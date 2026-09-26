@@ -54,8 +54,8 @@ web/                   # Monaco Editor-based static playground studio
 
 ```bash
 # Clone the repository
-git clone https://github.com/Robby-cell/qsyspy.git
-cd qsyspy
+git clone https://github.com/Robby-cell/QSysPyC.git
+cd QSysPyC
 
 # Build the compiler CLI
 cargo build --release -p qsyspyc
