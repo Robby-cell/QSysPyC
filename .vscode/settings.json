@@ -1,0 +1,11 @@
+{
+    "generic-lsp.serverConfigurations": [
+        {
+            "language": "python",
+            "command": "qsyspyc",
+            "args": [
+                "lsp"
+            ]
+        }
+    ]
+}

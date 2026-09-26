@@ -1,0 +1,11 @@
+[package]
+name = "qsys_parser"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+qsys_diagnostics.workspace = true
+
+ruff_python_parser = { version = "0.0.15" }
+ruff_python_ast = { version = "0.0.15" }
+ruff_text_size = { version = "0.0.15" }

@@ -1,0 +1,17 @@
+[package]
+name = "qsys_codegen_lua"
+version = "0.1.0"
+edition = "2024"
+description = "Lua 5.3 code generator for Q-SYS Core platform"
+
+[dev-dependencies]
+qsys_parser.workspace = true
+qsys_sema.workspace = true
+
+[dependencies]
+qsys_ir.workspace = true
+qsys_model.workspace = true
+qsys_diagnostics.workspace = true
+
+rustc-hash = { workspace = true }
+thiserror = { workspace = true }

@@ -1,0 +1,15 @@
+[package]
+name = "qsys_wasm"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+qsys_diagnostics.workspace = true
+qsys_compiler.workspace = true
+
+wasm-bindgen = { version = "0.2.129" }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }

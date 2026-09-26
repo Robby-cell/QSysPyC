@@ -1,0 +1,16 @@
+[package]
+name = "qsys_compiler"
+version = "0.1.0"
+edition = "2024"
+description = "Unified compiler pipeline and orchestration driver for QSysPy"
+
+[dependencies]
+qsys_diagnostics.workspace = true
+qsys_ir.workspace = true
+qsys_model.workspace = true
+qsys_parser.workspace = true
+qsys_sema.workspace = true
+qsys_codegen_lua = { path = "../qsys_codegen_lua" }
+
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }

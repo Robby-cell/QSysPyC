@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <title>QSysPy Studio - Python to Q-SYS Lua Transpiler</title>
+    <link rel="stylesheet" href="styles.css">
+    <!-- Load Monaco Editor via CDN -->
+    <link rel="stylesheet" data-name="vs/editor/editor.main"
+        href="https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.45.0/min/vs/editor/editor.main.css">
+</head>
+
+<body>
+    <header>
+        <div class="brand">
+            <span>QSysPy Studio</span>
+            <span class="brand-badge">WASM</span>
+        </div>
+
+        <div class="controls">
+            <label for="example-select" style="font-size: 12px; color: #888;">Example:</label>
+            <select id="example-select">
+                <option value="mixer">Matrix Mixer (Plugin)</option>
+                <option value="wol">Wake-on-LAN (Network Plugin)</option>
+                <option value="script">Procedural DSP Script</option>
+            </select>
+
+            <div id="status-pill" class="status-badge">
+                <div class="status-indicator"></div>
+                <span id="status-text">Loading WASM...</span>
+            </div>
+
+            <button id="btn-copy">Copy Lua</button>
+            <button id="btn-download" class="primary">Download .qplug</button>
+        </div>
+    </header>
+
+    <main>
+        <!-- Left Pane: Python Source -->
+        <div class="pane">
+            <div class="pane-header">
+                <span>PYTHON SOURCE (QSysPy)</span>
+                <span style="font-size: 11px;">Autocompletion & Diagnostics Active</span>
+            </div>
+            <div id="python-editor" class="editor-container"></div>
+        </div>
+
+        <!-- Right Pane: Lua Output -->
+        <div class="pane">
+            <div class="pane-header">
+                <span>EMITTED Q-SYS LUA (5.3)</span>
+                <span id="output-ext" style="font-size: 11px;">.qplug</span>
+            </div>
+            <div id="lua-editor" class="editor-container"></div>
+        </div>
+
+        <!-- Error/Diagnostics Drawer -->
+        <div id="error-drawer"></div>
+    </main>
+
+    <!-- Monaco loader script -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.45.0/min/vs/loader.js"></script>
+    <script type="module" src="app.js"></script>
+</body>
+
+</html>

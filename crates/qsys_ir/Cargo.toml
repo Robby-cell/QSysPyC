@@ -1,0 +1,11 @@
+[package]
+name = "qsys_ir"
+version = "0.1.0"
+edition = "2024"
+description = "Target-agnostic intermediate representation and backend abstraction for QSysPy"
+
+[dependencies]
+qsys_model.workspace = true
+qsys_diagnostics.workspace = true
+
+serde = { workspace = true, features = ["derive"] }

@@ -1,0 +1,27 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/qsys_codegen_lua",
+    "crates/qsys_compiler",
+    "crates/qsys_diagnostics",
+    "crates/qsys_ir",
+    "crates/qsys_model",
+    "crates/qsys_parser",
+    "crates/qsys_sema",
+    "crates/qsys_wasm",
+    "crates/qsyspyc",
+]
+
+[workspace.dependencies]
+miette = { version = "7.6.0" }
+rustc-hash = { version = "2.1.3" }
+serde = { version = "1.0" }
+serde_json = { version = "1.0" }
+thiserror = { version = "2.0.21" }
+
+qsys_compiler = { path = "crates/qsys_compiler" }
+qsys_diagnostics = { path = "crates/qsys_diagnostics" }
+qsys_ir = { path = "crates/qsys_ir" }
+qsys_model = { path = "crates/qsys_model" }
+qsys_parser = { path = "crates/qsys_parser" }
+qsys_sema = { path = "crates/qsys_sema" }

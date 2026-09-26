@@ -1,0 +1,16 @@
+[package]
+name = "qsys_sema"
+version = "0.1.0"
+edition = "2024"
+description = "Semantic analyzer, symbol resolver, and type checker for QSysPy"
+
+[dependencies]
+qsys_model.workspace = true
+qsys_diagnostics.workspace = true
+qsys_parser.workspace = true
+qsys_ir.workspace = true
+
+strsim = { version = "0.11.1" }
+
+rustc-hash = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
