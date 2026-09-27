@@ -26,11 +26,20 @@ pub struct IRPropertyBinding {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IRClass {
+    pub name: String,
+    pub constructor: Option<IRFunction>,
+    pub methods: Vec<IRFunction>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IRPlugin {
     pub info: PluginInfo,
     pub properties: Vec<IRPropertyBinding>,
     pub controls: Vec<IRControlBinding>,
     pub class_name: String,
+    pub classes: Vec<IRClass>,
     pub methods: Vec<IRFunction>,
     pub event_bindings: Vec<IREventBinding>,
     pub init_body: Vec<IRStmt>,
@@ -42,6 +51,7 @@ pub struct IRScript {
     pub name: String,
     pub is_controller: bool,
     pub bound_pins: Vec<String>,
+    pub classes: Vec<IRClass>,
     pub methods: Vec<IRFunction>,
     pub event_bindings: Vec<IREventBinding>,
     pub body: Vec<IRStmt>,

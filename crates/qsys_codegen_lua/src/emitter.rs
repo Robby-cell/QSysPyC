@@ -415,6 +415,48 @@ impl<'a> LuaEmitter<'a> {
             IRExpr::RawLua(code) => code.clone(),
         }
     }
+
+    pub fn emit_custom_class(&mut self, cls: &IRClass) {
+        let name = &cls.name;
+        self.write_line(&format!("local {name} = {{}}"));
+        self.write_line(&format!("{name}.__index = {name}\n"));
+
+        // Emit constructor: `function ClassName.new(...)`
+        let ctor_params = if let Some(ref ctor) = cls.constructor {
+            ctor.params
+                .iter()
+                .map(|p| p.name.clone())
+                .collect::<Vec<_>>()
+                .join(", ")
+        } else {
+            String::new()
+        };
+
+        self.write_line(&format!("function {name}.new({ctor_params})"));
+        self.indent();
+        self.write_line(&format!("local self = setmetatable({{}}, {name})"));
+        if let Some(ref ctor) = cls.constructor {
+            self.emit_statements(&ctor.body);
+        }
+        self.write_line("return self");
+        self.dedent();
+        self.write_line("end\n");
+
+        // Emit instance methods: `function ClassName:method(...)`
+        for method in &cls.methods {
+            let params = method
+                .params
+                .iter()
+                .map(|p| p.name.clone())
+                .collect::<Vec<_>>()
+                .join(", ");
+            self.write_line(&format!("function {name}:{}({params})", method.name));
+            self.indent();
+            self.emit_statements(&method.body);
+            self.dedent();
+            self.write_line("end\n");
+        }
+    }
 }
 
 pub fn escape_lua_string(s: &str) -> String {

@@ -298,6 +298,26 @@ impl<'a> Lowerer<'a> {
                 ExprKind::List(elts)
             }
 
+            // Lower Python dictionary literals: { "k": v, 1: 2 }
+            ruff::Expr::Dict(d) => {
+                let mut pairs = Vec::new();
+                for item in &d.items {
+                    if let Some(ref key) = item.key {
+                        let k = self.lower_expr(key);
+                        let v = self.lower_expr(&item.value);
+                        pairs.push((k, v));
+                    } else {
+                        self.diagnostics.report(
+                            DiagnosticKind::unsupported_expression(
+                                "Dict unpacking ('**dict') is not supported in QSysPy",
+                            ),
+                            span,
+                        );
+                    }
+                }
+                ExprKind::Dict(pairs)
+            }
+
             ruff::Expr::Call(c) => {
                 let callee = Box::new(self.lower_expr(&c.func));
                 let args = c

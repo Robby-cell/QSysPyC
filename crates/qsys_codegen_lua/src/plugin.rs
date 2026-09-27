@@ -48,6 +48,11 @@ pub fn emit_plugin(plugin: &IRPlugin, ctx: &mut CodegenContext) -> String {
         emit_method(&mut emitter, &plugin.class_name, method);
     }
 
+    // Classes
+    for cls in &plugin.classes {
+        emitter.emit_custom_class(cls);
+    }
+
     // Event Handler Bindings
     for binding in &plugin.event_bindings {
         let ctl_ref = format!("Controls[{}]", escape_lua_string(&binding.control_name));

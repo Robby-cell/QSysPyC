@@ -52,6 +52,7 @@ pub struct PluginSemantic {
     pub class_name: String,
     pub properties: Vec<DeclaredProperty>,
     pub controls: Vec<DeclaredControl>,
+    pub helper_classes: Vec<ast::ClassDef>,
     pub event_bindings: Vec<ResolvedBinding>,
     pub methods: Vec<ResolvedMethod>,
     pub init_statements: Vec<ast::Stmt>,
@@ -62,6 +63,7 @@ pub struct PluginSemantic {
 pub struct ControllerSemantic {
     pub class_name: String,
     pub controls: Vec<DeclaredControl>,
+    pub helper_classes: Vec<ast::ClassDef>,
     pub event_bindings: Vec<ResolvedBinding>,
     pub methods: Vec<ResolvedMethod>,
     pub init_statements: Vec<ast::Stmt>,
@@ -72,6 +74,7 @@ pub struct ControllerSemantic {
 pub struct ScriptSemantic {
     pub bound_pins: Vec<String>,
     pub event_bindings: Vec<ResolvedBinding>,
+    pub classes: Vec<ast::ClassDef>,
     pub methods: Vec<ResolvedMethod>,
     pub statements: Vec<ast::Stmt>,
 }
@@ -105,6 +108,27 @@ pub fn analyze(parsed: &ParsedModule) -> Result<SemanticModel, Diagnostics> {
 
     let mut scope_stack = ScopeStack::new();
     let mut type_map = TypeMap::new();
+
+    let mut custom_classes = Vec::new();
+    for stmt in &parsed.module.statements {
+        if let ast::StmtKind::ClassDef(cls) = &stmt.kind
+            && !cls
+                .bases
+                .iter()
+                .any(|b| b == "QSysPlugin" || b == "TextController")
+        {
+            let sym_id = scope_stack.alloc_symbol_id(); // <-- Store in local variable first
+            scope_stack.define(Symbol::new(
+                sym_id,
+                cls.name.clone(),
+                SymbolKind::UserClass {
+                    name: cls.name.clone(),
+                },
+                cls.span,
+            ));
+            custom_classes.push(cls.clone());
+        }
+    }
 
     let target = match classification {
         TargetClassification::Plugin { class } => {
@@ -249,6 +273,7 @@ pub fn analyze(parsed: &ParsedModule) -> Result<SemanticModel, Diagnostics> {
                 class_name: class.name.clone(),
                 properties: decls.properties,
                 controls: decls.controls,
+                helper_classes: custom_classes.clone(),
                 event_bindings,
                 methods,
                 init_statements: decls.remaining_statements,
@@ -358,6 +383,7 @@ pub fn analyze(parsed: &ParsedModule) -> Result<SemanticModel, Diagnostics> {
             TargetKind::TextController(ControllerSemantic {
                 class_name: class.name.clone(),
                 controls: decls.controls,
+                helper_classes: custom_classes.clone(),
                 event_bindings,
                 methods,
                 init_statements: decls.remaining_statements,
@@ -435,6 +461,7 @@ pub fn analyze(parsed: &ParsedModule) -> Result<SemanticModel, Diagnostics> {
             TargetKind::ProceduralScript(ScriptSemantic {
                 bound_pins: Vec::new(),
                 event_bindings: Vec::new(),
+                classes: custom_classes.clone(),
                 methods,
                 statements: top_level_statements,
             })

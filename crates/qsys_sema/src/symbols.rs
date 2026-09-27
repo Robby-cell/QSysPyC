@@ -34,6 +34,9 @@ pub enum SymbolKind {
         name: String,
         base: Option<String>,
     },
+    UserClass {
+        name: String,
+    },
 }
 
 #[derive(Debug, Clone)]

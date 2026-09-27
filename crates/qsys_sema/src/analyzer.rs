@@ -192,6 +192,7 @@ impl<'a> ExprAnalyzer<'a> {
                         SymbolKind::Class { name, .. } => {
                             Type::ClassInstance { name: name.clone() }
                         }
+                        SymbolKind::UserClass { name } => Type::UserClass { name: name.clone() },
                     }
                 } else if KNOWN_GLOBALS.contains(&name.as_str()) {
                     self.type_map
@@ -250,6 +251,7 @@ impl<'a> ExprAnalyzer<'a> {
             ast::ExprKind::Attribute { value, attr } => {
                 let base_ty = self.infer_expr(value);
                 match base_ty {
+                    Type::UserInstance { .. } => Type::Any,
                     Type::UdpSocketClass | Type::TcpSocketClass | Type::TimerClass => Type::Any,
 
                     Type::UdpSocketHandle => match attr.as_str() {
@@ -441,6 +443,19 @@ impl<'a> ExprAnalyzer<'a> {
                 args,
                 kwargs,
             } => {
+                let callee_ty = self.infer_expr(callee);
+                if let Type::UserClass { name } = callee_ty {
+                    for arg in args {
+                        let _ = self.infer_expr(arg);
+                    }
+                    for (_, kw_val) in kwargs {
+                        let _ = self.infer_expr(kw_val);
+                    }
+                    let inst_ty = Type::UserInstance { name };
+                    self.type_map.insert_type(expr.span, inst_ty.clone());
+                    return inst_ty;
+                }
+
                 if let ast::ExprKind::Attribute { value, attr } = &callee.kind
                     && attr == "New"
                 {

@@ -35,7 +35,9 @@ pub enum Type {
     TimerClass,
     TimerHandle,
 
-    ClassInstance { name: String },
+    ClassInstance { name: String }, // QSysPlugin instance (`self`)
+    UserClass { name: String },     // Custom class constructor (e.g. `Device`)
+    UserInstance { name: String },  // Custom class instance object (e.g. `dev = Device(...)`)
 
     Any,
 }
@@ -52,7 +54,8 @@ impl Type {
             | Self::UdpSocketHandle
             | Self::TcpSocketHandle
             | Self::TimerHandle
-            | Self::ClassInstance { .. } => TruthinessStrategy::Direct,
+            | Self::ClassInstance { .. }
+            | Self::UserInstance { .. } => TruthinessStrategy::Direct,
 
             Self::Int | Self::Float => TruthinessStrategy::NumericNotZero,
             Self::String => TruthinessStrategy::StringNonEmpty,
@@ -62,7 +65,8 @@ impl Type {
             | Self::PropertyHandle
             | Self::UdpSocketClass
             | Self::TcpSocketClass
-            | Self::TimerClass => TruthinessStrategy::Dynamic,
+            | Self::TimerClass
+            | Self::UserClass { .. } => TruthinessStrategy::Dynamic,
         }
     }
 }

@@ -36,6 +36,11 @@ pub fn emit_script(script: &IRScript, ctx: &mut CodegenContext) -> String {
         emitter.write_line("end\n");
     }
 
+    // Emit classes
+    for cls in &script.classes {
+        emitter.emit_custom_class(cls);
+    }
+
     // Emit event bindings
     for binding in &script.event_bindings {
         let ctl_ref = format!("Controls[{}]", escape_lua_string(&binding.control_name));

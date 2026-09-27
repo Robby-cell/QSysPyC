@@ -9,6 +9,12 @@ pub fn lower_to_ir(model: &SemanticModel) -> IRProgram {
         TargetKind::Plugin(p) => {
             let mut lowerer = StmtLowerer::new(&model.type_map);
 
+            let classes = p
+                .helper_classes
+                .iter()
+                .map(|c| lowerer.lower_class(c))
+                .collect();
+
             let methods = p
                 .methods
                 .iter()
@@ -55,6 +61,7 @@ pub fn lower_to_ir(model: &SemanticModel) -> IRProgram {
                 properties,
                 controls,
                 class_name: p.class_name.clone(),
+                classes,
                 methods,
                 event_bindings,
                 init_body,
@@ -64,6 +71,12 @@ pub fn lower_to_ir(model: &SemanticModel) -> IRProgram {
 
         TargetKind::TextController(c) => {
             let mut lowerer = StmtLowerer::new(&model.type_map);
+
+            let classes = c
+                .helper_classes
+                .iter()
+                .map(|cls| lowerer.lower_class(cls))
+                .collect();
 
             let methods = c
                 .methods
@@ -92,6 +105,7 @@ pub fn lower_to_ir(model: &SemanticModel) -> IRProgram {
                 name: c.class_name.clone(),
                 is_controller: true,
                 bound_pins,
+                classes,
                 methods,
                 event_bindings,
                 body,
@@ -101,6 +115,13 @@ pub fn lower_to_ir(model: &SemanticModel) -> IRProgram {
 
         TargetKind::ProceduralScript(s) => {
             let mut lowerer = StmtLowerer::new(&model.type_map);
+
+            let classes = s
+                .classes
+                .iter()
+                .map(|cls| lowerer.lower_class(cls))
+                .collect();
+
             let methods = s
                 .methods
                 .iter()
@@ -112,6 +133,7 @@ pub fn lower_to_ir(model: &SemanticModel) -> IRProgram {
                 name: "main".to_string(),
                 is_controller: false,
                 bound_pins: s.bound_pins.clone(),
+                classes,
                 methods,
                 event_bindings: Vec::new(),
                 body,
@@ -394,32 +416,37 @@ impl<'a> StmtLowerer<'a> {
                 if let Some(raw_code) = extract_raw_lua(expr) {
                     IRExpr::RawLua(raw_code)
                 } else {
-                    let mut args_ir: Vec<IRExpr> =
+                    let args_ir: Vec<IRExpr> =
                         args.iter().map(|arg| self.lower_expr(arg)).collect();
                     let kwargs_ir = kwargs
                         .iter()
                         .map(|(k, v)| (k.clone(), self.lower_expr(v)))
                         .collect();
 
+                    let callee_ty = self.type_map.get_type(callee.span);
+
+                    // Calling a custom class: `Device(...)` -> lowers to `Device.new(...)`
+                    if let Some(Type::UserClass { name }) = callee_ty {
+                        return IRExpr::Call {
+                            callee: Box::new(IRExpr::Attribute {
+                                object: Box::new(IRExpr::Global(name.clone())),
+                                attr: "new".to_string(),
+                            }),
+                            args: args_ir,
+                            kwargs: kwargs_ir,
+                        };
+                    }
+
                     // If calling an instance method on a Socket or Timer, lower to MethodCall (`object:method(...)`)
                     if let ast::ExprKind::Attribute { value, attr } = &callee.kind {
                         let val_ty = self.type_map.get_type(value.span);
-                        if matches!(
-                            val_ty,
-                            Some(Type::UdpSocketHandle | Type::TcpSocketHandle | Type::TimerHandle)
-                        ) {
-                            let obj_ir = Box::new(self.lower_expr(value));
+                        if matches!(val_ty, Some(Type::UserInstance { .. })) {
                             return IRExpr::MethodCall {
-                                object: obj_ir,
+                                object: Box::new(self.lower_expr(value)),
                                 method: attr.clone(),
                                 args: args_ir,
                                 kwargs: kwargs_ir,
                             };
-                        }
-
-                        // Method call on `self`: prepend `nil`
-                        if let Some(Type::ClassInstance { .. }) = val_ty {
-                            args_ir.insert(0, IRExpr::Nil);
                         }
                     }
 
@@ -437,13 +464,61 @@ impl<'a> StmtLowerer<'a> {
                 attr: attr.clone(),
             },
 
-            ast::ExprKind::Subscript { value, index } => IRExpr::Index {
-                base: Box::new(self.lower_expr(value)),
-                index: Box::new(self.lower_expr(index)),
-                is_zero_based: true,
-            },
+            // Subscript Indexing (Dictionaries do NOT get +1 offset)
+            ast::ExprKind::Subscript { value, index } => {
+                let val_ty = self.type_map.get_type(value.span);
+                let idx_ty = self.type_map.get_type(index.span);
+
+                let is_zero_based = match (val_ty, idx_ty) {
+                    (Some(Type::Dict(_, _)), _) => false,
+                    (_, Some(Type::String)) => false,
+                    (Some(Type::List(_)), _) => true,
+                    (Some(Type::UserInstance { .. }), _) => false,
+                    _ => false,
+                };
+
+                IRExpr::Index {
+                    base: Box::new(self.lower_expr(value)),
+                    index: Box::new(self.lower_expr(index)),
+                    is_zero_based,
+                }
+            }
 
             ast::ExprKind::Error => IRExpr::Nil,
+        }
+    }
+
+    fn lower_class(&mut self, cls: &ast::ClassDef) -> IRClass {
+        let mut constructor = None;
+        let mut methods = Vec::new();
+
+        for stmt in &cls.body {
+            if let ast::StmtKind::FunctionDef(f) = &stmt.kind {
+                let func_id = FunctionId(0);
+                // Filter out `self` parameter because Lua methods and constructors
+                // manage `self` implicitly via metatables or colon calls
+                let params: Vec<_> = f
+                    .params
+                    .iter()
+                    .filter(|p| p.name != "self")
+                    .map(|p| (SymbolId(0), p.name.clone()))
+                    .collect();
+
+                let lowered_fn = self.lower_function(func_id, &f.name, &params, &f.body, f.span);
+
+                if f.name == "__init__" {
+                    constructor = Some(lowered_fn);
+                } else {
+                    methods.push(lowered_fn);
+                }
+            }
+        }
+
+        IRClass {
+            name: cls.name.clone(),
+            constructor,
+            methods,
+            span: cls.span,
         }
     }
 }
