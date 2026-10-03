@@ -56,6 +56,7 @@ pub struct PluginSemantic {
     pub event_bindings: Vec<ResolvedBinding>,
     pub methods: Vec<ResolvedMethod>,
     pub init_statements: Vec<ast::Stmt>,
+    pub module_statements: Vec<ast::Stmt>,
     pub span: Span,
 }
 
@@ -101,6 +102,30 @@ fn type_from_annotation(ann: Option<&str>) -> Type {
 pub fn analyze(parsed: &ParsedModule) -> Result<SemanticModel, Diagnostics> {
     let mut diagnostics = Diagnostics::new();
 
+    // 1. Collect helper classes
+    let mut custom_classes: Vec<ast::ClassDef> = Vec::new();
+    // 2. Collect top-level statements (constants, utility functions, etc.)
+    let mut module_statements: Vec<ast::Stmt> = Vec::new();
+
+    for stmt in &parsed.module.statements {
+        match &stmt.kind {
+            ast::StmtKind::ClassDef(cls) => {
+                if !cls
+                    .bases
+                    .iter()
+                    .any(|b| b == "QSysPlugin" || b == "TextController")
+                {
+                    custom_classes.push(cls.clone());
+                }
+            }
+            ast::StmtKind::Import { .. } | ast::StmtKind::ImportFrom { .. } => {}
+            _ => {
+                module_statements.push(stmt.clone());
+            }
+        }
+    }
+
+    // Classify module target (Plugin vs TextController vs Script)
     let classification = match classify_module(&parsed.module, &mut diagnostics) {
         Some(c) => c,
         None => return Err(diagnostics),
@@ -109,24 +134,20 @@ pub fn analyze(parsed: &ParsedModule) -> Result<SemanticModel, Diagnostics> {
     let mut scope_stack = ScopeStack::new();
     let mut type_map = TypeMap::new();
 
-    let mut custom_classes = Vec::new();
-    for stmt in &parsed.module.statements {
-        if let ast::StmtKind::ClassDef(cls) = &stmt.kind
-            && !cls
-                .bases
-                .iter()
-                .any(|b| b == "QSysPlugin" || b == "TextController")
-        {
-            let sym_id = scope_stack.alloc_symbol_id(); // <-- Store in local variable first
-            scope_stack.define(Symbol::new(
-                sym_id,
-                cls.name.clone(),
-                SymbolKind::UserClass {
-                    name: cls.name.clone(),
-                },
-                cls.span,
-            ));
-            custom_classes.push(cls.clone());
+    // Pre-populate module scope with top-level constants and functions
+    {
+        let mut module_analyzer =
+            ExprAnalyzer::new(&mut scope_stack, &mut type_map, &mut diagnostics);
+        for stmt in &parsed.module.statements {
+            if let ast::StmtKind::ClassDef(cls) = &stmt.kind
+                && cls
+                    .bases
+                    .iter()
+                    .any(|b| b == "QSysPlugin" || b == "TextController")
+            {
+                continue;
+            }
+            module_analyzer.analyze_stmt(stmt);
         }
     }
 
@@ -277,6 +298,7 @@ pub fn analyze(parsed: &ParsedModule) -> Result<SemanticModel, Diagnostics> {
                 event_bindings,
                 methods,
                 init_statements: decls.remaining_statements,
+                module_statements, // <--- PASS IT HERE
                 span: class.span,
             })
         }

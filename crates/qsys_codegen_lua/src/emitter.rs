@@ -163,6 +163,25 @@ impl<'a> LuaEmitter<'a> {
                     self.write_line(line);
                 }
             }
+
+            IRStmt::FunctionDef(f) => {
+                // 1. Register parameter IDs into context so the body knows their names!
+                for param in &f.params {
+                    self.ctx.symbol_names.insert(param.id, param.name.clone());
+                    self.ctx.declared_locals.insert(param.id);
+                }
+
+                let params: Vec<_> = f.params.iter().map(|p| p.name.as_str()).collect();
+                let param_str = params.join(", ");
+
+                self.write_line(&format!("local function {}({})", f.name, param_str));
+                self.indent();
+                for s in &f.body {
+                    self.emit_stmt(s);
+                }
+                self.dedent();
+                self.write_line("end");
+            }
         }
     }
 
@@ -282,6 +301,7 @@ impl<'a> LuaEmitter<'a> {
                     IRBinaryOp::FloorDiv => "//",
                     IRBinaryOp::Mod => "%",
                     IRBinaryOp::Pow => "^",
+                    IRBinaryOp::Concat => "..",
                     IRBinaryOp::BitAnd => "&",
                     IRBinaryOp::BitOr => "|",
                     IRBinaryOp::BitXor => "~",
@@ -444,6 +464,12 @@ impl<'a> LuaEmitter<'a> {
 
         // Emit instance methods: `function ClassName:method(...)`
         for method in &cls.methods {
+            // Register method parameters into context!
+            for param in &method.params {
+                self.ctx.symbol_names.insert(param.id, param.name.clone());
+                self.ctx.declared_locals.insert(param.id);
+            }
+
             let params = method
                 .params
                 .iter()

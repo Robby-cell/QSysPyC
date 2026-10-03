@@ -163,6 +163,14 @@ impl<'a> Lowerer<'a> {
                 }
             }
 
+            ruff::Stmt::AnnAssign(a) => {
+                if let Some(val) = &a.value {
+                    let target = self.lower_expr(&a.target);
+                    let value = self.lower_expr(val);
+                    out.push(Stmt::new(StmtKind::Assign { target, value }, span));
+                }
+            }
+
             ruff::Stmt::AugAssign(a) => {
                 let target = self.lower_expr(&a.target);
                 let value = self.lower_expr(&a.value);
@@ -290,8 +298,76 @@ impl<'a> Lowerer<'a> {
             },
 
             ruff::Expr::StringLiteral(s) => ExprKind::String(s.value.to_str().to_string()),
+
+            ruff::Expr::FString(f) => {
+                let mut parts: Vec<Expr> = Vec::new();
+
+                for part in &f.value {
+                    match part {
+                        ruff::FStringPartRef::Literal(lit) => {
+                            parts.push(Expr::new(
+                                ExprKind::String(lit.value.to_string()),
+                                text_range_to_span(lit.range()),
+                            ));
+                        }
+                        ruff::FStringPartRef::FString(f_string) => {
+                            for element in &f_string.elements {
+                                match element {
+                                    ruff::InterpolatedStringElement::Literal(lit) => {
+                                        parts.push(Expr::new(
+                                            ExprKind::String(lit.value.to_string()),
+                                            text_range_to_span(lit.range()),
+                                        ));
+                                    }
+                                    ruff::InterpolatedStringElement::Interpolation(interp) => {
+                                        let inner = self.lower_expr(&interp.expression);
+                                        let span = text_range_to_span(interp.range());
+
+                                        let str_call = Expr::new(
+                                            ExprKind::Call {
+                                                callee: Box::new(Expr::new(
+                                                    ExprKind::Ident("str".to_string()),
+                                                    span,
+                                                )),
+                                                args: vec![inner],
+                                                kwargs: Vec::new(),
+                                            },
+                                            span,
+                                        );
+                                        parts.push(str_call);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if parts.is_empty() {
+                    ExprKind::String(String::new())
+                } else {
+                    let mut combined = parts.remove(0);
+                    for next_part in parts {
+                        let span = combined.span.merge(next_part.span);
+                        combined = Expr::new(
+                            ExprKind::Binary {
+                                left: Box::new(combined),
+                                op: BinaryOp::Add,
+                                right: Box::new(next_part),
+                            },
+                            span,
+                        );
+                    }
+                    combined.kind
+                }
+            }
+
             ruff::Expr::BooleanLiteral(b) => ExprKind::Bool(b.value),
             ruff::Expr::NoneLiteral(_) => ExprKind::None,
+
+            ruff::Expr::Tuple(t) => {
+                let elements = t.elts.iter().map(|e| self.lower_expr(e)).collect();
+                ExprKind::Tuple(elements)
+            }
 
             ruff::Expr::List(l) => {
                 let elts = l.elts.iter().map(|e| self.lower_expr(e)).collect();

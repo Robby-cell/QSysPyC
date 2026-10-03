@@ -1,3 +1,4 @@
+use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
 use qsys_diagnostics::Span;
@@ -7,8 +8,8 @@ pub use crate::id::{ControlId, FunctionId, PropertyId, SymbolId};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum IRProgram {
-    Plugin(IRPlugin),
-    Script(IRScript),
+    Plugin(Box<IRPlugin>),
+    Script(Box<IRScript>),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -43,6 +44,8 @@ pub struct IRPlugin {
     pub methods: Vec<IRFunction>,
     pub event_bindings: Vec<IREventBinding>,
     pub init_body: Vec<IRStmt>,
+    pub symbol_names: FxHashMap<SymbolId, String>,
+    pub top_level_stmts: Vec<IRStmt>,
     pub span: Span,
 }
 
@@ -122,6 +125,9 @@ pub enum IRStmt {
         code: String,
         span: Span,
     },
+
+    // [`IRFunction`] already has a `span` field.
+    FunctionDef(IRFunction),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -209,6 +215,7 @@ pub enum IRBinaryOp {
     FloorDiv,
     Mod,
     Pow,
+    Concat,
     BitAnd,
     BitOr,
     BitXor,

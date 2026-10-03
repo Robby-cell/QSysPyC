@@ -86,11 +86,20 @@ pub struct TypeMap {
     types: FxHashMap<Span, Type>,
     truthiness: FxHashMap<Span, TruthinessStrategy>,
     resolutions: FxHashMap<Span, ResolvedTarget>,
+    symbol_names: FxHashMap<SymbolId, String>,
 }
 
 impl TypeMap {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn insert_symbol_name(&mut self, id: SymbolId, name: impl Into<String>) {
+        self.symbol_names.insert(id, name.into());
+    }
+
+    pub fn symbol_names(&self) -> &FxHashMap<SymbolId, String> {
+        &self.symbol_names
     }
 
     pub fn insert_type(&mut self, span: Span, ty: Type) {

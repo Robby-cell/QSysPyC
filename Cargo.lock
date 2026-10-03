@@ -1092,6 +1092,7 @@ version = "0.1.0"
 dependencies = [
  "qsys_diagnostics",
  "qsys_model",
+ "rustc-hash",
  "serde",
 ]
 

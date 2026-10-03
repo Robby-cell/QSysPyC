@@ -56,7 +56,11 @@ pub fn lower_to_ir(model: &SemanticModel) -> IRProgram {
                 })
                 .collect();
 
-            IRProgram::Plugin(IRPlugin {
+            // Populate from the semantic model's scopes
+            let symbol_names = model.type_map.symbol_names().clone();
+
+            // Pass symbol_names into IRPlugin
+            IRProgram::Plugin(Box::new(IRPlugin {
                 info: p.info.clone(),
                 properties,
                 controls,
@@ -65,8 +69,10 @@ pub fn lower_to_ir(model: &SemanticModel) -> IRProgram {
                 methods,
                 event_bindings,
                 init_body,
+                symbol_names,
+                top_level_stmts: lowerer.lower_statements(&p.module_statements),
                 span: p.span,
-            })
+            }))
         }
 
         TargetKind::TextController(c) => {
@@ -101,7 +107,7 @@ pub fn lower_to_ir(model: &SemanticModel) -> IRProgram {
 
             let bound_pins = c.controls.iter().map(|ctl| ctl.def.name.clone()).collect();
 
-            IRProgram::Script(IRScript {
+            IRProgram::Script(Box::new(IRScript {
                 name: c.class_name.clone(),
                 is_controller: true,
                 bound_pins,
@@ -110,7 +116,7 @@ pub fn lower_to_ir(model: &SemanticModel) -> IRProgram {
                 event_bindings,
                 body,
                 span: c.span,
-            })
+            }))
         }
 
         TargetKind::ProceduralScript(s) => {
@@ -129,7 +135,7 @@ pub fn lower_to_ir(model: &SemanticModel) -> IRProgram {
                 .collect();
             let body = lowerer.lower_statements(&s.statements);
 
-            IRProgram::Script(IRScript {
+            IRProgram::Script(Box::new(IRScript {
                 name: "main".to_string(),
                 is_controller: false,
                 bound_pins: s.bound_pins.clone(),
@@ -138,7 +144,7 @@ pub fn lower_to_ir(model: &SemanticModel) -> IRProgram {
                 event_bindings: Vec::new(),
                 body,
                 span: qsys_diagnostics::Span::new(0, 0),
-            })
+            }))
         }
     }
 }
@@ -190,7 +196,21 @@ impl<'a> StmtLowerer<'a> {
 
         match &stmt.kind {
             ast::StmtKind::Assign { target, value } => {
-                let target_ir = self.lower_expr(target);
+                let target_ir = match &target.kind {
+                    ast::ExprKind::Subscript {
+                        value: sub_val,
+                        index: sub_idx,
+                    } => {
+                        let val_ty = self.type_map.get_type(sub_val.span);
+                        let is_zero_based = matches!(val_ty, Some(Type::List(_)));
+                        IRExpr::Index {
+                            base: Box::new(self.lower_expr(sub_val)),
+                            index: Box::new(self.lower_expr(sub_idx)),
+                            is_zero_based,
+                        }
+                    }
+                    _ => self.lower_expr(target),
+                };
                 let value_ir = self.lower_expr(value);
                 Some(IRStmt::Assign {
                     target: target_ir,
@@ -311,6 +331,27 @@ impl<'a> StmtLowerer<'a> {
             | ast::StmtKind::Import { .. }
             | ast::StmtKind::ImportFrom { .. } => None,
 
+            ast::StmtKind::FunctionDef(f) => {
+                let params = f
+                    .params
+                    .iter()
+                    .map(|p| qsys_ir::IRParam {
+                        name: p.name.clone(),
+                        id: qsys_ir::SymbolId(0),
+                    })
+                    .collect();
+
+                let body = self.lower_statements(&f.body);
+
+                Some(qsys_ir::IRStmt::FunctionDef(qsys_ir::IRFunction {
+                    id: qsys_ir::FunctionId(0),
+                    name: f.name.clone(),
+                    params,
+                    body,
+                    span: f.span,
+                }))
+            }
+
             _ => None,
         }
     }
@@ -334,6 +375,11 @@ impl<'a> StmtLowerer<'a> {
             ast::ExprKind::None => IRExpr::Nil,
             ast::ExprKind::Ident(name) => IRExpr::Global(name.clone()),
 
+            ast::ExprKind::Tuple(items) => {
+                let lowered = items.iter().map(|item| self.lower_expr(item)).collect();
+                IRExpr::List(lowered)
+            }
+
             ast::ExprKind::List(items) => {
                 let lowered = items.iter().map(|item| self.lower_expr(item)).collect();
                 IRExpr::List(lowered)
@@ -348,38 +394,33 @@ impl<'a> StmtLowerer<'a> {
             }
 
             ast::ExprKind::Binary { left, op, right } => {
-                let mut ir_op = lower_binary_op(*op);
-                let left_ty = self.type_map.get_type(left.span);
-                let right_ty = self.type_map.get_type(right.span);
+                let left_ir = self.lower_expr(left);
+                let right_ir = self.lower_expr(right);
 
-                if *op == ast::BinaryOp::Add {
-                    if matches!(left_ty, Some(Type::String))
-                        || matches!(right_ty, Some(Type::String))
-                    {
-                        ir_op = IRBinaryOp::StringConcat;
-                    }
-                } else if *op == ast::BinaryOp::Mul
-                    && ((matches!(left_ty, Some(Type::String))
-                        && matches!(right_ty, Some(Type::Int)))
-                        || (matches!(left_ty, Some(Type::Int))
-                            && matches!(right_ty, Some(Type::String))))
+                let is_str_expr = |e: &IRExpr, span: qsys_diagnostics::Span| -> bool {
+                    matches!(e, IRExpr::String(_))
+                        || matches!(
+                            e,
+                            IRExpr::Binary {
+                                op: IRBinaryOp::Concat | IRBinaryOp::StringConcat,
+                                ..
+                            }
+                        )
+                        || self.type_map.get_type(span) == Some(&Type::String)
+                };
+
+                let binary_op = if *op == ast::BinaryOp::Add
+                    && (is_str_expr(&left_ir, left.span) || is_str_expr(&right_ir, right.span))
                 {
-                    ir_op = IRBinaryOp::StringRep;
-                }
-
-                // If `reps * "a"`, swap operands so Lua receives (str, count) -> string.rep("a", reps)
-                if ir_op == IRBinaryOp::StringRep && matches!(left_ty, Some(Type::Int)) {
-                    return IRExpr::Binary {
-                        left: Box::new(self.lower_expr(right)),
-                        op: ir_op,
-                        right: Box::new(self.lower_expr(left)),
-                    };
-                }
+                    IRBinaryOp::Concat
+                } else {
+                    lower_binary_op(*op)
+                };
 
                 IRExpr::Binary {
-                    left: Box::new(self.lower_expr(left)),
-                    op: ir_op,
-                    right: Box::new(self.lower_expr(right)),
+                    left: Box::new(left_ir),
+                    op: binary_op,
+                    right: Box::new(right_ir),
                 }
             }
 
@@ -439,13 +480,54 @@ impl<'a> StmtLowerer<'a> {
 
                     // If calling an instance method on a Socket or Timer, lower to MethodCall (`object:method(...)`)
                     if let ast::ExprKind::Attribute { value, attr } = &callee.kind {
-                        let val_ty = self.type_map.get_type(value.span);
-                        if matches!(val_ty, Some(Type::UserInstance { .. })) {
-                            return IRExpr::MethodCall {
-                                object: Box::new(self.lower_expr(value)),
-                                method: attr.clone(),
-                                args: args_ir,
-                                kwargs: kwargs_ir,
+                        // list.append(x) -> table.insert(list, x)
+                        if attr == "append" && args.len() == 1 {
+                            return IRExpr::Call {
+                                callee: Box::new(IRExpr::Attribute {
+                                    object: Box::new(IRExpr::Global("table".to_string())),
+                                    attr: "insert".to_string(),
+                                }),
+                                args: vec![self.lower_expr(value), self.lower_expr(&args[0])],
+                                kwargs: vec![],
+                            };
+                        }
+                        // list.insert(0, x) -> table.insert(list, 1, x)
+                        if attr == "insert" && args.len() == 2 {
+                            let index_expr = IRExpr::Binary {
+                                left: Box::new(self.lower_expr(&args[0])),
+                                op: IRBinaryOp::Add,
+                                right: Box::new(IRExpr::Int(1)),
+                            };
+                            return IRExpr::Call {
+                                callee: Box::new(IRExpr::Attribute {
+                                    object: Box::new(IRExpr::Global("table".to_string())),
+                                    attr: "insert".to_string(),
+                                }),
+                                args: vec![
+                                    self.lower_expr(value),
+                                    index_expr,
+                                    self.lower_expr(&args[1]),
+                                ],
+                                kwargs: vec![],
+                            };
+                        }
+                        // list.pop() -> table.remove(list)
+                        if attr == "pop" && args.is_empty() {
+                            return IRExpr::Call {
+                                callee: Box::new(IRExpr::Attribute {
+                                    object: Box::new(IRExpr::Global("table".to_string())),
+                                    attr: "remove".to_string(),
+                                }),
+                                args: vec![self.lower_expr(value)],
+                                kwargs: vec![],
+                            };
+                        }
+                        // dict.get(key) -> dict[key]
+                        if attr == "get" && args.len() == 1 {
+                            return IRExpr::Index {
+                                base: Box::new(self.lower_expr(value)),
+                                index: Box::new(self.lower_expr(&args[0])),
+                                is_zero_based: false,
                             };
                         }
                     }

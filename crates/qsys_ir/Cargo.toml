@@ -8,4 +8,5 @@ description = "Target-agnostic intermediate representation and backend abstracti
 qsys_model.workspace = true
 qsys_diagnostics.workspace = true
 
+rustc-hash = { workspace = true }
 serde = { workspace = true, features = ["derive"] }

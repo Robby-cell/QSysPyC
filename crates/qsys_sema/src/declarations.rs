@@ -49,6 +49,28 @@ impl ConstValue {
     }
 }
 
+pub fn eval_constant_with_env(
+    expr: &ast::Expr,
+    env: &rustc_hash::FxHashMap<String, ConstValue>,
+) -> Option<ConstValue> {
+    match &expr.kind {
+        ast::ExprKind::Int(i) => Some(ConstValue::Int(*i)),
+        ast::ExprKind::Float(f) => Some(ConstValue::Float(*f)),
+        ast::ExprKind::String(s) => Some(ConstValue::String(s.clone())),
+        ast::ExprKind::Bool(b) => Some(ConstValue::Bool(*b)),
+        ast::ExprKind::Ident(name) => env.get(name).cloned(),
+        ast::ExprKind::Unary {
+            op: ast::UnaryOp::Neg,
+            operand,
+        } => match eval_constant_with_env(operand, env)? {
+            ConstValue::Int(i) => Some(ConstValue::Int(-i)),
+            ConstValue::Float(f) => Some(ConstValue::Float(-f)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 pub fn eval_constant(expr: &ast::Expr) -> Option<ConstValue> {
     match &expr.kind {
         ast::ExprKind::Int(i) => Some(ConstValue::Int(*i)),
