@@ -226,7 +226,11 @@ impl<'a> LuaEmitter<'a> {
                     self.emit_stmt(s);
                 }
                 self.dedent();
-                self.write_line("end");
+                self.write_line("end\n");
+            }
+
+            IRStmt::ClassDef(cls) => {
+                self.emit_custom_class(cls);
             }
         }
     }
@@ -489,7 +493,11 @@ impl<'a> LuaEmitter<'a> {
     pub fn emit_custom_class(&mut self, cls: &IRClass) {
         let name = &cls.name;
         self.write_line(&format!("local {name} = {{}}"));
-        self.write_line(&format!("{name}.__index = {name}\n"));
+        self.write_line(&format!("{name}.__index = {name}"));
+        if let Some(ref base) = cls.base {
+            self.write_line(&format!("setmetatable({name}, {{ __index = {base} }})"));
+        }
+        self.write_line("");
 
         // Emit constructor: `function ClassName.new(...)`
         let ctor_params = if let Some(ref ctor) = cls.constructor {
@@ -509,12 +517,24 @@ impl<'a> LuaEmitter<'a> {
         self.write_line(&format!("function {name}.new({ctor_params})"));
         self.indent();
         self.write_line(&format!("local self = setmetatable({{}}, {name})"));
-        if let Some(ref ctor) = cls.constructor {
+        if cls.emit_init_method {
+            self.write_line(&format!("self:__init({ctor_params})"));
+        } else if let Some(ref ctor) = cls.constructor {
             self.emit_statements(&ctor.body);
         }
         self.write_line("return self");
         self.dedent();
         self.write_line("end\n");
+
+        if cls.emit_init_method {
+            self.write_line(&format!("function {name}:__init({ctor_params})"));
+            self.indent();
+            if let Some(ref ctor) = cls.constructor {
+                self.emit_statements(&ctor.body);
+            }
+            self.dedent();
+            self.write_line("end\n");
+        }
 
         // Emit instance methods: `function ClassName:method(...)`
         for method in &cls.methods {
@@ -529,7 +549,11 @@ impl<'a> LuaEmitter<'a> {
                 .map(|p| p.name.clone())
                 .collect::<Vec<_>>()
                 .join(", ");
-            self.write_line(&format!("function {name}:{}({params})", method.name));
+            let lua_method_name = match method.name.as_str() {
+                "__str__" | "__repr__" => "__tostring",
+                other => other,
+            };
+            self.write_line(&format!("function {name}:{lua_method_name}({params})"));
             self.indent();
             self.emit_statements(&method.body);
             self.dedent();

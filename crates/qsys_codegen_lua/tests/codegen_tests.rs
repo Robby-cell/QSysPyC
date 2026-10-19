@@ -81,7 +81,7 @@ def format_label(prefix: str, idx: int):
     assert!(lua.contains("[(idx) + 1]"));
 
     // Verify string concatenation: (prefix .. val)
-    assert!(lua.contains("(prefix .. _v"));
+    assert!(lua.contains("(prefix .. val)"));
 }
 
 #[test]
@@ -152,4 +152,123 @@ class LayoutPlugin(QSysPlugin):
     // len() and chr() lowered to # and string.char
     assert!(lua.contains("(#msg)"));
     assert!(lua.contains("string.char(65)"));
+}
+
+#[test]
+fn test_global_custom_class_and_statements_order() {
+    let plugin_src = r#"
+class Foo:
+    def __init__(self) -> None:
+        pass
+
+    def get_number(self) -> int:
+        return 42
+
+foo = Foo()
+print(foo)
+
+class MatrixMixer(QSysPlugin):
+    name = "MatrixMixer"
+    version = "1.0.0"
+"#;
+    let lua = compile_to_lua(plugin_src);
+
+    let class_def_pos = lua
+        .find("local Foo = {}")
+        .expect("Must emit `local Foo = {}`");
+    let ctor_def_pos = lua
+        .find("function Foo.new()")
+        .expect("Must emit `function Foo.new()`");
+    let method_def_pos = lua
+        .find("function Foo:get_number()")
+        .expect("Must emit `function Foo:get_number()`");
+    let inst_pos = lua
+        .find("local foo = Foo.new()")
+        .expect("Must emit `local foo = Foo.new()`");
+    let print_pos = lua.find("print(foo)").expect("Must emit `print(foo)`");
+
+    assert!(
+        class_def_pos < ctor_def_pos
+            && ctor_def_pos < method_def_pos
+            && method_def_pos < inst_pos
+            && inst_pos < print_pos,
+        "Class definition and methods must be emitted BEFORE `local foo = Foo.new()` and `print(foo)`:\n{lua}"
+    );
+}
+
+#[test]
+fn test_custom_class_inheritance() {
+    let plugin_src = r#"
+class Foo:
+    def __init__(self): pass
+    def show(): print("Foo")
+
+class Bar(Foo):
+    def __init__(self): pass
+
+bar = Bar()
+bar.show()
+
+class MatrixMixer(QSysPlugin):
+    name = "MatrixMixer"
+    version = "1.0.0"
+"#;
+    let lua = compile_to_lua(plugin_src);
+
+    assert!(
+        lua.contains("setmetatable(Bar, { __index = Foo })"),
+        "Must link Bar metatable to Foo for inheritance:\n{lua}"
+    );
+    assert!(
+        lua.contains("local bar = Bar.new()"),
+        "Must instantiate Bar:\n{lua}"
+    );
+    assert!(
+        lua.contains("bar:show()"),
+        "Must dispatch inherited method with colon call:\n{lua}"
+    );
+}
+
+#[test]
+fn test_custom_class_inheritance_with_super() {
+    let plugin_src = r#"
+class Foo:
+    def __init__(self, x: int):
+        self.x = x
+    def show(self):
+        print(self.x)
+
+class Bar(Foo):
+    def __init__(self, x: int, y: int):
+        super().__init__(x)
+        self.y = y
+    def show(self):
+        super().show()
+        print(self.y)
+
+bar = Bar(10, 20)
+bar.show()
+
+class MatrixMixer(QSysPlugin):
+    name = "MatrixMixer"
+    version = "1.0.0"
+"#;
+    let lua = compile_to_lua(plugin_src);
+
+    assert!(
+        lua.contains("setmetatable(Bar, { __index = Foo })"),
+        "Must link Bar metatable to Foo:\n{lua}"
+    );
+    assert!(
+        lua.contains("function Foo:__init(x)"),
+        "Base class must emit :__init when subclass calls super().__init__:\n{lua}"
+    );
+    assert!(
+        lua.contains("Foo.__init(self, x)"),
+        "Subclass super().__init__(x) must lower to Foo.__init(self, x):\n{lua}"
+    );
+    assert!(
+        lua.contains("Foo.show(self)"),
+        "Subclass super().show() must lower to Foo.show(self):\n{lua}"
+    );
 }

@@ -55,6 +55,7 @@ const KNOWN_GLOBALS: &[&str] = &[
     "Property",
     "QSysPlugin",
     "TextController",
+    "super",
 ];
 
 fn find_closest_match(target: &str, candidates: &[String]) -> Option<String> {
@@ -141,6 +142,29 @@ impl<'a> ExprAnalyzer<'a> {
                         let sub_ty = self.infer_expr(sub_val);
                         let _ = self.infer_expr(sub_idx);
                         self.type_map.insert_type(target.span, sub_ty);
+                    }
+                    ast::ExprKind::Attribute {
+                        value: obj_val,
+                        attr,
+                    } => {
+                        if let ast::ExprKind::Ident(obj_name) = &obj_val.kind
+                            && let Some(sym) = self.scope_stack.lookup(obj_name)
+                            && let SymbolKind::Variable {
+                                ty: Type::UserInstance { ref name },
+                                ..
+                            }
+                            | SymbolKind::Parameter {
+                                ty: Type::UserInstance { ref name },
+                                ..
+                            } = sym.kind
+                        {
+                            self.type_map.insert_class_member_type(
+                                name.clone(),
+                                attr.clone(),
+                                val_ty,
+                            );
+                        }
+                        let _ = self.infer_expr(target);
                     }
                     _ => {
                         let _ = self.infer_expr(target);
@@ -256,12 +280,13 @@ impl<'a> ExprAnalyzer<'a> {
                             Type::Any
                         }
                     } else {
-                        Type::Any
+                        crate::type_from_annotation(param.type_annotation.as_deref())
                     };
                     self.type_map
                         .insert_symbol_name(param_sym_id, param.name.clone());
                     self.type_map
                         .insert_resolution(param.span, ResolvedTarget::Local(param_sym_id));
+                    self.type_map.insert_type(param.span, param_ty.clone());
                     self.scope_stack.define(Symbol::new(
                         param_sym_id,
                         param.name.clone(),
@@ -276,10 +301,41 @@ impl<'a> ExprAnalyzer<'a> {
 
                 self.analyze_statements(&f.body);
                 self.scope_stack.pop_scope();
+
+                let mut ret_ty = crate::type_from_annotation(f.return_type.as_deref());
+                if ret_ty == Type::Any {
+                    for body_stmt in &f.body {
+                        if let ast::StmtKind::Return(Some(ret_expr)) = &body_stmt.kind
+                            && let Some(inferred) = self.type_map.get_type(ret_expr.span)
+                            && *inferred != Type::Any
+                        {
+                            ret_ty = inferred.clone();
+                            break;
+                        }
+                    }
+                }
+
+                if let Some(cls_name) = enclosing_class {
+                    self.type_map
+                        .insert_class_member_type(cls_name, f.name.clone(), ret_ty);
+                } else {
+                    self.type_map
+                        .insert_function_return_type(f.name.clone(), ret_ty);
+                }
             }
 
             ast::StmtKind::ClassDef(c) => {
                 let sym_id = self.scope_stack.alloc_symbol_id();
+
+                if let Some(base_name) = c.bases.first()
+                    && !matches!(
+                        base_name.as_str(),
+                        "QSysPlugin" | "TextController" | "object"
+                    )
+                {
+                    self.type_map
+                        .insert_class_base(c.name.clone(), base_name.clone());
+                }
 
                 self.scope_stack.define(Symbol::new(
                     sym_id,
@@ -290,6 +346,18 @@ impl<'a> ExprAnalyzer<'a> {
                     },
                     c.span,
                 ));
+
+                // Pre-register methods on the class so intra-class `self.method()` calls resolve cleanly
+                for body_stmt in &c.body {
+                    if let ast::StmtKind::FunctionDef(f) = &body_stmt.kind {
+                        let annotated_ret = crate::type_from_annotation(f.return_type.as_deref());
+                        self.type_map.insert_class_member_type(
+                            c.name.clone(),
+                            f.name.clone(),
+                            annotated_ret,
+                        );
+                    }
+                }
 
                 self.scope_stack.push_scope(ScopeKind::Class {
                     name: c.name.clone(),
@@ -509,6 +577,29 @@ impl<'a> ExprAnalyzer<'a> {
                             Type::Any
                         }
                     }
+                    Type::UserInstance { ref name } => {
+                        if let Some(member_ty) =
+                            self.type_map.get_class_member_type(name, attr).cloned()
+                        {
+                            member_ty
+                        } else {
+                            let known_members = self.type_map.class_member_names(name);
+                            if !known_members.is_empty() {
+                                let candidates = find_closest_match(attr, &known_members)
+                                    .map(|c| vec![c])
+                                    .unwrap_or_default();
+                                self.diagnostics.report(
+                                    DiagnosticKind::UnknownClassMember {
+                                        class_name: name.clone(),
+                                        member: attr.clone(),
+                                        candidates,
+                                    },
+                                    expr.span,
+                                );
+                            }
+                            Type::Any
+                        }
+                    }
                     _ => Type::Any,
                 }
             }
@@ -675,6 +766,13 @@ impl<'a> ExprAnalyzer<'a> {
                             Some(Type::TimerClass) => Type::TimerHandle,
                             _ => Type::Any,
                         }
+                    } else if let Some(
+                        Type::UserInstance { ref name } | Type::ClassInstance { ref name },
+                    ) = receiver_ty
+                        && let Some(ret_ty) =
+                            self.type_map.get_class_member_type(name, attr).cloned()
+                    {
+                        ret_ty
                     } else if receiver_ty == Some(Type::String) {
                         match attr.as_str() {
                             "upper" | "lower" | "strip" | "lstrip" | "rstrip" | "replace"
@@ -704,7 +802,30 @@ impl<'a> ExprAnalyzer<'a> {
                                 Type::Float
                             }
                         }
-                        _ => Type::Any,
+                        "super" => {
+                            if let Some(sym) = self.scope_stack.lookup("self")
+                                && let SymbolKind::Variable {
+                                    ty: Type::UserInstance { ref name },
+                                    ..
+                                }
+                                | SymbolKind::Parameter {
+                                    ty: Type::UserInstance { ref name },
+                                    ..
+                                } = sym.kind
+                                && let Some(base_name) = self.type_map.get_class_base(name)
+                            {
+                                Type::UserInstance {
+                                    name: base_name.to_string(),
+                                }
+                            } else {
+                                Type::Any
+                            }
+                        }
+                        _ => self
+                            .type_map
+                            .get_function_return_type(fn_name)
+                            .cloned()
+                            .unwrap_or(Type::Any),
                     }
                 } else {
                     Type::Any

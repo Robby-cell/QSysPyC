@@ -7,7 +7,7 @@ use crate::{SemanticModel, TargetKind, TruthinessStrategy, TypeMap};
 pub fn lower_to_ir(model: &SemanticModel) -> IRProgram {
     match &model.target {
         TargetKind::Plugin(p) => {
-            let mut lowerer = StmtLowerer::new(&model.type_map, true);
+            let mut lowerer = StmtLowerer::new(&model.type_map, true, &p.helper_classes);
 
             let classes = p
                 .helper_classes
@@ -74,7 +74,7 @@ pub fn lower_to_ir(model: &SemanticModel) -> IRProgram {
         }
 
         TargetKind::TextController(c) => {
-            let mut lowerer = StmtLowerer::new(&model.type_map, false);
+            let mut lowerer = StmtLowerer::new(&model.type_map, false, &c.helper_classes);
 
             let classes = c
                 .helper_classes
@@ -123,13 +123,14 @@ pub fn lower_to_ir(model: &SemanticModel) -> IRProgram {
                 classes,
                 methods,
                 event_bindings,
+                symbol_names: model.type_map.symbol_names().clone(),
                 body,
                 span: c.span,
             }))
         }
 
         TargetKind::ProceduralScript(s) => {
-            let mut lowerer = StmtLowerer::new(&model.type_map, false);
+            let mut lowerer = StmtLowerer::new(&model.type_map, false, &s.classes);
 
             let classes = s
                 .classes
@@ -152,6 +153,7 @@ pub fn lower_to_ir(model: &SemanticModel) -> IRProgram {
                 classes,
                 methods,
                 event_bindings: Vec::new(),
+                symbol_names: model.type_map.symbol_names().clone(),
                 body,
                 span: qsys_diagnostics::Span::new(0, 0),
             }))
@@ -162,13 +164,17 @@ pub fn lower_to_ir(model: &SemanticModel) -> IRProgram {
 struct StmtLowerer<'a> {
     type_map: &'a TypeMap,
     is_plugin: bool,
+    custom_classes: &'a [ast::ClassDef],
+    current_class_base: Option<String>,
 }
 
 impl<'a> StmtLowerer<'a> {
-    fn new(type_map: &'a TypeMap, is_plugin: bool) -> Self {
+    fn new(type_map: &'a TypeMap, is_plugin: bool, custom_classes: &'a [ast::ClassDef]) -> Self {
         Self {
             type_map,
             is_plugin,
+            custom_classes,
+            current_class_base: None,
         }
     }
 
@@ -387,7 +393,7 @@ impl<'a> StmtLowerer<'a> {
                 }))
             }
 
-            _ => None,
+            ast::StmtKind::ClassDef(cls) => Some(IRStmt::ClassDef(self.lower_class(cls))),
         }
     }
 
@@ -652,6 +658,34 @@ impl<'a> StmtLowerer<'a> {
                             };
                         }
 
+                        // `super().method(...)` -> `BaseName.method(self, ...)`
+                        if let ast::ExprKind::Call {
+                            callee: super_callee,
+                            args: super_args,
+                            ..
+                        } = &value.kind
+                            && super_args.is_empty()
+                            && matches!(&super_callee.kind, ast::ExprKind::Ident(id) if id == "super")
+                            && let Some(ref base_name) = self.current_class_base
+                        {
+                            let target_method = if attr == "__init__" {
+                                "__init"
+                            } else {
+                                attr.as_str()
+                            };
+                            let mut call_args = Vec::with_capacity(args_ir.len() + 1);
+                            call_args.push(IRExpr::Global("self".to_string()));
+                            call_args.extend(args_ir);
+                            return IRExpr::Call {
+                                callee: Box::new(IRExpr::Attribute {
+                                    object: Box::new(IRExpr::Global(base_name.clone())),
+                                    attr: target_method.to_string(),
+                                }),
+                                args: call_args,
+                                kwargs: kwargs_ir,
+                            };
+                        }
+
                         let obj_ty = self.type_map.get_type(value.span);
 
                         // Socket, Timer, or custom class instance method call -> `obj:method(...)`
@@ -739,40 +773,19 @@ impl<'a> StmtLowerer<'a> {
     }
 
     fn lower_class(&mut self, cls: &ast::ClassDef) -> IRClass {
+        let base = cls
+            .bases
+            .first()
+            .filter(|b| !matches!(b.as_str(), "QSysPlugin" | "TextController" | "object"))
+            .cloned();
+
+        let prev_base = std::mem::replace(&mut self.current_class_base, base.clone());
         let mut constructor = None;
         let mut methods = Vec::new();
 
         for stmt in &cls.body {
             if let ast::StmtKind::FunctionDef(f) = &stmt.kind {
-                let func_id = self
-                    .type_map
-                    .get_resolution(f.span)
-                    .and_then(|r| match r {
-                        ResolvedTarget::Function(id) => Some(*id),
-                        _ => None,
-                    })
-                    .unwrap_or(FunctionId(0));
-
-                // Filter out `self` parameter because Lua methods and constructors
-                // manage `self` implicitly via metatables or colon calls
-                let params: Vec<_> = f
-                    .params
-                    .iter()
-                    .filter(|p| p.name != "self")
-                    .map(|p| {
-                        let sym_id = self
-                            .type_map
-                            .get_resolution(p.span)
-                            .and_then(|r| match r {
-                                ResolvedTarget::Local(id) => Some(*id),
-                                _ => None,
-                            })
-                            .unwrap_or(SymbolId(0));
-                        (sym_id, p.name.clone())
-                    })
-                    .collect();
-
-                let lowered_fn = self.lower_function(func_id, &f.name, &params, &f.body, f.span);
+                let lowered_fn = self.lower_class_method(f);
 
                 if f.name == "__init__" {
                     constructor = Some(lowered_fn);
@@ -782,13 +795,152 @@ impl<'a> StmtLowerer<'a> {
             }
         }
 
+        // If this subclass has no `__init__`, inherit the nearest ancestor's `__init__`
+        if constructor.is_none()
+            && let Some(ref base_name) = base
+            && let Some((ancestor_cls, ancestor_init)) =
+                find_inherited_init(base_name, self.custom_classes)
+        {
+            let ancestor_base = ancestor_cls
+                .bases
+                .first()
+                .filter(|b| !matches!(b.as_str(), "QSysPlugin" | "TextController" | "object"))
+                .cloned();
+            let saved = std::mem::replace(&mut self.current_class_base, ancestor_base);
+            constructor = Some(self.lower_class_method(ancestor_init));
+            self.current_class_base = saved;
+        }
+
+        self.current_class_base = prev_base;
+
+        let emit_init_method = class_needs_init_method(&cls.name, self.custom_classes);
+
         IRClass {
             name: cls.name.clone(),
+            base,
             constructor,
+            emit_init_method,
             methods,
             span: cls.span,
         }
     }
+
+    fn lower_class_method(&mut self, f: &ast::FunctionDef) -> IRFunction {
+        let func_id = self
+            .type_map
+            .get_resolution(f.span)
+            .and_then(|r| match r {
+                ResolvedTarget::Function(id) => Some(*id),
+                _ => None,
+            })
+            .unwrap_or(FunctionId(0));
+
+        // Filter out `self` parameter because Lua methods and constructors
+        // manage `self` implicitly via metatables or colon calls
+        let params: Vec<_> = f
+            .params
+            .iter()
+            .filter(|p| p.name != "self")
+            .map(|p| {
+                let sym_id = self
+                    .type_map
+                    .get_resolution(p.span)
+                    .and_then(|r| match r {
+                        ResolvedTarget::Local(id) => Some(*id),
+                        _ => None,
+                    })
+                    .unwrap_or(SymbolId(0));
+                (sym_id, p.name.clone())
+            })
+            .collect();
+
+        self.lower_function(func_id, &f.name, &params, &f.body, f.span)
+    }
+}
+
+fn find_inherited_init<'a>(
+    base_name: &str,
+    classes: &'a [ast::ClassDef],
+) -> Option<(&'a ast::ClassDef, &'a ast::FunctionDef)> {
+    let mut current = Some(base_name);
+    let mut depth = 0;
+    while let Some(target_name) = current {
+        if depth > 16 {
+            break;
+        }
+        depth += 1;
+        let cls = classes.iter().find(|c| c.name == target_name)?;
+        for stmt in &cls.body {
+            if let ast::StmtKind::FunctionDef(f) = &stmt.kind
+                && f.name == "__init__"
+            {
+                return Some((cls, f));
+            }
+        }
+        current = cls
+            .bases
+            .first()
+            .filter(|b| !matches!(b.as_str(), "QSysPlugin" | "TextController" | "object"))
+            .map(|s| s.as_str());
+    }
+    None
+}
+
+fn class_needs_init_method(class_name: &str, classes: &[ast::ClassDef]) -> bool {
+    classes.iter().any(|c| {
+        c.bases.first().is_some_and(|b| b == class_name)
+            && c.body.iter().any(|stmt| {
+                if let ast::StmtKind::FunctionDef(f) = &stmt.kind {
+                    f.body.iter().any(stmt_calls_super_init)
+                } else {
+                    false
+                }
+            })
+    })
+}
+
+fn stmt_calls_super_init(stmt: &ast::Stmt) -> bool {
+    match &stmt.kind {
+        ast::StmtKind::Expr(expr)
+        | ast::StmtKind::Return(Some(expr))
+        | ast::StmtKind::Assign { value: expr, .. }
+        | ast::StmtKind::AugAssign { value: expr, .. } => expr_calls_super_init(expr),
+        ast::StmtKind::If {
+            condition,
+            then_branch,
+            else_branch,
+        } => {
+            expr_calls_super_init(condition)
+                || then_branch.iter().any(stmt_calls_super_init)
+                || else_branch.iter().any(stmt_calls_super_init)
+        }
+        ast::StmtKind::While { condition, body } => {
+            expr_calls_super_init(condition) || body.iter().any(stmt_calls_super_init)
+        }
+        ast::StmtKind::For { iterable, body, .. } => {
+            expr_calls_super_init(iterable) || body.iter().any(stmt_calls_super_init)
+        }
+        _ => false,
+    }
+}
+
+fn expr_calls_super_init(expr: &ast::Expr) -> bool {
+    if let ast::ExprKind::Call { callee, args, .. } = &expr.kind {
+        if let ast::ExprKind::Attribute { value, attr } = &callee.kind
+            && attr == "__init__"
+            && let ast::ExprKind::Call {
+                callee: super_callee,
+                args: super_args,
+                ..
+            } = &value.kind
+            && super_args.is_empty()
+            && matches!(&super_callee.kind, ast::ExprKind::Ident(id) if id == "super")
+        {
+            return true;
+        }
+        return expr_calls_super_init(callee) || args.iter().any(expr_calls_super_init);
+    }
+    false
 }
 
 fn lower_binary_op(op: ast::BinaryOp) -> IRBinaryOp {

@@ -87,6 +87,9 @@ pub struct TypeMap {
     truthiness: FxHashMap<Span, TruthinessStrategy>,
     resolutions: FxHashMap<Span, ResolvedTarget>,
     symbol_names: FxHashMap<SymbolId, String>,
+    class_bases: FxHashMap<String, String>,
+    class_member_types: FxHashMap<(String, String), Type>,
+    function_return_types: FxHashMap<String, Type>,
 }
 
 impl TypeMap {
@@ -100,6 +103,73 @@ impl TypeMap {
 
     pub fn symbol_names(&self) -> &FxHashMap<SymbolId, String> {
         &self.symbol_names
+    }
+
+    pub fn insert_class_base(
+        &mut self,
+        class_name: impl Into<String>,
+        base_name: impl Into<String>,
+    ) {
+        self.class_bases.insert(class_name.into(), base_name.into());
+    }
+
+    pub fn get_class_base(&self, class_name: &str) -> Option<&str> {
+        self.class_bases.get(class_name).map(String::as_str)
+    }
+
+    pub fn insert_class_member_type(
+        &mut self,
+        class_name: impl Into<String>,
+        member_name: impl Into<String>,
+        ty: Type,
+    ) {
+        self.class_member_types
+            .insert((class_name.into(), member_name.into()), ty);
+    }
+
+    pub fn get_class_member_type(&self, class_name: &str, member_name: &str) -> Option<&Type> {
+        let mut current = class_name;
+        for _ in 0..16 {
+            if let Some(ty) = self
+                .class_member_types
+                .get(&(current.to_string(), member_name.to_string()))
+            {
+                return Some(ty);
+            }
+            if let Some(base) = self.class_bases.get(current) {
+                current = base;
+            } else {
+                break;
+            }
+        }
+        None
+    }
+
+    pub fn class_member_names(&self, class_name: &str) -> Vec<String> {
+        let mut names = Vec::new();
+        let mut current = class_name;
+        for _ in 0..16 {
+            for (cls, member) in self.class_member_types.keys() {
+                if cls == current && member != "__init__" && !names.contains(member) {
+                    names.push(member.clone());
+                }
+            }
+            if let Some(base) = self.class_bases.get(current) {
+                current = base;
+            } else {
+                break;
+            }
+        }
+        names.sort();
+        names
+    }
+
+    pub fn insert_function_return_type(&mut self, fn_name: impl Into<String>, ty: Type) {
+        self.function_return_types.insert(fn_name.into(), ty);
+    }
+
+    pub fn get_function_return_type(&self, fn_name: &str) -> Option<&Type> {
+        self.function_return_types.get(fn_name)
     }
 
     pub fn insert_type(&mut self, span: Span, ty: Type) {

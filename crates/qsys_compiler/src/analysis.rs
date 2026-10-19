@@ -56,7 +56,7 @@ impl Analyzer {
     /// Queries the Rust semantic model to produce hover documentation at (line, col).
     pub fn hover(source: &str, line: usize, col: usize) -> Option<LspHover> {
         let file = SourceFile::new(FileId(1), "input.py", source);
-        let (_, model) = parse_and_analyze_for_ide(source, line);
+        let (parsed, model) = parse_and_analyze_for_ide(source, line);
 
         let cursor_offset = file.offset(line, col);
         let (word, word_start, word_end) = get_word_at_offset(&file.src, cursor_offset)?;
@@ -189,6 +189,91 @@ impl Analyzer {
                     end_line,
                     end_col,
                 });
+            }
+        }
+
+        // 4b. Search custom classes and their methods in the parsed AST
+        for stmt in &parsed.module.statements {
+            if let ast::StmtKind::ClassDef(cls) = &stmt.kind
+                && !cls
+                    .bases
+                    .iter()
+                    .any(|b| b == "QSysPlugin" || b == "TextController")
+            {
+                if word == cls.name {
+                    let method_list: Vec<String> = cls
+                        .body
+                        .iter()
+                        .filter_map(|s| {
+                            if let ast::StmtKind::FunctionDef(f) = &s.kind {
+                                let ret = f.return_type.as_deref().unwrap_or("Any");
+                                Some(format!("- `def {}(...) -> {ret}`", f.name))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    let doc = if method_list.is_empty() {
+                        format!(
+                            "Custom class `{}` (compiled to Lua metatable `{}.new()`).",
+                            cls.name, cls.name
+                        )
+                    } else {
+                        format!(
+                            "Custom class `{}` (compiled to Lua metatable `{}.new()`).\n\n**Methods:**\n{}",
+                            cls.name,
+                            cls.name,
+                            method_list.join("\n")
+                        )
+                    };
+                    return Some(LspHover {
+                        contents: vec![format!("*(class)* `class {}`", cls.name), doc],
+                        start_line,
+                        start_col,
+                        end_line,
+                        end_col,
+                    });
+                }
+
+                for body_stmt in &cls.body {
+                    if let ast::StmtKind::FunctionDef(f) = &body_stmt.kind
+                        && word == f.name
+                    {
+                        let params_str = f
+                            .params
+                            .iter()
+                            .map(|p| {
+                                if let Some(ref ann) = p.type_annotation {
+                                    format!("{}: {ann}", p.name)
+                                } else {
+                                    p.name.clone()
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let ret_str = f
+                            .return_type
+                            .as_deref()
+                            .map(|r| format!(" -> {r}"))
+                            .unwrap_or_default();
+                        return Some(LspHover {
+                            contents: vec![
+                                format!(
+                                    "*(method)* `def {}.{}({}){}`",
+                                    cls.name, f.name, params_str, ret_str
+                                ),
+                                format!(
+                                    "Method on custom class `{}` (emitted as `function {}:{}()` in Lua).",
+                                    cls.name, cls.name, f.name
+                                ),
+                            ],
+                            start_line,
+                            start_col,
+                            end_line,
+                            end_col,
+                        });
+                    }
+                }
             }
         }
 
@@ -478,6 +563,90 @@ impl Analyzer {
                     }
                     return items;
                 }
+                Some(Type::UserInstance { ref name }) => {
+                    let mut seen = Vec::new();
+                    let mut current_cls = Some(name.as_str());
+                    let mut depth = 0;
+                    while let Some(target_cls_name) = current_cls {
+                        if depth > 16 {
+                            break;
+                        }
+                        depth += 1;
+                        for stmt in &parsed.module.statements {
+                            if let ast::StmtKind::ClassDef(cls) = &stmt.kind
+                                && cls.name == target_cls_name
+                            {
+                                for body_stmt in &cls.body {
+                                    if let ast::StmtKind::FunctionDef(f) = &body_stmt.kind {
+                                        if matches!(
+                                            f.name.as_str(),
+                                            "__init__" | "__str__" | "__repr__"
+                                        ) || seen.contains(&f.name)
+                                        {
+                                            continue;
+                                        }
+                                        if matches_prefix(&f.name, partial) {
+                                            seen.push(f.name.clone());
+                                            let user_params: Vec<_> = f
+                                                .params
+                                                .iter()
+                                                .filter(|p| p.name != "self")
+                                                .map(|p| p.name.as_str())
+                                                .collect();
+                                            let ret_str = f
+                                                .return_type
+                                                .as_deref()
+                                                .map(|r| format!(" -> {r}"))
+                                                .unwrap_or_default();
+                                            let insert_text = if user_params.is_empty() {
+                                                format!("{}()", f.name)
+                                            } else {
+                                                format!("{}(${{0}})", f.name)
+                                            };
+                                            items.push(LspCompletion {
+                                                label: f.name.clone(),
+                                                kind: "Method".to_string(),
+                                                detail: format!(
+                                                    "def {}.{}({}){}",
+                                                    cls.name,
+                                                    f.name,
+                                                    user_params.join(", "),
+                                                    ret_str
+                                                ),
+                                                documentation: format!(
+                                                    "Calls `{}:{}(...)` on `{}` instance.",
+                                                    cls.name, f.name, name
+                                                ),
+                                                insert_text,
+                                                is_snippet: !user_params.is_empty(),
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        current_cls = model.type_map.get_class_base(target_cls_name);
+                    }
+
+                    for member_name in model.type_map.class_member_names(name) {
+                        if !seen.contains(&member_name) && matches_prefix(&member_name, partial) {
+                            let ty_str = model
+                                .type_map
+                                .get_class_member_type(name, &member_name)
+                                .and_then(format_type_display)
+                                .unwrap_or_else(|| "Any".to_string());
+                            items.push(LspCompletion {
+                                label: member_name.clone(),
+                                kind: "Field".to_string(),
+                                detail: format!("(field) {name}.{member_name}: {ty_str}"),
+                                documentation: format!("Instance attribute on `{name}`."),
+                                insert_text: member_name,
+                                is_snippet: false,
+                            });
+                        }
+                    }
+                    return items;
+                }
                 _ => {
                     // Default to ControlHandle runtime members (covers `self.Gain.`, `ctl.`, `Controls["x"].`)
                     for &member_name in ControlMember::all_member_names() {
@@ -505,6 +674,52 @@ impl Analyzer {
         let ident_partial =
             prefix.trim_start_matches(['(', '[', '{', ',', '=', ':', '+', '-', '*', '/']);
 
+        // Include custom classes and module-level variables from the AST
+        for stmt in &parsed.module.statements {
+            match &stmt.kind {
+                ast::StmtKind::ClassDef(cls)
+                    if !cls
+                        .bases
+                        .iter()
+                        .any(|b| b == "QSysPlugin" || b == "TextController") =>
+                {
+                    if matches_prefix(&cls.name, ident_partial) {
+                        items.push(LspCompletion {
+                            label: cls.name.clone(),
+                            kind: "Class".to_string(),
+                            detail: format!("class {} -> {}.new()", cls.name, cls.name),
+                            documentation: format!(
+                                "Instantiates custom class `{}` (`{}.new()`).",
+                                cls.name, cls.name
+                            ),
+                            insert_text: format!("{}()", cls.name),
+                            is_snippet: false,
+                        });
+                    }
+                }
+                ast::StmtKind::Assign { target, .. } => {
+                    if let ast::ExprKind::Ident(var_name) = &target.kind
+                        && matches_prefix(var_name, ident_partial)
+                    {
+                        let ty_str = model
+                            .type_map
+                            .get_type(target.span)
+                            .and_then(format_type_display)
+                            .unwrap_or_else(|| "Any".to_string());
+                        items.push(LspCompletion {
+                            label: var_name.clone(),
+                            kind: "Variable".to_string(),
+                            detail: format!("(local) {var_name}: {ty_str}"),
+                            documentation: format!("Module-scope variable `{var_name}`."),
+                            insert_text: var_name.clone(),
+                            is_snippet: false,
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+
         for item in top_level_completions(controls, properties, methods) {
             if matches_prefix(&item.label, ident_partial) {
                 items.push(item);
@@ -520,6 +735,8 @@ impl Analyzer {
         let (parsed, model) = parse_and_analyze_for_ide(source, 0);
 
         let mut hints = Vec::new();
+
+        collect_stmt_inlay_hints(&parsed.module.statements, &file, &model, &mut hints);
 
         for stmt in &parsed.module.statements {
             if let ast::StmtKind::ClassDef(cls) = &stmt.kind {
@@ -643,10 +860,17 @@ fn collect_stmt_inlay_hints(
 ) {
     for stmt in stmts {
         match &stmt.kind {
-            ast::StmtKind::Assign { target, .. } => {
+            ast::StmtKind::Assign { target, value } => {
+                let is_obvious_literal = matches!(
+                    value.kind,
+                    ast::ExprKind::Int(_)
+                        | ast::ExprKind::Float(_)
+                        | ast::ExprKind::String(_)
+                        | ast::ExprKind::Bool(_)
+                );
                 if let ast::ExprKind::Ident(_) = &target.kind
                     && let Some(ty) = model.type_map.get_type(target.span)
-                    && matches!(
+                    && (matches!(
                         ty,
                         Type::UdpSocketHandle
                             | Type::TcpSocketHandle
@@ -654,7 +878,7 @@ fn collect_stmt_inlay_hints(
                             | Type::ControlHandle
                             | Type::PropertyHandle
                             | Type::UserInstance { .. }
-                    )
+                    ) || !is_obvious_literal)
                     && let Some(ty_str) = format_type_display(ty)
                 {
                     let (line, col) = file.location(target.span.end);
@@ -718,7 +942,7 @@ fn infer_receiver_type(
         }
     }
 
-    // Fallback: inspect AST assignments `receiver = UdpSocket.New()` etc.
+    // Fallback: inspect AST assignments `receiver = UdpSocket.New()` or `receiver = Foo()`
     find_assigned_type_in_module(&parsed.module.statements, receiver)
 }
 
@@ -729,15 +953,23 @@ fn find_assigned_type_in_module(stmts: &[ast::Stmt], var_name: &str) -> Option<T
                 if let ast::ExprKind::Ident(name) = &target.kind
                     && name == var_name
                     && let ast::ExprKind::Call { callee, .. } = &value.kind
-                    && let ast::ExprKind::Attribute { value: recv, attr } = &callee.kind
-                    && attr == "New"
-                    && let ast::ExprKind::Ident(cls_name) = &recv.kind
                 {
-                    match cls_name.as_str() {
-                        "UdpSocket" => return Some(Type::UdpSocketHandle),
-                        "TcpSocket" => return Some(Type::TcpSocketHandle),
-                        "Timer" => return Some(Type::TimerHandle),
-                        _ => {}
+                    if let ast::ExprKind::Attribute { value: recv, attr } = &callee.kind
+                        && attr == "New"
+                        && let ast::ExprKind::Ident(cls_name) = &recv.kind
+                    {
+                        match cls_name.as_str() {
+                            "UdpSocket" => return Some(Type::UdpSocketHandle),
+                            "TcpSocket" => return Some(Type::TcpSocketHandle),
+                            "Timer" => return Some(Type::TimerHandle),
+                            _ => {}
+                        }
+                    } else if let ast::ExprKind::Ident(cls_name) = &callee.kind
+                        && cls_name.chars().next().is_some_and(char::is_uppercase)
+                    {
+                        return Some(Type::UserInstance {
+                            name: cls_name.clone(),
+                        });
                     }
                 }
             }

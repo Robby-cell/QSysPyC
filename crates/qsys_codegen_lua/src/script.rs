@@ -7,6 +7,7 @@ pub fn emit_script(script: &IRScript, ctx: &mut CodegenContext) -> String {
     for ctl in &script.controls {
         ctx.controls.insert(ctl.id, ctl.def.clone());
     }
+    ctx.symbol_names.extend(script.symbol_names.clone());
     for func in &script.methods {
         ctx.functions.insert(func.id, func.name.clone());
     }
@@ -43,11 +44,6 @@ pub fn emit_script(script: &IRScript, ctx: &mut CodegenContext) -> String {
         emitter.write_line("end\n");
     }
 
-    // Emit classes
-    for cls in &script.classes {
-        emitter.emit_custom_class(cls);
-    }
-
     // Emit event bindings
     for binding in &script.event_bindings {
         let ctl_ref = format!("Controls[{}]", escape_lua_string(&binding.control_name));
@@ -58,7 +54,7 @@ pub fn emit_script(script: &IRScript, ctx: &mut CodegenContext) -> String {
         emitter.write_line("end\n");
     }
 
-    // Emit top-level body statements
+    // Emit top-level body statements (including custom classes in declaration order)
     emitter.emit_statements(&script.body);
 
     emitter.buffer

@@ -90,12 +90,13 @@ pub struct ResolvedMethod {
     pub span: Span,
 }
 
-fn type_from_annotation(ann: Option<&str>) -> Type {
+pub(crate) fn type_from_annotation(ann: Option<&str>) -> Type {
     match ann {
         Some("str") | Some("String") => Type::String,
         Some("int") | Some("Integer") => Type::Int,
         Some("float") | Some("Double") => Type::Float,
         Some("bool") | Some("Boolean") => Type::Bool,
+        Some("None") => Type::None,
         Some("ControlHandle") => Type::ControlHandle,
         Some("PropertyHandle") => Type::PropertyHandle,
         _ => Type::Any,
@@ -110,7 +111,7 @@ pub fn analyze_lossy(parsed: &ParsedModule) -> (SemanticModel, Diagnostics) {
 
     // 1. Collect helper classes
     let mut custom_classes: Vec<ast::ClassDef> = Vec::new();
-    // 2. Collect top-level statements (constants, utility functions, etc.)
+    // 2. Collect top-level statements (constants, helper classes, utility functions, etc.) in source order
     let mut module_statements: Vec<ast::Stmt> = Vec::new();
 
     for stmt in &parsed.module.statements {
@@ -122,6 +123,7 @@ pub fn analyze_lossy(parsed: &ParsedModule) -> (SemanticModel, Diagnostics) {
                     .any(|b| b == "QSysPlugin" || b == "TextController")
                 {
                     custom_classes.push(cls.clone());
+                    module_statements.push(stmt.clone());
                 }
             }
             ast::StmtKind::Import { .. } | ast::StmtKind::ImportFrom { .. } => {}
@@ -577,6 +579,20 @@ pub fn analyze_lossy(parsed: &ParsedModule) -> (SemanticModel, Diagnostics) {
 
                         scope_stack.pop_scope();
 
+                        let mut ret_ty = type_from_annotation(f.return_type.as_deref());
+                        if ret_ty == Type::Any {
+                            for body_stmt in &f.body {
+                                if let ast::StmtKind::Return(Some(ret_expr)) = &body_stmt.kind
+                                    && let Some(inferred) = type_map.get_type(ret_expr.span)
+                                    && *inferred != Type::Any
+                                {
+                                    ret_ty = inferred.clone();
+                                    break;
+                                }
+                            }
+                        }
+                        type_map.insert_function_return_type(f.name.clone(), ret_ty);
+
                         methods.push(ResolvedMethod {
                             id: func_id,
                             name: f.name.clone(),
@@ -589,6 +605,7 @@ pub fn analyze_lossy(parsed: &ParsedModule) -> (SemanticModel, Diagnostics) {
                         let mut analyzer =
                             ExprAnalyzer::new(&mut scope_stack, &mut type_map, &mut diagnostics);
                         analyzer.analyze_stmt(stmt);
+                        top_level_statements.push(stmt.clone());
                     }
                     ast::StmtKind::Import { .. } | ast::StmtKind::ImportFrom { .. } => {}
                     _ => {
