@@ -748,12 +748,11 @@ fn find_assigned_type_in_module(stmts: &[ast::Stmt], var_name: &str) -> Option<T
             }
             ast::StmtKind::FunctionDef(f) => {
                 for (idx, p) in f.params.iter().enumerate() {
-                    if p.name == var_name {
-                        if p.type_annotation.as_deref() == Some("ControlHandle")
-                            || (idx == 1 && !f.decorators.is_empty())
-                        {
-                            return Some(Type::ControlHandle);
-                        }
+                    if p.name == var_name
+                        && (p.type_annotation.as_deref() == Some("ControlHandle")
+                            || (idx == 1 && !f.decorators.is_empty()))
+                    {
+                        return Some(Type::ControlHandle);
                     }
                 }
                 if let Some(ty) = find_assigned_type_in_module(&f.body, var_name) {

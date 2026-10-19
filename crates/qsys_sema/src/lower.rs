@@ -395,15 +395,14 @@ impl<'a> StmtLowerer<'a> {
         if matches!(
             expr.kind,
             ast::ExprKind::Ident(_) | ast::ExprKind::Attribute { .. }
-        ) {
-            if let Some(target) = self.type_map.get_resolution(expr.span) {
-                match target {
-                    ResolvedTarget::Local(id) => return IRExpr::Local(*id),
-                    ResolvedTarget::Control(id) => return IRExpr::Control(*id),
-                    ResolvedTarget::Property(id) => return IRExpr::Property(*id),
-                    ResolvedTarget::Function(id) => return IRExpr::Function(*id),
-                    ResolvedTarget::Global(name) => return IRExpr::Global(name.clone()),
-                }
+        ) && let Some(target) = self.type_map.get_resolution(expr.span)
+        {
+            match target {
+                ResolvedTarget::Local(id) => return IRExpr::Local(*id),
+                ResolvedTarget::Control(id) => return IRExpr::Control(*id),
+                ResolvedTarget::Property(id) => return IRExpr::Property(*id),
+                ResolvedTarget::Function(id) => return IRExpr::Function(*id),
+                ResolvedTarget::Global(name) => return IRExpr::Global(name.clone()),
             }
         }
 
