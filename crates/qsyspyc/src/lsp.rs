@@ -1,12 +1,13 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 
-use qsys_compiler::{Analyzer, Compiler};
-use qsys_diagnostics::{FileId, SourceFile};
+use tokio::sync::RwLock;
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
+
+use qsys_compiler::{Analyzer, Compiler};
+use qsys_diagnostics::{FileId, SourceFile};
 
 pub struct QSysLspBackend {
     client: Client,
@@ -78,6 +79,11 @@ impl LanguageServer for QSysLspBackend {
                 completion_provider: Some(CompletionOptions {
                     trigger_characters: Some(vec![".".to_string(), "@".to_string()]),
                     ..Default::default()
+                }),
+                signature_help_provider: Some(SignatureHelpOptions {
+                    trigger_characters: Some(vec!["(".to_string(), ",".to_string()]),
+                    retrigger_characters: Some(vec![",".to_string()]),
+                    work_done_progress_options: WorkDoneProgressOptions::default(),
                 }),
                 inlay_hint_provider: Some(OneOf::Left(true)),
                 ..Default::default()
@@ -233,6 +239,50 @@ impl LanguageServer for QSysLspBackend {
             .collect();
 
         Ok(Some(lsp_hints))
+    }
+
+    async fn signature_help(&self, params: SignatureHelpParams) -> Result<Option<SignatureHelp>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let pos = params.text_document_position_params.position;
+
+        let docs = self.documents.read().await;
+        let text = match docs.get(&uri) {
+            Some(t) => t,
+            None => return Ok(None),
+        };
+
+        let line = (pos.line + 1) as usize;
+        let col = (pos.character + 1) as usize;
+
+        if let Some(sig) = Analyzer::signature_help(text, line, col) {
+            let parameters = sig
+                .parameters
+                .into_iter()
+                .map(|p| ParameterInformation {
+                    label: ParameterLabel::Simple(p.label),
+                    documentation: Some(Documentation::MarkupContent(MarkupContent {
+                        kind: MarkupKind::Markdown,
+                        value: p.documentation,
+                    })),
+                })
+                .collect();
+
+            Ok(Some(SignatureHelp {
+                signatures: vec![SignatureInformation {
+                    label: sig.label,
+                    documentation: Some(Documentation::MarkupContent(MarkupContent {
+                        kind: MarkupKind::Markdown,
+                        value: sig.documentation,
+                    })),
+                    parameters: Some(parameters),
+                    active_parameter: Some(sig.active_parameter as u32),
+                }],
+                active_signature: Some(0),
+                active_parameter: Some(sig.active_parameter as u32),
+            }))
+        } else {
+            Ok(None)
+        }
     }
 
     async fn shutdown(&self) -> Result<()> {

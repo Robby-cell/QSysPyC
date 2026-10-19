@@ -264,6 +264,8 @@ impl<'a> Lowerer<'a> {
 
             ruff::Stmt::Pass(_) => out.push(Stmt::new(StmtKind::Pass, span)),
 
+            ruff::Stmt::Break(_) => out.push(Stmt::new(StmtKind::Break, span)),
+
             ruff::Stmt::Match(_) => {
                 self.diagnostics
                     .report(DiagnosticKind::UnsupportedMatchStatement, span);
@@ -299,6 +301,16 @@ impl<'a> Lowerer<'a> {
 
             ruff::Expr::StringLiteral(s) => ExprKind::String(s.value.to_str().to_string()),
 
+            ruff::Expr::BytesLiteral(b) => {
+                let mut s = String::new();
+                for part in &b.value {
+                    for &byte in part.as_slice() {
+                        s.push(char::from(byte));
+                    }
+                }
+                ExprKind::String(s)
+            }
+
             ruff::Expr::FString(f) => {
                 let mut parts: Vec<Expr> = Vec::new();
 
@@ -322,12 +334,13 @@ impl<'a> Lowerer<'a> {
                                     ruff::InterpolatedStringElement::Interpolation(interp) => {
                                         let inner = self.lower_expr(&interp.expression);
                                         let span = text_range_to_span(interp.range());
+                                        let callee_span = Span::new(span.start, span.start);
 
                                         let str_call = Expr::new(
                                             ExprKind::Call {
                                                 callee: Box::new(Expr::new(
                                                     ExprKind::Ident("str".to_string()),
-                                                    span,
+                                                    callee_span,
                                                 )),
                                                 args: vec![inner],
                                                 kwargs: Vec::new(),

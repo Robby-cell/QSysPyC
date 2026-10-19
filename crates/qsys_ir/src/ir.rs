@@ -54,6 +54,7 @@ pub struct IRScript {
     pub name: String,
     pub is_controller: bool,
     pub bound_pins: Vec<String>,
+    pub controls: Vec<IRControlBinding>,
     pub classes: Vec<IRClass>,
     pub methods: Vec<IRFunction>,
     pub event_bindings: Vec<IREventBinding>,
@@ -117,6 +118,9 @@ pub enum IRStmt {
         value: Option<IRExpr>,
         span: Span,
     },
+    Break {
+        span: Span,
+    },
     Expr {
         expr: IRExpr,
         span: Span,
@@ -155,6 +159,7 @@ pub enum IRExpr {
     Function(FunctionId),
     Global(String),
 
+    Tuple(Vec<IRExpr>),
     List(Vec<IRExpr>),
     Dict(Vec<(IRExpr, IRExpr)>),
 
@@ -235,4 +240,5 @@ pub enum IRUnaryOp {
     Neg,
     Pos,
     BitNot,
+    Len,
 }

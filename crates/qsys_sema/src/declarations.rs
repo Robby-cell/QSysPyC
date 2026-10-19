@@ -300,8 +300,52 @@ fn try_parse_control(
         None => PinStyle::Both,
     };
 
+    let user_pin = match kwargs.iter().find(|(k, _)| k == "user_pin") {
+        Some((_, val)) => match eval_constant(val).and_then(|c| c.as_bool()) {
+            Some(b) => b,
+            None => {
+                diagnostics.report(
+                    DiagnosticKind::InvalidDeclarationArgument {
+                        name: control_name.clone(),
+                        message: "'user_pin' must be a boolean literal".to_string(),
+                    },
+                    val.span,
+                );
+                return None;
+            }
+        },
+        None => true,
+    };
+
+    let parse_unit = |diagnostics: &mut Diagnostics| -> Option<ControlUnit> {
+        match kwargs.iter().find(|(k, _)| k == "unit") {
+            Some((_, val)) => match eval_constant(val).and_then(|c| c.as_str().map(String::from)) {
+                Some(ref s) if s == "Float" => Some(ControlUnit::Float),
+                Some(ref s) if s == "Integer" => Some(ControlUnit::Integer),
+                Some(ref s) if s == "dB" || s == "Decibels" => Some(ControlUnit::Decibels),
+                Some(ref s) if s == "Hz" || s == "Hertz" => Some(ControlUnit::Hertz),
+                Some(ref s) if s == "Percent" => Some(ControlUnit::Percent),
+                Some(ref s) if s == "Seconds" => Some(ControlUnit::Seconds),
+                Some(ref s) if s == "Pan" => Some(ControlUnit::Pan),
+                _ => {
+                    diagnostics.report(
+                            DiagnosticKind::InvalidDeclarationArgument {
+                                name: control_name.clone(),
+                                message: "Invalid 'unit'. Expected 'Float', 'Integer', 'dB', 'Hz', 'Percent', 'Seconds', or 'Pan'".to_string(),
+                            },
+                            val.span,
+                        );
+                    None
+                }
+            },
+            None => Some(ControlUnit::Float),
+        }
+    };
+
     let kind = match kind_str {
         "Float" | "Knob" | "Fader" => {
+            let unit = parse_unit(diagnostics)?;
+
             let min = match kwargs.iter().find(|(k, _)| k == "min") {
                 Some((_, val)) => match eval_constant(val).and_then(|c| c.as_f64()) {
                     Some(m) => m,
@@ -377,14 +421,14 @@ fn try_parse_control(
 
             if kind_str == "Fader" {
                 ControlKind::Fader {
-                    unit: ControlUnit::Float,
+                    unit,
                     min,
                     max,
                     default,
                 }
             } else {
                 ControlKind::Knob {
-                    unit: ControlUnit::Float,
+                    unit,
                     min,
                     max,
                     default,
@@ -393,6 +437,11 @@ fn try_parse_control(
         }
 
         "Boolean" | "Button" => {
+            let default_btn_type = if kind_str == "Boolean" {
+                ButtonType::Toggle
+            } else {
+                ButtonType::Momentary
+            };
             let btn_type = match kwargs.iter().find(|(k, _)| k == "type") {
                 Some((_, val)) => {
                     match eval_constant(val).and_then(|c| c.as_str().map(String::from)) {
@@ -411,7 +460,7 @@ fn try_parse_control(
                         }
                     }
                 }
-                None => ButtonType::Momentary,
+                None => default_btn_type,
             };
             ControlKind::Button {
                 button_type: btn_type,
@@ -437,10 +486,32 @@ fn try_parse_control(
                 }
                 None => String::new(),
             };
-            ControlKind::Text {
-                text_type: TextType::Text,
-                default,
-            }
+            let text_type = match kwargs.iter().find(|(k, _)| k == "type") {
+                Some((_, val)) => {
+                    match eval_constant(val).and_then(|c| c.as_str().map(String::from)) {
+                        Some(ref s) if s == "Text" => TextType::Text,
+                        Some(ref s) if s == "ReadOnly" => TextType::ReadOnly,
+                        _ => {
+                            diagnostics.report(
+                                DiagnosticKind::InvalidDeclarationArgument {
+                                    name: control_name.clone(),
+                                    message: "Invalid text 'type'. Expected 'Text' or 'ReadOnly'"
+                                        .to_string(),
+                                },
+                                val.span,
+                            );
+                            return None;
+                        }
+                    }
+                }
+                None => TextType::Text,
+            };
+            ControlKind::Text { text_type, default }
+        }
+
+        "Indicator" => {
+            let unit = parse_unit(diagnostics)?;
+            ControlKind::Indicator { unit }
         }
 
         // Built-in Q-SYS Reserved Control: IPAddress
@@ -482,7 +553,9 @@ fn try_parse_control(
         }
     };
 
-    let mut def = ControlDef::new(control_name, kind).with_pin_style(pin_style);
+    let mut def = ControlDef::new(control_name, kind)
+        .with_pin_style(pin_style)
+        .with_user_pin(user_pin);
     if count > 1 {
         def = def.with_count(count);
     }
@@ -577,6 +650,16 @@ fn try_parse_property(
                 .and_then(|c| c.as_str().map(String::from))
                 .unwrap_or_default();
             PropertyDef::string(prop_name, default)
+        }
+
+        "Boolean" => {
+            let default = kwargs
+                .iter()
+                .find(|(k, _)| k == "default")
+                .and_then(|(_, v)| eval_constant(v))
+                .and_then(|c| c.as_bool())
+                .unwrap_or(false);
+            PropertyDef::boolean(prop_name, default)
         }
 
         "Enum" => {
@@ -717,6 +800,12 @@ fn try_parse_metadata(var_name: &str, value: &ast::Expr, info: &mut PluginInfo) 
         "description" => {
             if let Some(s) = const_val.and_then(|c| c.as_str().map(String::from)) {
                 info.description = Some(s);
+                return true;
+            }
+        }
+        "manufacturer" => {
+            if let Some(s) = const_val.and_then(|c| c.as_str().map(String::from)) {
+                info.manufacturer = Some(s);
                 return true;
             }
         }

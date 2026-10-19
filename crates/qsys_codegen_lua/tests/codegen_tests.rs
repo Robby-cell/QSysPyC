@@ -109,3 +109,47 @@ def run():
     let lua = compile_to_lua(src);
     assert!(lua.contains("Component.New('MyDSP')"));
 }
+
+#[test]
+fn test_python_builtins_fstrings_range_and_tuple_returns() {
+    let src = r#"
+class LayoutPlugin(QSysPlugin):
+    Status = Control.Text(name="Status", default="Ready")
+    Port = Property.Integer(name="Port", default=9)
+
+    def get_control_layout(self, props):
+        layout = {}
+        graphics = []
+        return layout, graphics
+
+    def runtime(self):
+        port = self.Port.Value
+        for i in range(0, 4):
+            if i == 2:
+                break
+        msg = f"Listening on {port}"
+        n = len(msg)
+        b = chr(65)
+        self.Status.String = msg
+"#;
+    let lua = compile_to_lua(src);
+
+    // Multiple return values in GetControlLayout
+    assert!(lua.contains("function GetControlLayout(props)"));
+    assert!(lua.contains("return layout, graphics"));
+
+    // Property access without double .Value.Value
+    assert!(lua.contains("local port = Properties[\"Port\"].Value"));
+    assert!(!lua.contains(".Value.Value"));
+
+    // Numeric for loop from range(0, 4) and break
+    assert!(lua.contains("for i = 0, (4) - 1 do"));
+    assert!(lua.contains("break"));
+
+    // f-string lowered with tostring() and ..
+    assert!(lua.contains("(\"Listening on \" .. tostring(port))"));
+
+    // len() and chr() lowered to # and string.char
+    assert!(lua.contains("(#msg)"));
+    assert!(lua.contains("string.char(65)"));
+}

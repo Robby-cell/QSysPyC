@@ -1,15 +1,15 @@
 pub mod ast;
 mod lower;
 
-pub use ast::*;
-use lower::{Lowerer, text_range_to_span};
-
-use qsys_diagnostics::{DiagnosticKind, Diagnostics, SourceFile, Span};
-
 use std::sync::Arc;
 
 use ruff_python_parser::{Mode, ParseOptions, parse_unchecked};
 use ruff_text_size::Ranged;
+
+use qsys_diagnostics::{DiagnosticKind, Diagnostics, SourceFile, Span};
+
+pub use crate::ast::*;
+use crate::lower::{Lowerer, text_range_to_span};
 
 /// A validated, lowered QSysPy module.
 #[derive(Debug, Clone)]
@@ -67,6 +67,39 @@ pub fn parse_module(file: Arc<SourceFile>) -> Result<ParsedModule, Diagnostics> 
         };
         Ok(ParsedModule { file, module })
     }
+}
+
+/// Fault-tolerant parser entry point for IDE / LSP features.
+/// Always lowers the recovered Ruff AST even when syntax errors are present.
+pub fn parse_module_lossy(file: Arc<SourceFile>) -> (ParsedModule, Diagnostics) {
+    let mut diagnostics = Diagnostics::new();
+    let parsed = parse_unchecked(&file.src, ParseOptions::from(Mode::Module));
+
+    for err in parsed.errors() {
+        let span = text_range_to_span(err.range());
+        diagnostics.report(
+            DiagnosticKind::SyntaxError {
+                message: err.error.to_string(),
+            },
+            span,
+        );
+    }
+
+    let ruff_suite = match parsed.into_syntax() {
+        ruff_python_ast::Mod::Module(m) => m.body,
+        _ => Default::default(),
+    };
+
+    let mut lowerer = Lowerer {
+        diagnostics: &mut diagnostics,
+    };
+    let statements = lowerer.lower_suite(&ruff_suite);
+    let module = ast::Module {
+        statements,
+        span: Span::new(0, file.src.len()),
+    };
+
+    (ParsedModule { file, module }, diagnostics)
 }
 
 #[cfg(test)]

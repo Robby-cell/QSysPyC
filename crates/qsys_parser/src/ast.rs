@@ -56,6 +56,7 @@ pub enum StmtKind {
     },
     Return(Option<Expr>),
     Expr(Expr),
+    Break,
     Pass,
 }
 

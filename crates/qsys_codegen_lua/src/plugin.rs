@@ -8,7 +8,8 @@ use crate::emitter::{LuaEmitter, escape_lua_string, format_lua_float};
 fn is_lifecycle_method(name: &str) -> bool {
     matches!(
         name,
-        "get_controls"
+        "get_properties"
+            | "get_controls"
             | "get_control_layout"
             | "get_pages"
             | "get_color"

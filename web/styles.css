@@ -162,13 +162,42 @@ main {
     border-bottom: 1px solid #333333;
     color: #f48771;
     display: flex;
-    align-items: flex-start;
-    gap: 8px;
+    align-items: center;
+    gap: 10px;
+    cursor: pointer;
+    transition: background-color 0.12s ease;
+}
+
+.error-item:hover {
+    background-color: #2f2f32;
 }
 
 .error-item .code {
     font-weight: 700;
     background: rgba(241, 76, 76, 0.2);
-    padding: 1px 4px;
+    padding: 2px 6px;
     border-radius: 3px;
+    flex-shrink: 0;
 }
+
+.error-item .error-msg {
+    flex: 1;
+}
+
+.error-item .error-help {
+    color: #9cdcfe;
+}
+
+.quickfix-btn {
+    padding: 2px 8px;
+    font-size: 11px;
+    background: #0e639c;
+    border: 1px solid #1177bb;
+    color: #ffffff;
+    border-radius: 3px;
+    flex-shrink: 0;
+}
+
+.quickfix-btn:hover {
+    background: #1177bb;
+}

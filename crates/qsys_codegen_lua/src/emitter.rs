@@ -106,9 +106,45 @@ impl<'a> LuaEmitter<'a> {
                     .insert(*target_id, target_name.clone());
                 self.ctx.declared_locals.insert(*target_id);
                 let var_name = self.ctx.get_symbol_name(*target_id);
-                let iter_str = self.emit_expr(iterable);
 
-                self.write_line(&format!("for _, {var_name} in ipairs({iter_str}) do"));
+                if let IRExpr::Call {
+                    callee,
+                    args,
+                    kwargs,
+                } = iterable
+                    && kwargs.is_empty()
+                    && matches!(callee.as_ref(), IRExpr::Global(g) if g == "range")
+                {
+                    match args.as_slice() {
+                        [stop] => {
+                            let stop_str = self.emit_expr(stop);
+                            self.write_line(&format!("for {var_name} = 0, ({stop_str}) - 1 do"));
+                        }
+                        [start, stop] => {
+                            let start_str = self.emit_expr(start);
+                            let stop_str = self.emit_expr(stop);
+                            self.write_line(&format!(
+                                "for {var_name} = {start_str}, ({stop_str}) - 1 do"
+                            ));
+                        }
+                        [start, stop, step] => {
+                            let start_str = self.emit_expr(start);
+                            let stop_str = self.emit_expr(stop);
+                            let step_str = self.emit_expr(step);
+                            self.write_line(&format!(
+                                "for {var_name} = {start_str}, ({stop_str}) - 1, {step_str} do"
+                            ));
+                        }
+                        _ => {
+                            let iter_str = self.emit_expr(iterable);
+                            self.write_line(&format!("for _, {var_name} in ipairs({iter_str}) do"));
+                        }
+                    }
+                } else {
+                    let iter_str = self.emit_expr(iterable);
+                    self.write_line(&format!("for _, {var_name} in ipairs({iter_str}) do"));
+                }
+
                 self.indent();
                 self.emit_statements(body);
                 self.dedent();
@@ -117,11 +153,21 @@ impl<'a> LuaEmitter<'a> {
 
             IRStmt::Return { value, .. } => {
                 if let Some(val) = value {
-                    let val_str = self.emit_expr(val);
-                    self.write_line(&format!("return {val_str}"));
+                    if let IRExpr::Tuple(items) = val {
+                        let rendered: Vec<_> =
+                            items.iter().map(|item| self.emit_expr(item)).collect();
+                        self.write_line(&format!("return {}", rendered.join(", ")));
+                    } else {
+                        let val_str = self.emit_expr(val);
+                        self.write_line(&format!("return {val_str}"));
+                    }
                 } else {
                     self.write_line("return");
                 }
+            }
+
+            IRStmt::Break { .. } => {
+                self.write_line("break");
             }
 
             IRStmt::Expr { expr, .. } => {
@@ -165,7 +211,7 @@ impl<'a> LuaEmitter<'a> {
             }
 
             IRStmt::FunctionDef(f) => {
-                // 1. Register parameter IDs into context so the body knows their names!
+                self.ctx.functions.insert(f.id, f.name.clone());
                 for param in &f.params {
                     self.ctx.symbol_names.insert(param.id, param.name.clone());
                     self.ctx.declared_locals.insert(param.id);
@@ -258,14 +304,14 @@ impl<'a> LuaEmitter<'a> {
 
             IRExpr::Function(id) => {
                 if let Some(name) = self.ctx.functions.get(id) {
-                    name.clone() // <-- Resolves to "PluginName_function_name"
+                    name.clone()
                 } else {
                     format!("_fn_{}", id.0)
                 }
             }
             IRExpr::Global(name) => name.clone(),
 
-            IRExpr::List(items) => {
+            IRExpr::Tuple(items) | IRExpr::List(items) => {
                 let rendered: Vec<_> = items.iter().map(|item| self.emit_expr(item)).collect();
                 format!("{{ {} }}", rendered.join(", "))
             }
@@ -369,6 +415,7 @@ impl<'a> LuaEmitter<'a> {
                 IRUnaryOp::Neg => format!("(-{})", self.emit_expr(operand)),
                 IRUnaryOp::Pos => format!("(+{})", self.emit_expr(operand)),
                 IRUnaryOp::BitNot => format!("(~{})", self.emit_expr(operand)),
+                IRUnaryOp::Len => format!("(#{})", self.emit_expr(operand)),
             },
 
             IRExpr::Call {
@@ -414,6 +461,9 @@ impl<'a> LuaEmitter<'a> {
             }
 
             IRExpr::Attribute { object, attr } => {
+                if matches!(object.as_ref(), IRExpr::Property(_)) && attr == "Value" {
+                    return self.emit_expr(object);
+                }
                 let obj_str = self.emit_expr(object);
                 format!("{obj_str}.{attr}")
             }
@@ -443,6 +493,10 @@ impl<'a> LuaEmitter<'a> {
 
         // Emit constructor: `function ClassName.new(...)`
         let ctor_params = if let Some(ref ctor) = cls.constructor {
+            for param in &ctor.params {
+                self.ctx.symbol_names.insert(param.id, param.name.clone());
+                self.ctx.declared_locals.insert(param.id);
+            }
             ctor.params
                 .iter()
                 .map(|p| p.name.clone())
@@ -464,7 +518,6 @@ impl<'a> LuaEmitter<'a> {
 
         // Emit instance methods: `function ClassName:method(...)`
         for method in &cls.methods {
-            // Register method parameters into context!
             for param in &method.params {
                 self.ctx.symbol_names.insert(param.id, param.name.clone());
                 self.ctx.declared_locals.insert(param.id);

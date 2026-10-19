@@ -43,4 +43,3 @@ class MyPlugin(QSysPlugin):
         "Class 'MyPlugin' has no control or property 'MusterGain'; did you mean 'MasterGain'?"
     ));
 }
-

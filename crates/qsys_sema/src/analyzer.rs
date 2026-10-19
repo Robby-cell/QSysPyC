@@ -1,9 +1,84 @@
+use strsim::levenshtein;
+
 use qsys_diagnostics::{DiagnosticKind, Diagnostics};
-use qsys_model::ControlMember;
+use qsys_model::{ControlMember, PropertyKind};
 use qsys_parser::ast;
 
+use crate::binding::find_closest_member;
 use crate::symbols::{ScopeKind, ScopeStack, Symbol, SymbolKind};
 use crate::types::{ResolvedTarget, Type, TypeMap};
+
+const KNOWN_GLOBALS: &[&str] = &[
+    "print",
+    "qsys",
+    "Controls",
+    "Properties",
+    "Timer",
+    "TcpSocket",
+    "UdpSocket",
+    "SerialPort",
+    "HttpClient",
+    "NamedControl",
+    "Notifications",
+    "Component",
+    "Log",
+    "System",
+    "Crypto",
+    "rapidjson",
+    "json",
+    "math",
+    "string",
+    "table",
+    "bit32",
+    "tonumber",
+    "tostring",
+    "type",
+    "ipairs",
+    "pairs",
+    "next",
+    "unpack",
+    "pcall",
+    "error",
+    "assert",
+    "range",
+    "len",
+    "str",
+    "int",
+    "float",
+    "bool",
+    "abs",
+    "min",
+    "max",
+    "chr",
+    "ord",
+    "Control",
+    "Property",
+    "QSysPlugin",
+    "TextController",
+];
+
+fn find_closest_match(target: &str, candidates: &[String]) -> Option<String> {
+    let mut best_match = None;
+    let mut min_distance = usize::MAX;
+
+    for candidate in candidates {
+        let dist = levenshtein(target, candidate);
+        if dist > 0 && dist <= 2 && dist < min_distance {
+            min_distance = dist;
+            best_match = Some(candidate.clone());
+        }
+    }
+
+    best_match
+}
+
+fn extract_expr_name(expr: &ast::Expr) -> String {
+    match &expr.kind {
+        ast::ExprKind::Ident(name) => name.clone(),
+        ast::ExprKind::Attribute { attr, .. } => attr.clone(),
+        _ => "<control>".to_string(),
+    }
+}
 
 pub struct ExprAnalyzer<'a> {
     pub scope_stack: &'a mut ScopeStack,
@@ -34,29 +109,42 @@ impl<'a> ExprAnalyzer<'a> {
         match &stmt.kind {
             ast::StmtKind::Assign { target, value } => {
                 let val_ty = self.infer_expr(value);
-                if let ast::ExprKind::Ident(ref name) = target.kind {
-                    let sym_id = self.scope_stack.alloc_symbol_id();
-                    self.scope_stack.define(Symbol::new(
-                        sym_id,
-                        name.clone(),
-                        SymbolKind::Variable {
-                            id: sym_id,
-                            ty: val_ty.clone(),
-                        },
-                        target.span,
-                    ));
-                    self.type_map
-                        .insert_resolution(target.span, ResolvedTarget::Local(sym_id));
-                    self.type_map.insert_type(target.span, val_ty);
-                    self.type_map.insert_symbol_name(sym_id, name.clone());
-                } else if let ast::ExprKind::Subscript {
-                    ref value,
-                    ref index,
-                } = target.kind
-                {
-                    let val_ty = self.infer_expr(value);
-                    let _ = self.infer_expr(index);
-                    self.type_map.insert_type(target.span, val_ty);
+                match &target.kind {
+                    ast::ExprKind::Ident(name) => {
+                        let sym_id = if let Some(existing) = self.scope_stack.lookup(name) {
+                            match existing.kind {
+                                SymbolKind::Variable { id, .. }
+                                | SymbolKind::Parameter { id, .. } => id,
+                                _ => self.scope_stack.alloc_symbol_id(),
+                            }
+                        } else {
+                            self.scope_stack.alloc_symbol_id()
+                        };
+                        self.scope_stack.define(Symbol::new(
+                            sym_id,
+                            name.clone(),
+                            SymbolKind::Variable {
+                                id: sym_id,
+                                ty: val_ty.clone(),
+                            },
+                            target.span,
+                        ));
+                        self.type_map
+                            .insert_resolution(target.span, ResolvedTarget::Local(sym_id));
+                        self.type_map.insert_type(target.span, val_ty);
+                        self.type_map.insert_symbol_name(sym_id, name.clone());
+                    }
+                    ast::ExprKind::Subscript {
+                        value: sub_val,
+                        index: sub_idx,
+                    } => {
+                        let sub_ty = self.infer_expr(sub_val);
+                        let _ = self.infer_expr(sub_idx);
+                        self.type_map.insert_type(target.span, sub_ty);
+                    }
+                    _ => {
+                        let _ = self.infer_expr(target);
+                    }
                 }
             }
 
@@ -135,7 +223,11 @@ impl<'a> ExprAnalyzer<'a> {
                 let func_id = self.scope_stack.alloc_function_id();
                 let sym_id = self.scope_stack.alloc_symbol_id();
 
-                // 1. Register function in outer scope with its real allocated IDs
+                let enclosing_class = match &self.scope_stack.current_scope().kind {
+                    ScopeKind::Class { name } => Some(name.clone()),
+                    _ => None,
+                };
+
                 self.scope_stack.define(Symbol::new(
                     sym_id,
                     f.name.clone(),
@@ -146,23 +238,37 @@ impl<'a> ExprAnalyzer<'a> {
                     },
                     f.span,
                 ));
+                self.type_map
+                    .insert_resolution(f.span, ResolvedTarget::Function(func_id));
 
-                // 2. Push function scope for parameters and body
                 self.scope_stack.push_scope(ScopeKind::Function {
                     name: f.name.clone(),
                 });
 
                 for (idx, param) in f.params.iter().enumerate() {
                     let param_sym_id = self.scope_stack.alloc_symbol_id();
+                    let param_ty = if idx == 0 && param.name == "self" {
+                        if let Some(ref cls_name) = enclosing_class {
+                            Type::UserInstance {
+                                name: cls_name.clone(),
+                            }
+                        } else {
+                            Type::Any
+                        }
+                    } else {
+                        Type::Any
+                    };
                     self.type_map
                         .insert_symbol_name(param_sym_id, param.name.clone());
+                    self.type_map
+                        .insert_resolution(param.span, ResolvedTarget::Local(param_sym_id));
                     self.scope_stack.define(Symbol::new(
                         param_sym_id,
                         param.name.clone(),
                         SymbolKind::Parameter {
                             id: param_sym_id,
                             index: idx,
-                            ty: Type::Any,
+                            ty: param_ty,
                         },
                         param.span,
                     ));
@@ -204,7 +310,6 @@ impl<'a> ExprAnalyzer<'a> {
             ast::ExprKind::Bool(_) => Type::Bool,
             ast::ExprKind::None => Type::None,
 
-            // Recognize Socket/Timer global classes
             ast::ExprKind::Ident(name) => {
                 if let Some(symbol) = self.scope_stack.lookup(name) {
                     match &symbol.kind {
@@ -223,17 +328,52 @@ impl<'a> ExprAnalyzer<'a> {
                                 .insert_resolution(expr.span, ResolvedTarget::Property(*id));
                             Type::PropertyHandle
                         }
+                        SymbolKind::Method { id, .. } => {
+                            self.type_map
+                                .insert_resolution(expr.span, ResolvedTarget::Function(*id));
+                            Type::Any
+                        }
                         SymbolKind::Class { name, .. } | SymbolKind::UserClass { name } => {
                             Type::UserClass { name: name.clone() }
                         }
-                        _ => Type::Any,
                     }
+                } else if name == "UdpSocket" {
+                    self.type_map
+                        .insert_resolution(expr.span, ResolvedTarget::Global(name.clone()));
+                    Type::UdpSocketClass
+                } else if name == "TcpSocket" {
+                    self.type_map
+                        .insert_resolution(expr.span, ResolvedTarget::Global(name.clone()));
+                    Type::TcpSocketClass
+                } else if name == "Timer" {
+                    self.type_map
+                        .insert_resolution(expr.span, ResolvedTarget::Global(name.clone()));
+                    Type::TimerClass
+                } else if KNOWN_GLOBALS.contains(&name.as_str()) {
+                    self.type_map
+                        .insert_resolution(expr.span, ResolvedTarget::Global(name.clone()));
+                    Type::Any
                 } else {
+                    let mut visible = self.scope_stack.all_visible_names();
+                    for g in KNOWN_GLOBALS {
+                        visible.push((*g).to_string());
+                    }
+                    let candidates = find_closest_match(name, &visible)
+                        .map(|c| vec![c])
+                        .unwrap_or_default();
+
+                    self.diagnostics.report(
+                        DiagnosticKind::UndefinedVariable {
+                            name: name.clone(),
+                            candidates,
+                        },
+                        expr.span,
+                    );
                     Type::Any
                 }
             }
 
-            ast::ExprKind::List(items) => {
+            ast::ExprKind::Tuple(items) | ast::ExprKind::List(items) => {
                 let elem_ty = if let Some(first) = items.first() {
                     self.infer_expr(first)
                 } else {
@@ -260,6 +400,18 @@ impl<'a> ExprAnalyzer<'a> {
 
             ast::ExprKind::Attribute { value, attr } => {
                 let base_ty = self.infer_expr(value);
+
+                // Support `self.<Property>.Value` by propagating the property resolution
+                if attr == "Value"
+                    && let Some(ResolvedTarget::Property(prop_id)) =
+                        self.type_map.get_resolution(value.span).cloned()
+                {
+                    self.type_map
+                        .insert_resolution(expr.span, ResolvedTarget::Property(prop_id));
+                    self.type_map.insert_type(expr.span, base_ty.clone());
+                    return base_ty;
+                }
+
                 match base_ty {
                     Type::ControlHandle => match ControlMember::from_ident(attr) {
                         Some(ControlMember::Value) | Some(ControlMember::RampTime) => Type::Float,
@@ -271,23 +423,91 @@ impl<'a> ExprAnalyzer<'a> {
                         | Some(ControlMember::IsInvisible) => Type::Bool,
                         Some(ControlMember::Values) => Type::List(Box::new(Type::Float)),
                         Some(ControlMember::Strings) => Type::List(Box::new(Type::String)),
-                        _ => Type::Any,
+                        Some(ControlMember::EventHandler) => Type::Any,
+                        None => {
+                            let control_name = extract_expr_name(value);
+                            let candidates = find_closest_member(attr)
+                                .map(|c| vec![c.to_string()])
+                                .unwrap_or_default();
+
+                            self.diagnostics.report(
+                                DiagnosticKind::UnknownControlMember {
+                                    control_name,
+                                    member: attr.clone(),
+                                    candidates,
+                                },
+                                expr.span,
+                            );
+                            Type::Any
+                        }
                     },
-                    Type::ClassInstance { .. } => {
-                        // Check if it's a declared control
-                        if let Some(symbol) = self.scope_stack.lookup(attr)
-                            && matches!(symbol.kind, SymbolKind::Control { .. })
-                        {
-                            return Type::ControlHandle;
-                        }
-                        // Allow standard plugin metadata attributes (self.name, self.version, etc.) without E0207
-                        if matches!(
+                    Type::ClassInstance { ref name } => {
+                        if let Some(symbol) = self.scope_stack.lookup(attr) {
+                            match &symbol.kind {
+                                SymbolKind::Control { id, .. } => {
+                                    self.type_map
+                                        .insert_resolution(expr.span, ResolvedTarget::Control(*id));
+                                    Type::ControlHandle
+                                }
+                                SymbolKind::Property { id, def } => {
+                                    self.type_map.insert_resolution(
+                                        expr.span,
+                                        ResolvedTarget::Property(*id),
+                                    );
+                                    match def.kind {
+                                        PropertyKind::Integer { .. } => Type::Int,
+                                        PropertyKind::Double { .. } => Type::Float,
+                                        PropertyKind::String { .. } | PropertyKind::Enum { .. } => {
+                                            Type::String
+                                        }
+                                        PropertyKind::Boolean { .. } => Type::Bool,
+                                    }
+                                }
+                                SymbolKind::Method { id, .. } => {
+                                    self.type_map.insert_resolution(
+                                        expr.span,
+                                        ResolvedTarget::Function(*id),
+                                    );
+                                    Type::Any
+                                }
+                                SymbolKind::Variable { id, ty } => {
+                                    self.type_map
+                                        .insert_resolution(expr.span, ResolvedTarget::Local(*id));
+                                    ty.clone()
+                                }
+                                _ => Type::Any,
+                            }
+                        } else if matches!(
                             attr.as_str(),
-                            "name" | "version" | "author" | "description" | "id" | "show_debug"
+                            "name"
+                                | "version"
+                                | "author"
+                                | "description"
+                                | "id"
+                                | "manufacturer"
+                                | "show_debug"
                         ) {
-                            return Type::String;
+                            if attr == "show_debug" {
+                                Type::Bool
+                            } else {
+                                Type::String
+                            }
+                        } else {
+                            let class_members = self.scope_stack.class_member_names();
+                            let candidates = find_closest_match(attr, &class_members)
+                                .map(|c| vec![c])
+                                .unwrap_or_default();
+
+                            self.diagnostics.report(
+                                DiagnosticKind::UnknownClassMember {
+                                    class_name: name.clone(),
+                                    member: attr.clone(),
+                                    candidates,
+                                },
+                                expr.span,
+                            );
+                            Type::Any
                         }
-                        Type::Any
                     }
                     _ => Type::Any,
                 }
@@ -296,10 +516,26 @@ impl<'a> ExprAnalyzer<'a> {
             ast::ExprKind::Subscript { value, index } => {
                 let val_ty = self.infer_expr(value);
                 let _ = self.infer_expr(index);
-                match val_ty {
-                    Type::List(elem) => *elem,
-                    Type::Dict(_, val) => *val,
-                    _ => Type::Any,
+                if let ast::ExprKind::Ident(ref name) = value.kind {
+                    if name == "Controls" {
+                        Type::ControlHandle
+                    } else if name == "Properties" {
+                        Type::PropertyHandle
+                    } else {
+                        match val_ty {
+                            Type::List(elem) => *elem,
+                            Type::Dict(_, val) => *val,
+                            Type::String => Type::String,
+                            _ => Type::Any,
+                        }
+                    }
+                } else {
+                    match val_ty {
+                        Type::List(elem) => *elem,
+                        Type::Dict(_, val) => *val,
+                        Type::String => Type::String,
+                        _ => Type::Any,
+                    }
                 }
             }
 
@@ -331,7 +567,7 @@ impl<'a> ExprAnalyzer<'a> {
                         if (left_ty == Type::String && right_ty == Type::Int)
                             || (left_ty == Type::Int && right_ty == Type::String)
                         {
-                            Type::String // Python string repetition
+                            Type::String
                         } else if left_ty == Type::Float || right_ty == Type::Float {
                             Type::Float
                         } else if left_ty == Type::Int && right_ty == Type::Int {
@@ -352,7 +588,12 @@ impl<'a> ExprAnalyzer<'a> {
                     }
 
                     ast::BinaryOp::Div => Type::Float,
-                    _ => Type::Any,
+                    ast::BinaryOp::FloorDiv
+                    | ast::BinaryOp::BitAnd
+                    | ast::BinaryOp::BitOr
+                    | ast::BinaryOp::BitXor
+                    | ast::BinaryOp::LShift
+                    | ast::BinaryOp::RShift => Type::Int,
                 }
             }
 
@@ -387,32 +628,12 @@ impl<'a> ExprAnalyzer<'a> {
                 kwargs,
             } => {
                 let callee_ty = self.infer_expr(callee);
-                if let Type::UserClass { name } = callee_ty {
-                    for arg in args {
-                        let _ = self.infer_expr(arg);
-                    }
-                    for (_, kw_val) in kwargs {
-                        let _ = self.infer_expr(kw_val);
-                    }
-                    let inst_ty = Type::UserInstance { name };
-                    self.type_map.insert_type(expr.span, inst_ty.clone());
-                    return inst_ty;
+                let mut arg_types = Vec::with_capacity(args.len());
+                for arg in args {
+                    arg_types.push(self.infer_expr(arg));
                 }
-
-                if let ast::ExprKind::Attribute { value, attr } = &callee.kind
-                    && attr == "New"
-                {
-                    let class_ty = self.infer_expr(value);
-                    let return_ty = match class_ty {
-                        Type::UdpSocketClass => Type::UdpSocketHandle,
-                        Type::TcpSocketClass => Type::TcpSocketHandle,
-                        Type::TimerClass => Type::TimerHandle,
-                        _ => Type::Any,
-                    };
-                    if return_ty != Type::Any {
-                        self.type_map.insert_type(expr.span, return_ty.clone());
-                        return return_ty;
-                    }
+                for (_, kw_val) in kwargs {
+                    let _ = self.infer_expr(kw_val);
                 }
 
                 if is_qsys_lua_call(callee) {
@@ -443,17 +664,54 @@ impl<'a> ExprAnalyzer<'a> {
                     }
                 }
 
-                let _ = self.infer_expr(callee);
-                for arg in args {
-                    let _ = self.infer_expr(arg);
+                if let Type::UserClass { name } = callee_ty {
+                    Type::UserInstance { name }
+                } else if let ast::ExprKind::Attribute { value, attr } = &callee.kind {
+                    let receiver_ty = self.type_map.get_type(value.span).cloned();
+                    if attr == "New" {
+                        match receiver_ty {
+                            Some(Type::UdpSocketClass) => Type::UdpSocketHandle,
+                            Some(Type::TcpSocketClass) => Type::TcpSocketHandle,
+                            Some(Type::TimerClass) => Type::TimerHandle,
+                            _ => Type::Any,
+                        }
+                    } else if receiver_ty == Some(Type::String) {
+                        match attr.as_str() {
+                            "upper" | "lower" | "strip" | "lstrip" | "rstrip" | "replace"
+                            | "gsub" | "sub" | "format" | "rep" => Type::String,
+                            "startswith" | "endswith" => Type::Bool,
+                            "find" | "byte" => Type::Int,
+                            _ => Type::Any,
+                        }
+                    } else if attr == "char" || attr == "rep" || attr == "format" || attr == "sub" {
+                        Type::String
+                    } else if attr == "byte" || attr == "len" {
+                        Type::Int
+                    } else {
+                        Type::Any
+                    }
+                } else if let ast::ExprKind::Ident(fn_name) = &callee.kind {
+                    match fn_name.as_str() {
+                        "str" | "tostring" | "chr" => Type::String,
+                        "int" | "len" | "ord" => Type::Int,
+                        "float" | "tonumber" => Type::Float,
+                        "bool" => Type::Bool,
+                        "range" => Type::List(Box::new(Type::Int)),
+                        "abs" | "min" | "max" => {
+                            if !arg_types.is_empty() && arg_types.iter().all(|t| *t == Type::Int) {
+                                Type::Int
+                            } else {
+                                Type::Float
+                            }
+                        }
+                        _ => Type::Any,
+                    }
+                } else {
+                    Type::Any
                 }
-                for (_, kw_val) in kwargs {
-                    let _ = self.infer_expr(kw_val);
-                }
-                Type::Any
             }
 
-            _ => Type::Any,
+            ast::ExprKind::Error => Type::Any,
         };
 
         self.type_map.insert_type(expr.span, ty.clone());
@@ -471,5 +729,123 @@ fn is_qsys_lua_call(callee: &ast::Expr) -> bool {
             }
         }
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use qsys_diagnostics::{FileId, SourceFile};
+    use qsys_ir::ControlId;
+    use qsys_parser::parse_module;
+
+    use crate::analyze;
+    use crate::types::{ResolvedTarget, TruthinessStrategy, Type};
+
+    #[test]
+    fn test_self_control_attribute_resolves_to_control_id() {
+        let src = r#"
+class MyPlugin(QSysPlugin):
+    Gain = Control.Float(name="MasterGain", min=-100.0, max=20.0, default=0.0)
+
+    def runtime(self):
+        v = self.Gain.Value
+"#;
+        let file = SourceFile::new(FileId(1), "test.py", src);
+        let parsed = parse_module(file).unwrap();
+        let model = analyze(&parsed).expect("Should analyze cleanly");
+
+        let has_ctl_resolution = model
+            .type_map
+            .resolutions()
+            .values()
+            .any(|r| *r == ResolvedTarget::Control(ControlId(0)));
+        assert!(
+            has_ctl_resolution,
+            "self.Gain must resolve to ResolvedTarget::Control(ControlId(0))"
+        );
+    }
+
+    #[test]
+    fn test_fuzzy_member_diagnosis_on_control_handle() {
+        let src = r#"
+class MyPlugin(QSysPlugin):
+    Gain = Control.Float(name="MasterGain", min=-100.0, max=20.0, default=0.0)
+
+    @Gain.EventHandler
+    def on_gain(self, ctl):
+        x = ctl.Valu
+"#;
+        let file = SourceFile::new(FileId(1), "test.py", src);
+        let parsed = parse_module(file).unwrap();
+        let err = analyze(&parsed).expect_err("Should fail due to typo ctl.Valu");
+        assert_eq!(err.items[0].code(), "E0201");
+        assert!(err.items[0].message().contains("did you mean 'Value'?"));
+    }
+
+    #[test]
+    fn test_catches_undefined_variable_typo_for_self() {
+        let src = r#"
+class MyPlugin(QSysPlugin):
+    Gain = Control.Float(name="MasterGain", min=-100.0, max=20.0, default=0.0)
+
+    def runtime(self):
+        sel.Gain = 42.0
+"#;
+        let file = SourceFile::new(FileId(1), "test.py", src);
+        let parsed = parse_module(file).unwrap();
+        let err = analyze(&parsed).expect_err("Should fail due to typo sel");
+        assert_eq!(err.items[0].code(), "E0206");
+        assert!(err.items[0].message().contains("did you mean 'self'?"));
+    }
+
+    #[test]
+    fn test_catches_undeclared_attribute_on_self() {
+        let src = r#"
+class MyPlugin(QSysPlugin):
+    MasterGain = Control.Float(name="Gain", min=-100.0, max=20.0, default=0.0)
+
+    def runtime(self):
+        self.MusterGain = 42.0
+"#;
+        let file = SourceFile::new(FileId(1), "test.py", src);
+        let parsed = parse_module(file).unwrap();
+        let err = analyze(&parsed).expect_err("Should fail due to typo self.MusterGain");
+        assert_eq!(err.items[0].code(), "E0207");
+        assert!(
+            err.items[0]
+                .message()
+                .contains("did you mean 'MasterGain'?")
+        );
+    }
+
+    #[test]
+    fn test_numeric_truthiness_inferred() {
+        let src = r#"
+class MyPlugin(QSysPlugin):
+    Gain = Control.Float(name="MasterGain", min=-100.0, max=20.0, default=0.0)
+
+    @Gain.EventHandler
+    def on_gain(self, ctl):
+        if ctl.Value:
+            pass
+"#;
+        let file = SourceFile::new(FileId(1), "test.py", src);
+        let parsed = parse_module(file).unwrap();
+        let model = analyze(&parsed).expect("Should analyze");
+
+        let float_spans: Vec<_> = model
+            .type_map
+            .types()
+            .iter()
+            .filter(|(_, ty)| **ty == Type::Float)
+            .map(|(span, _)| *span)
+            .collect();
+        assert!(!float_spans.is_empty());
+        for span in float_spans {
+            assert_eq!(
+                model.type_map.get_truthiness(span),
+                TruthinessStrategy::NumericNotZero
+            );
+        }
     }
 }

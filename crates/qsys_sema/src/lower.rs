@@ -7,7 +7,7 @@ use crate::{SemanticModel, TargetKind, TruthinessStrategy, TypeMap};
 pub fn lower_to_ir(model: &SemanticModel) -> IRProgram {
     match &model.target {
         TargetKind::Plugin(p) => {
-            let mut lowerer = StmtLowerer::new(&model.type_map);
+            let mut lowerer = StmtLowerer::new(&model.type_map, true);
 
             let classes = p
                 .helper_classes
@@ -56,10 +56,8 @@ pub fn lower_to_ir(model: &SemanticModel) -> IRProgram {
                 })
                 .collect();
 
-            // Populate from the semantic model's scopes
             let symbol_names = model.type_map.symbol_names().clone();
 
-            // Pass symbol_names into IRPlugin
             IRProgram::Plugin(Box::new(IRPlugin {
                 info: p.info.clone(),
                 properties,
@@ -76,7 +74,7 @@ pub fn lower_to_ir(model: &SemanticModel) -> IRProgram {
         }
 
         TargetKind::TextController(c) => {
-            let mut lowerer = StmtLowerer::new(&model.type_map);
+            let mut lowerer = StmtLowerer::new(&model.type_map, false);
 
             let classes = c
                 .helper_classes
@@ -90,7 +88,8 @@ pub fn lower_to_ir(model: &SemanticModel) -> IRProgram {
                 .map(|m| lowerer.lower_function(m.id, &m.name, &m.params, &m.body, m.span))
                 .collect();
 
-            let body = lowerer.lower_statements(&c.init_statements);
+            let mut body = lowerer.lower_statements(&c.module_statements);
+            body.extend(lowerer.lower_statements(&c.init_statements));
 
             let event_bindings = c
                 .event_bindings
@@ -106,11 +105,21 @@ pub fn lower_to_ir(model: &SemanticModel) -> IRProgram {
                 .collect();
 
             let bound_pins = c.controls.iter().map(|ctl| ctl.def.name.clone()).collect();
+            let controls = c
+                .controls
+                .iter()
+                .map(|ctl| IRControlBinding {
+                    id: ctl.id,
+                    ident: ctl.ident.clone(),
+                    def: ctl.def.clone(),
+                })
+                .collect();
 
             IRProgram::Script(Box::new(IRScript {
                 name: c.class_name.clone(),
                 is_controller: true,
                 bound_pins,
+                controls,
                 classes,
                 methods,
                 event_bindings,
@@ -120,7 +129,7 @@ pub fn lower_to_ir(model: &SemanticModel) -> IRProgram {
         }
 
         TargetKind::ProceduralScript(s) => {
-            let mut lowerer = StmtLowerer::new(&model.type_map);
+            let mut lowerer = StmtLowerer::new(&model.type_map, false);
 
             let classes = s
                 .classes
@@ -139,6 +148,7 @@ pub fn lower_to_ir(model: &SemanticModel) -> IRProgram {
                 name: "main".to_string(),
                 is_controller: false,
                 bound_pins: s.bound_pins.clone(),
+                controls: Vec::new(),
                 classes,
                 methods,
                 event_bindings: Vec::new(),
@@ -151,11 +161,15 @@ pub fn lower_to_ir(model: &SemanticModel) -> IRProgram {
 
 struct StmtLowerer<'a> {
     type_map: &'a TypeMap,
+    is_plugin: bool,
 }
 
 impl<'a> StmtLowerer<'a> {
-    fn new(type_map: &'a TypeMap) -> Self {
-        Self { type_map }
+    fn new(type_map: &'a TypeMap, is_plugin: bool) -> Self {
+        Self {
+            type_map,
+            is_plugin,
+        }
     }
 
     fn lower_function(
@@ -313,6 +327,8 @@ impl<'a> StmtLowerer<'a> {
                 })
             }
 
+            ast::StmtKind::Break => Some(IRStmt::Break { span }),
+
             ast::StmtKind::Expr(expr) => {
                 if let Some(raw_code) = extract_raw_lua(expr) {
                     Some(IRStmt::RawLua {
@@ -332,19 +348,38 @@ impl<'a> StmtLowerer<'a> {
             | ast::StmtKind::ImportFrom { .. } => None,
 
             ast::StmtKind::FunctionDef(f) => {
+                let func_id = self
+                    .type_map
+                    .get_resolution(f.span)
+                    .and_then(|r| match r {
+                        ResolvedTarget::Function(id) => Some(*id),
+                        _ => None,
+                    })
+                    .unwrap_or(FunctionId(0));
+
                 let params = f
                     .params
                     .iter()
-                    .map(|p| qsys_ir::IRParam {
-                        name: p.name.clone(),
-                        id: qsys_ir::SymbolId(0),
+                    .map(|p| {
+                        let sym_id = self
+                            .type_map
+                            .get_resolution(p.span)
+                            .and_then(|r| match r {
+                                ResolvedTarget::Local(id) => Some(*id),
+                                _ => None,
+                            })
+                            .unwrap_or(SymbolId(0));
+                        IRParam {
+                            name: p.name.clone(),
+                            id: sym_id,
+                        }
                     })
                     .collect();
 
                 let body = self.lower_statements(&f.body);
 
-                Some(qsys_ir::IRStmt::FunctionDef(qsys_ir::IRFunction {
-                    id: qsys_ir::FunctionId(0),
+                Some(IRStmt::FunctionDef(IRFunction {
+                    id: func_id,
                     name: f.name.clone(),
                     params,
                     body,
@@ -357,13 +392,18 @@ impl<'a> StmtLowerer<'a> {
     }
 
     fn lower_expr(&self, expr: &ast::Expr) -> IRExpr {
-        if let Some(target) = self.type_map.get_resolution(expr.span) {
-            match target {
-                ResolvedTarget::Local(id) => return IRExpr::Local(*id),
-                ResolvedTarget::Control(id) => return IRExpr::Control(*id),
-                ResolvedTarget::Property(id) => return IRExpr::Property(*id),
-                ResolvedTarget::Function(id) => return IRExpr::Function(*id),
-                ResolvedTarget::Global(name) => return IRExpr::Global(name.clone()),
+        if matches!(
+            expr.kind,
+            ast::ExprKind::Ident(_) | ast::ExprKind::Attribute { .. }
+        ) {
+            if let Some(target) = self.type_map.get_resolution(expr.span) {
+                match target {
+                    ResolvedTarget::Local(id) => return IRExpr::Local(*id),
+                    ResolvedTarget::Control(id) => return IRExpr::Control(*id),
+                    ResolvedTarget::Property(id) => return IRExpr::Property(*id),
+                    ResolvedTarget::Function(id) => return IRExpr::Function(*id),
+                    ResolvedTarget::Global(name) => return IRExpr::Global(name.clone()),
+                }
             }
         }
 
@@ -377,7 +417,7 @@ impl<'a> StmtLowerer<'a> {
 
             ast::ExprKind::Tuple(items) => {
                 let lowered = items.iter().map(|item| self.lower_expr(item)).collect();
-                IRExpr::List(lowered)
+                IRExpr::Tuple(lowered)
             }
 
             ast::ExprKind::List(items) => {
@@ -402,24 +442,49 @@ impl<'a> StmtLowerer<'a> {
                         || matches!(
                             e,
                             IRExpr::Binary {
-                                op: IRBinaryOp::Concat | IRBinaryOp::StringConcat,
+                                op: IRBinaryOp::Concat
+                                    | IRBinaryOp::StringConcat
+                                    | IRBinaryOp::StringRep,
                                 ..
                             }
                         )
                         || self.type_map.get_type(span) == Some(&Type::String)
                 };
 
-                let binary_op = if *op == ast::BinaryOp::Add
+                let is_int_expr = |e: &IRExpr, span: qsys_diagnostics::Span| -> bool {
+                    matches!(e, IRExpr::Int(_)) || self.type_map.get_type(span) == Some(&Type::Int)
+                };
+
+                if *op == ast::BinaryOp::Add
                     && (is_str_expr(&left_ir, left.span) || is_str_expr(&right_ir, right.span))
                 {
-                    IRBinaryOp::Concat
-                } else {
-                    lower_binary_op(*op)
-                };
+                    return IRExpr::Binary {
+                        left: Box::new(left_ir),
+                        op: IRBinaryOp::StringConcat,
+                        right: Box::new(right_ir),
+                    };
+                }
+
+                if *op == ast::BinaryOp::Mul {
+                    if is_str_expr(&left_ir, left.span) && is_int_expr(&right_ir, right.span) {
+                        return IRExpr::Binary {
+                            left: Box::new(left_ir),
+                            op: IRBinaryOp::StringRep,
+                            right: Box::new(right_ir),
+                        };
+                    }
+                    if is_int_expr(&left_ir, left.span) && is_str_expr(&right_ir, right.span) {
+                        return IRExpr::Binary {
+                            left: Box::new(right_ir),
+                            op: IRBinaryOp::StringRep,
+                            right: Box::new(left_ir),
+                        };
+                    }
+                }
 
                 IRExpr::Binary {
                     left: Box::new(left_ir),
-                    op: binary_op,
+                    op: lower_binary_op(*op),
                     right: Box::new(right_ir),
                 }
             }
@@ -457,9 +522,9 @@ impl<'a> StmtLowerer<'a> {
                 if let Some(raw_code) = extract_raw_lua(expr) {
                     IRExpr::RawLua(raw_code)
                 } else {
-                    let args_ir: Vec<IRExpr> =
+                    let mut args_ir: Vec<IRExpr> =
                         args.iter().map(|arg| self.lower_expr(arg)).collect();
-                    let kwargs_ir = kwargs
+                    let kwargs_ir: Vec<(String, IRExpr)> = kwargs
                         .iter()
                         .map(|(k, v)| (k.clone(), self.lower_expr(v)))
                         .collect();
@@ -478,7 +543,64 @@ impl<'a> StmtLowerer<'a> {
                         };
                     }
 
-                    // If calling an instance method on a Socket or Timer, lower to MethodCall (`object:method(...)`)
+                    // Python built-in function lowering
+                    if let ast::ExprKind::Ident(fn_name) = &callee.kind {
+                        match fn_name.as_str() {
+                            "len" if args_ir.len() == 1 && kwargs_ir.is_empty() => {
+                                return IRExpr::Unary {
+                                    op: IRUnaryOp::Len,
+                                    operand: Box::new(args_ir.remove(0)),
+                                    truthiness: IRTruthiness::NumericNotZero,
+                                };
+                            }
+                            "str" => {
+                                return IRExpr::Call {
+                                    callee: Box::new(IRExpr::Global("tostring".to_string())),
+                                    args: args_ir,
+                                    kwargs: kwargs_ir,
+                                };
+                            }
+                            "int" | "float" => {
+                                return IRExpr::Call {
+                                    callee: Box::new(IRExpr::Global("tonumber".to_string())),
+                                    args: args_ir,
+                                    kwargs: kwargs_ir,
+                                };
+                            }
+                            "abs" | "min" | "max" => {
+                                return IRExpr::Call {
+                                    callee: Box::new(IRExpr::Attribute {
+                                        object: Box::new(IRExpr::Global("math".to_string())),
+                                        attr: fn_name.clone(),
+                                    }),
+                                    args: args_ir,
+                                    kwargs: kwargs_ir,
+                                };
+                            }
+                            "chr" => {
+                                return IRExpr::Call {
+                                    callee: Box::new(IRExpr::Attribute {
+                                        object: Box::new(IRExpr::Global("string".to_string())),
+                                        attr: "char".to_string(),
+                                    }),
+                                    args: args_ir,
+                                    kwargs: kwargs_ir,
+                                };
+                            }
+                            "ord" => {
+                                return IRExpr::Call {
+                                    callee: Box::new(IRExpr::Attribute {
+                                        object: Box::new(IRExpr::Global("string".to_string())),
+                                        attr: "byte".to_string(),
+                                    }),
+                                    args: args_ir,
+                                    kwargs: kwargs_ir,
+                                };
+                            }
+                            _ => {}
+                        }
+                    }
+
                     if let ast::ExprKind::Attribute { value, attr } = &callee.kind {
                         // list.append(x) -> table.insert(list, x)
                         if attr == "append" && args.len() == 1 {
@@ -530,6 +652,53 @@ impl<'a> StmtLowerer<'a> {
                                 is_zero_based: false,
                             };
                         }
+
+                        let obj_ty = self.type_map.get_type(value.span);
+
+                        // Socket, Timer, or custom class instance method call -> `obj:method(...)`
+                        if matches!(
+                            obj_ty,
+                            Some(
+                                Type::UdpSocketHandle
+                                    | Type::TcpSocketHandle
+                                    | Type::TimerHandle
+                                    | Type::UserInstance { .. }
+                            )
+                        ) {
+                            return IRExpr::MethodCall {
+                                object: Box::new(self.lower_expr(value)),
+                                method: attr.clone(),
+                                args: args_ir,
+                                kwargs: kwargs_ir,
+                            };
+                        }
+
+                        // String instance methods -> `s:upper()`, `s:lower()`, `s:gsub(...)`, `s:sub(...)`
+                        if obj_ty == Some(&Type::String)
+                            && !matches!(&value.kind, ast::ExprKind::Ident(id) if id == "string")
+                        {
+                            let lua_method = match attr.as_str() {
+                                "replace" => Some("gsub"),
+                                "upper" | "lower" | "gsub" | "sub" | "find" | "match"
+                                | "gmatch" | "byte" | "rep" | "reverse" | "format" => {
+                                    Some(attr.as_str())
+                                }
+                                _ => None,
+                            };
+                            if let Some(m_name) = lua_method {
+                                return IRExpr::MethodCall {
+                                    object: Box::new(self.lower_expr(value)),
+                                    method: m_name.to_string(),
+                                    args: args_ir,
+                                    kwargs: kwargs_ir,
+                                };
+                            }
+                        }
+
+                        // Calling a method on `self` inside a QSysPlugin -> prepend `nil` for `self`
+                        if self.is_plugin && matches!(obj_ty, Some(Type::ClassInstance { .. })) {
+                            args_ir.insert(0, IRExpr::Nil);
+                        }
                     }
 
                     let callee_ir = Box::new(self.lower_expr(callee));
@@ -576,14 +745,32 @@ impl<'a> StmtLowerer<'a> {
 
         for stmt in &cls.body {
             if let ast::StmtKind::FunctionDef(f) = &stmt.kind {
-                let func_id = FunctionId(0);
+                let func_id = self
+                    .type_map
+                    .get_resolution(f.span)
+                    .and_then(|r| match r {
+                        ResolvedTarget::Function(id) => Some(*id),
+                        _ => None,
+                    })
+                    .unwrap_or(FunctionId(0));
+
                 // Filter out `self` parameter because Lua methods and constructors
                 // manage `self` implicitly via metatables or colon calls
                 let params: Vec<_> = f
                     .params
                     .iter()
                     .filter(|p| p.name != "self")
-                    .map(|p| (SymbolId(0), p.name.clone()))
+                    .map(|p| {
+                        let sym_id = self
+                            .type_map
+                            .get_resolution(p.span)
+                            .and_then(|r| match r {
+                                ResolvedTarget::Local(id) => Some(*id),
+                                _ => None,
+                            })
+                            .unwrap_or(SymbolId(0));
+                        (sym_id, p.name.clone())
+                    })
                     .collect();
 
                 let lowered_fn = self.lower_function(func_id, &f.name, &params, &f.body, f.span);
@@ -666,4 +853,46 @@ fn extract_raw_lua(expr: &ast::Expr) -> Option<String> {
         return Some(s.clone());
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use qsys_diagnostics::{FileId, SourceFile};
+    use qsys_ir::{IRBinaryOp, IRExpr, IRProgram, IRStmt};
+    use qsys_parser::parse_module;
+
+    use crate::{analyze, lower_to_ir};
+
+    #[test]
+    fn test_string_concatenation_typed_to_ir() {
+        let src = r#"
+class MyPlugin(QSysPlugin):
+    Status = Control.Text(name="Status", default="Ready")
+
+    def runtime(self):
+        msg = "State: " + self.Status.String
+"#;
+        let file = SourceFile::new(FileId(1), "test.py", src);
+        let parsed = parse_module(file).unwrap();
+        let model = analyze(&parsed).unwrap();
+        let ir = lower_to_ir(&model);
+
+        match ir {
+            IRProgram::Plugin(p) => {
+                let stmt = &p.methods[0].body[0];
+                match stmt {
+                    IRStmt::Assign {
+                        value:
+                            IRExpr::Binary {
+                                op: IRBinaryOp::StringConcat,
+                                ..
+                            },
+                        ..
+                    } => {}
+                    other => panic!("Expected StringConcat binary op, got {other:?}"),
+                }
+            }
+            _ => panic!("Expected Plugin IR"),
+        }
+    }
 }

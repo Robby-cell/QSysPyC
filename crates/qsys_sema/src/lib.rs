@@ -6,25 +6,25 @@ pub mod lower;
 pub mod symbols;
 pub mod types;
 
-pub use binding::{ResolvedBinding, resolve_event_decorator};
-pub use classifier::{TargetClassification, classify_module};
-pub use declarations::{
-    ConstValue, DeclaredControl, DeclaredProperty, ExtractedDeclarations, eval_constant,
-    extract_class_declarations,
-};
-pub use lower::lower_to_ir;
-pub use symbols::{ScopeKind, ScopeStack, Symbol, SymbolKind};
-pub use types::{ResolvedTarget, TruthinessStrategy, Type, TypeMap};
-
 use std::sync::Arc;
+
+use rustc_hash::FxHashMap;
 
 use qsys_diagnostics::{Diagnostics, SourceFile, Span};
 use qsys_ir::{FunctionId, SymbolId};
 use qsys_model::PluginInfo;
-use qsys_parser::ParsedModule;
-use qsys_parser::ast;
+use qsys_parser::{ParsedModule, ast};
 
-use analyzer::ExprAnalyzer;
+use crate::analyzer::ExprAnalyzer;
+pub use crate::binding::{ResolvedBinding, resolve_event_decorator};
+pub use crate::classifier::{TargetClassification, classify_module};
+pub use crate::declarations::{
+    ConstValue, DeclaredControl, DeclaredProperty, ExtractedDeclarations, eval_constant,
+    extract_class_declarations,
+};
+pub use crate::lower::lower_to_ir;
+pub use crate::symbols::{ScopeKind, ScopeStack, Symbol, SymbolKind};
+pub use crate::types::{ResolvedTarget, TruthinessStrategy, Type, TypeMap};
 
 impl SemanticModel {
     pub fn into_ir(&self) -> qsys_ir::IRProgram {
@@ -68,10 +68,11 @@ pub struct ControllerSemantic {
     pub event_bindings: Vec<ResolvedBinding>,
     pub methods: Vec<ResolvedMethod>,
     pub init_statements: Vec<ast::Stmt>,
+    pub module_statements: Vec<ast::Stmt>,
     pub span: Span,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ScriptSemantic {
     pub bound_pins: Vec<String>,
     pub event_bindings: Vec<ResolvedBinding>,
@@ -95,11 +96,16 @@ fn type_from_annotation(ann: Option<&str>) -> Type {
         Some("int") | Some("Integer") => Type::Int,
         Some("float") | Some("Double") => Type::Float,
         Some("bool") | Some("Boolean") => Type::Bool,
+        Some("ControlHandle") => Type::ControlHandle,
+        Some("PropertyHandle") => Type::PropertyHandle,
         _ => Type::Any,
     }
 }
 
-pub fn analyze(parsed: &ParsedModule) -> Result<SemanticModel, Diagnostics> {
+/// Fault-tolerant semantic analysis that always returns a `SemanticModel` alongside any diagnostics.
+/// Used by IDE / LSP features (`Analyzer`) so completions, hover, and inlay hints continue to work
+/// even when the user is mid-edit and diagnostics are present.
+pub fn analyze_lossy(parsed: &ParsedModule) -> (SemanticModel, Diagnostics) {
     let mut diagnostics = Diagnostics::new();
 
     // 1. Collect helper classes
@@ -125,17 +131,28 @@ pub fn analyze(parsed: &ParsedModule) -> Result<SemanticModel, Diagnostics> {
         }
     }
 
-    // Classify module target (Plugin vs TextController vs Script)
-    let classification = match classify_module(&parsed.module, &mut diagnostics) {
-        Some(c) => c,
-        None => return Err(diagnostics),
-    };
-
     let mut scope_stack = ScopeStack::new();
     let mut type_map = TypeMap::new();
 
-    // Pre-populate module scope with top-level constants and functions
-    {
+    let classification = match classify_module(&parsed.module, &mut diagnostics) {
+        Some(c) => c,
+        None => {
+            return (
+                SemanticModel {
+                    file: parsed.file.clone(),
+                    target: TargetKind::ProceduralScript(ScriptSemantic::default()),
+                    type_map,
+                },
+                diagnostics,
+            );
+        }
+    };
+
+    // Pre-populate module scope with top-level constants, classes, and functions for class-based targets
+    if matches!(
+        classification,
+        TargetClassification::Plugin { .. } | TargetClassification::TextController { .. }
+    ) {
         let mut module_analyzer =
             ExprAnalyzer::new(&mut scope_stack, &mut type_map, &mut diagnostics);
         for stmt in &parsed.module.statements {
@@ -188,9 +205,7 @@ pub fn analyze(parsed: &ParsedModule) -> Result<SemanticModel, Diagnostics> {
             }
 
             // 3. PASS 1: Register all methods in class scope with a FunctionId
-            // This ensures `self.send_packet()` can resolve to FunctionId(0)
-            let mut method_ids: rustc_hash::FxHashMap<String, FunctionId> =
-                rustc_hash::FxHashMap::default();
+            let mut method_ids: FxHashMap<String, FunctionId> = FxHashMap::default();
             for stmt in &decls.remaining_statements {
                 if let ast::StmtKind::FunctionDef(f) = &stmt.kind {
                     let method_id = scope_stack.alloc_function_id();
@@ -201,7 +216,7 @@ pub fn analyze(parsed: &ParsedModule) -> Result<SemanticModel, Diagnostics> {
                         SymbolKind::Method {
                             id: method_id,
                             param_count: f.params.len(),
-                            has_self: f.params.first().map(|p| p.name == "self").unwrap_or(false),
+                            has_self: f.params.first().is_some_and(|p| p.name == "self"),
                         },
                         f.span,
                     ));
@@ -211,80 +226,114 @@ pub fn analyze(parsed: &ParsedModule) -> Result<SemanticModel, Diagnostics> {
 
             let mut event_bindings = Vec::new();
             let mut methods = Vec::new();
+            let mut init_statements = Vec::new();
 
             // 4. PASS 2: Analyze method bodies and event decorators
             for stmt in &decls.remaining_statements {
-                if let ast::StmtKind::FunctionDef(f) = &stmt.kind {
-                    let method_id = *method_ids.get(&f.name).unwrap();
+                match &stmt.kind {
+                    ast::StmtKind::FunctionDef(f) => {
+                        let method_id = *method_ids.get(&f.name).unwrap();
 
-                    for dec in &f.decorators {
-                        if let Some(binding) = resolve_event_decorator(
-                            dec,
-                            method_id,
-                            f,
-                            &scope_stack,
-                            &mut diagnostics,
-                        ) {
-                            event_bindings.push(binding);
+                        for dec in &f.decorators {
+                            if let Some(binding) = resolve_event_decorator(
+                                dec,
+                                method_id,
+                                f,
+                                &scope_stack,
+                                &mut diagnostics,
+                            ) {
+                                event_bindings.push(binding);
+                            }
                         }
-                    }
 
-                    scope_stack.push_scope(ScopeKind::Function {
-                        name: f.name.clone(),
-                    });
+                        scope_stack.push_scope(ScopeKind::Function {
+                            name: f.name.clone(),
+                        });
 
-                    let self_id = scope_stack.alloc_symbol_id();
-                    scope_stack.define(Symbol::new(
-                        self_id,
-                        "self",
-                        SymbolKind::Variable {
-                            id: self_id,
-                            ty: Type::ClassInstance {
-                                name: class.name.clone(),
-                            },
-                        },
-                        f.span,
-                    ));
-
-                    let is_event_handler = event_bindings.iter().any(|b| b.handler_id == method_id);
-                    let mut resolved_params = Vec::new();
-
-                    for (idx, param) in f.params.iter().enumerate().skip(1) {
-                        let param_ty = if is_event_handler && idx == 1 {
-                            Type::ControlHandle
-                        } else {
-                            type_from_annotation(param.type_annotation.as_deref())
-                        };
-
-                        let param_sym = scope_stack.alloc_symbol_id();
+                        let self_id = scope_stack.alloc_symbol_id();
+                        type_map.insert_symbol_name(self_id, "self");
                         scope_stack.define(Symbol::new(
-                            param_sym,
-                            param.name.clone(),
-                            SymbolKind::Parameter {
-                                id: param_sym,
-                                ty: param_ty,
-                                index: idx,
+                            self_id,
+                            "self",
+                            SymbolKind::Variable {
+                                id: self_id,
+                                ty: Type::ClassInstance {
+                                    name: class.name.clone(),
+                                },
                             },
-                            param.span,
+                            f.span,
                         ));
-                        type_map.insert_resolution(param.span, ResolvedTarget::Local(param_sym));
-                        resolved_params.push((param_sym, param.name.clone()));
+
+                        let is_event_handler =
+                            event_bindings.iter().any(|b| b.handler_id == method_id);
+                        let mut resolved_params = Vec::new();
+                        let skip_count =
+                            usize::from(f.params.first().is_some_and(|p| p.name == "self"));
+
+                        for (idx, param) in f.params.iter().enumerate().skip(skip_count) {
+                            let param_ty = if is_event_handler && idx == 1 {
+                                Type::ControlHandle
+                            } else {
+                                type_from_annotation(param.type_annotation.as_deref())
+                            };
+
+                            let param_sym = scope_stack.alloc_symbol_id();
+                            type_map.insert_symbol_name(param_sym, param.name.clone());
+                            scope_stack.define(Symbol::new(
+                                param_sym,
+                                param.name.clone(),
+                                SymbolKind::Parameter {
+                                    id: param_sym,
+                                    ty: param_ty.clone(),
+                                    index: idx,
+                                },
+                                param.span,
+                            ));
+                            type_map
+                                .insert_resolution(param.span, ResolvedTarget::Local(param_sym));
+                            type_map.insert_type(param.span, param_ty);
+                            resolved_params.push((param_sym, param.name.clone()));
+                        }
+
+                        let mut analyzer =
+                            ExprAnalyzer::new(&mut scope_stack, &mut type_map, &mut diagnostics);
+                        analyzer.analyze_statements(&f.body);
+
+                        scope_stack.pop_scope();
+
+                        methods.push(ResolvedMethod {
+                            id: method_id,
+                            name: f.name.clone(),
+                            params: resolved_params,
+                            body: f.body.clone(),
+                            span: f.span,
+                        });
                     }
-
-                    let mut analyzer =
-                        ExprAnalyzer::new(&mut scope_stack, &mut type_map, &mut diagnostics);
-                    analyzer.analyze_statements(&f.body);
-
-                    scope_stack.pop_scope();
-
-                    methods.push(ResolvedMethod {
-                        id: method_id,
-                        name: f.name.clone(),
-                        params: resolved_params,
-                        body: f.body.clone(),
-                        span: f.span,
-                    });
+                    ast::StmtKind::Pass => {}
+                    ast::StmtKind::Expr(e) if matches!(e.kind, ast::ExprKind::String(_)) => {}
+                    _ => {
+                        init_statements.push(stmt.clone());
+                    }
                 }
+            }
+
+            if !init_statements.is_empty() {
+                let self_id = scope_stack.alloc_symbol_id();
+                type_map.insert_symbol_name(self_id, "self");
+                scope_stack.define(Symbol::new(
+                    self_id,
+                    "self",
+                    SymbolKind::Variable {
+                        id: self_id,
+                        ty: Type::ClassInstance {
+                            name: class.name.clone(),
+                        },
+                    },
+                    class.span,
+                ));
+                let mut analyzer =
+                    ExprAnalyzer::new(&mut scope_stack, &mut type_map, &mut diagnostics);
+                analyzer.analyze_statements(&init_statements);
             }
 
             scope_stack.pop_scope();
@@ -294,11 +343,11 @@ pub fn analyze(parsed: &ParsedModule) -> Result<SemanticModel, Diagnostics> {
                 class_name: class.name.clone(),
                 properties: decls.properties,
                 controls: decls.controls,
-                helper_classes: custom_classes.clone(),
+                helper_classes: custom_classes,
                 event_bindings,
                 methods,
-                init_statements: decls.remaining_statements,
-                module_statements, // <--- PASS IT HERE
+                init_statements,
+                module_statements,
                 span: class.span,
             })
         }
@@ -323,81 +372,134 @@ pub fn analyze(parsed: &ParsedModule) -> Result<SemanticModel, Diagnostics> {
                 ));
             }
 
-            let mut event_bindings = Vec::new();
-            let mut methods = Vec::new();
-
+            let mut method_ids: FxHashMap<String, FunctionId> = FxHashMap::default();
             for stmt in &decls.remaining_statements {
                 if let ast::StmtKind::FunctionDef(f) = &stmt.kind {
                     let method_id = scope_stack.alloc_function_id();
-
-                    for dec in &f.decorators {
-                        if let Some(binding) = resolve_event_decorator(
-                            dec,
-                            method_id,
-                            f,
-                            &scope_stack,
-                            &mut diagnostics,
-                        ) {
-                            event_bindings.push(binding);
-                        }
-                    }
-
-                    scope_stack.push_scope(ScopeKind::Function {
-                        name: f.name.clone(),
-                    });
-
-                    let self_id = scope_stack.alloc_symbol_id();
+                    let sym_id = scope_stack.alloc_symbol_id();
                     scope_stack.define(Symbol::new(
-                        self_id,
-                        "self",
-                        SymbolKind::Variable {
-                            id: self_id,
-                            ty: Type::ClassInstance {
-                                name: class.name.clone(),
-                            },
+                        sym_id,
+                        f.name.clone(),
+                        SymbolKind::Method {
+                            id: method_id,
+                            param_count: f.params.len(),
+                            has_self: f.params.first().is_some_and(|p| p.name == "self"),
                         },
                         f.span,
                     ));
-
-                    let is_event_handler = event_bindings.iter().any(|b| b.handler_id == method_id);
-                    let mut resolved_params = Vec::new();
-
-                    for (idx, param) in f.params.iter().enumerate().skip(1) {
-                        let param_ty = if is_event_handler && idx == 1 {
-                            Type::ControlHandle
-                        } else {
-                            type_from_annotation(param.type_annotation.as_deref())
-                        };
-
-                        let param_sym = scope_stack.alloc_symbol_id();
-                        scope_stack.define(Symbol::new(
-                            param_sym,
-                            param.name.clone(),
-                            SymbolKind::Parameter {
-                                id: param_sym,
-                                ty: param_ty,
-                                index: idx,
-                            },
-                            param.span,
-                        ));
-                        type_map.insert_resolution(param.span, ResolvedTarget::Local(param_sym));
-                        resolved_params.push((param_sym, param.name.clone()));
-                    }
-
-                    let mut analyzer =
-                        ExprAnalyzer::new(&mut scope_stack, &mut type_map, &mut diagnostics);
-                    analyzer.analyze_statements(&f.body);
-
-                    scope_stack.pop_scope();
-
-                    methods.push(ResolvedMethod {
-                        id: method_id,
-                        name: f.name.clone(),
-                        params: resolved_params,
-                        body: f.body.clone(),
-                        span: f.span,
-                    });
+                    method_ids.insert(f.name.clone(), method_id);
                 }
+            }
+
+            let mut event_bindings = Vec::new();
+            let mut methods = Vec::new();
+            let mut init_statements = Vec::new();
+
+            for stmt in &decls.remaining_statements {
+                match &stmt.kind {
+                    ast::StmtKind::FunctionDef(f) => {
+                        let method_id = *method_ids.get(&f.name).unwrap();
+
+                        for dec in &f.decorators {
+                            if let Some(binding) = resolve_event_decorator(
+                                dec,
+                                method_id,
+                                f,
+                                &scope_stack,
+                                &mut diagnostics,
+                            ) {
+                                event_bindings.push(binding);
+                            }
+                        }
+
+                        scope_stack.push_scope(ScopeKind::Function {
+                            name: f.name.clone(),
+                        });
+
+                        let self_id = scope_stack.alloc_symbol_id();
+                        type_map.insert_symbol_name(self_id, "self");
+                        scope_stack.define(Symbol::new(
+                            self_id,
+                            "self",
+                            SymbolKind::Variable {
+                                id: self_id,
+                                ty: Type::ClassInstance {
+                                    name: class.name.clone(),
+                                },
+                            },
+                            f.span,
+                        ));
+
+                        let is_event_handler =
+                            event_bindings.iter().any(|b| b.handler_id == method_id);
+                        let mut resolved_params = Vec::new();
+                        let skip_count =
+                            usize::from(f.params.first().is_some_and(|p| p.name == "self"));
+
+                        for (idx, param) in f.params.iter().enumerate().skip(skip_count) {
+                            let param_ty = if is_event_handler && idx == 1 {
+                                Type::ControlHandle
+                            } else {
+                                type_from_annotation(param.type_annotation.as_deref())
+                            };
+
+                            let param_sym = scope_stack.alloc_symbol_id();
+                            type_map.insert_symbol_name(param_sym, param.name.clone());
+                            scope_stack.define(Symbol::new(
+                                param_sym,
+                                param.name.clone(),
+                                SymbolKind::Parameter {
+                                    id: param_sym,
+                                    ty: param_ty.clone(),
+                                    index: idx,
+                                },
+                                param.span,
+                            ));
+                            type_map
+                                .insert_resolution(param.span, ResolvedTarget::Local(param_sym));
+                            type_map.insert_type(param.span, param_ty);
+                            resolved_params.push((param_sym, param.name.clone()));
+                        }
+
+                        let mut analyzer =
+                            ExprAnalyzer::new(&mut scope_stack, &mut type_map, &mut diagnostics);
+                        analyzer.analyze_statements(&f.body);
+
+                        scope_stack.pop_scope();
+
+                        methods.push(ResolvedMethod {
+                            id: method_id,
+                            name: f.name.clone(),
+                            params: resolved_params,
+                            body: f.body.clone(),
+                            span: f.span,
+                        });
+                    }
+                    ast::StmtKind::Pass => {}
+                    ast::StmtKind::Expr(e) if matches!(e.kind, ast::ExprKind::String(_)) => {}
+                    _ => {
+                        init_statements.push(stmt.clone());
+                    }
+                }
+            }
+
+            if !init_statements.is_empty() {
+                let self_id = scope_stack.alloc_symbol_id();
+                type_map.insert_symbol_name(self_id, "self");
+                scope_stack.define(Symbol::new(
+                    self_id,
+                    "self",
+                    SymbolKind::Variable {
+                        id: self_id,
+                        ty: Type::ClassInstance {
+                            name: class.name.clone(),
+                        },
+                    },
+                    class.span,
+                ));
+                let mut analyzer =
+                    ExprAnalyzer::new(&mut scope_stack, &mut type_map, &mut diagnostics);
+                analyzer.analyze_statements(&init_statements);
             }
 
             scope_stack.pop_scope();
@@ -405,10 +507,11 @@ pub fn analyze(parsed: &ParsedModule) -> Result<SemanticModel, Diagnostics> {
             TargetKind::TextController(ControllerSemantic {
                 class_name: class.name.clone(),
                 controls: decls.controls,
-                helper_classes: custom_classes.clone(),
+                helper_classes: custom_classes,
                 event_bindings,
                 methods,
-                init_statements: decls.remaining_statements,
+                init_statements,
+                module_statements,
                 span: class.span,
             })
         }
@@ -417,22 +520,31 @@ pub fn analyze(parsed: &ParsedModule) -> Result<SemanticModel, Diagnostics> {
             let mut methods = Vec::new();
             let mut top_level_statements = Vec::new();
 
+            // Pre-register top-level functions so they can call each other in any order
+            let mut fn_ids: FxHashMap<String, FunctionId> = FxHashMap::default();
+            for stmt in &parsed.module.statements {
+                if let ast::StmtKind::FunctionDef(f) = &stmt.kind {
+                    let func_id = scope_stack.alloc_function_id();
+                    let func_sym = scope_stack.alloc_symbol_id();
+                    scope_stack.define(Symbol::new(
+                        func_sym,
+                        f.name.clone(),
+                        SymbolKind::Method {
+                            id: func_id,
+                            param_count: f.params.len(),
+                            has_self: false,
+                        },
+                        f.span,
+                    ));
+                    type_map.insert_resolution(f.span, ResolvedTarget::Function(func_id));
+                    fn_ids.insert(f.name.clone(), func_id);
+                }
+            }
+
             for stmt in &parsed.module.statements {
                 match &stmt.kind {
                     ast::StmtKind::FunctionDef(f) => {
-                        let func_id = scope_stack.alloc_function_id();
-                        let func_sym = scope_stack.alloc_symbol_id();
-                        scope_stack.define(Symbol::new(
-                            func_sym,
-                            f.name.clone(),
-                            SymbolKind::Method {
-                                id: func_id,
-                                param_count: f.params.len(),
-                                has_self: false,
-                            },
-                            f.span,
-                        ));
-                        type_map.insert_resolution(f.span, ResolvedTarget::Function(func_id));
+                        let func_id = *fn_ids.get(&f.name).unwrap();
 
                         scope_stack.push_scope(ScopeKind::Function {
                             name: f.name.clone(),
@@ -442,18 +554,20 @@ pub fn analyze(parsed: &ParsedModule) -> Result<SemanticModel, Diagnostics> {
                         for (idx, param) in f.params.iter().enumerate() {
                             let param_ty = type_from_annotation(param.type_annotation.as_deref());
                             let param_sym = scope_stack.alloc_symbol_id();
+                            type_map.insert_symbol_name(param_sym, param.name.clone());
                             scope_stack.define(Symbol::new(
                                 param_sym,
                                 param.name.clone(),
                                 SymbolKind::Parameter {
                                     id: param_sym,
-                                    ty: param_ty,
+                                    ty: param_ty.clone(),
                                     index: idx,
                                 },
                                 param.span,
                             ));
                             type_map
                                 .insert_resolution(param.span, ResolvedTarget::Local(param_sym));
+                            type_map.insert_type(param.span, param_ty);
                             resolved_params.push((param_sym, param.name.clone()));
                         }
 
@@ -471,6 +585,12 @@ pub fn analyze(parsed: &ParsedModule) -> Result<SemanticModel, Diagnostics> {
                             span: f.span,
                         });
                     }
+                    ast::StmtKind::ClassDef(_) => {
+                        let mut analyzer =
+                            ExprAnalyzer::new(&mut scope_stack, &mut type_map, &mut diagnostics);
+                        analyzer.analyze_stmt(stmt);
+                    }
+                    ast::StmtKind::Import { .. } | ast::StmtKind::ImportFrom { .. } => {}
                     _ => {
                         let mut analyzer =
                             ExprAnalyzer::new(&mut scope_stack, &mut type_map, &mut diagnostics);
@@ -483,30 +603,39 @@ pub fn analyze(parsed: &ParsedModule) -> Result<SemanticModel, Diagnostics> {
             TargetKind::ProceduralScript(ScriptSemantic {
                 bound_pins: Vec::new(),
                 event_bindings: Vec::new(),
-                classes: custom_classes.clone(),
+                classes: custom_classes,
                 methods,
                 statements: top_level_statements,
             })
         }
     };
 
-    if diagnostics.has_errors() {
-        Err(diagnostics)
-    } else {
-        Ok(SemanticModel {
+    (
+        SemanticModel {
             file: parsed.file.clone(),
             target,
             type_map,
-        })
+        },
+        diagnostics,
+    )
+}
+
+pub fn analyze(parsed: &ParsedModule) -> Result<SemanticModel, Diagnostics> {
+    let (model, diagnostics) = analyze_lossy(parsed);
+    if diagnostics.has_errors() {
+        Err(diagnostics)
+    } else {
+        Ok(model)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use qsys_diagnostics::{FileId, SourceFile};
     use qsys_model::ControlMember;
     use qsys_parser::parse_module;
+
+    use super::*;
 
     #[test]
     fn test_end_to_end_plugin_analysis() {

@@ -83,3 +83,9 @@ pub fn get_inlay_hints(source: &str) -> String {
     let hints = Analyzer::inlay_hints(source);
     serde_json::to_string(&hints).unwrap_or_else(|_| "[]".to_string())
 }
+
+/// Query the Rust compiler for function/method signature help at (line, column).
+#[wasm_bindgen]
+pub fn get_signature_help(source: &str, line: usize, col: usize) -> Option<String> {
+    Analyzer::signature_help(source, line, col).and_then(|s| serde_json::to_string(&s).ok())
+}
