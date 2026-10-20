@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use qsys_diagnostics::{Diagnostics, EditorMarker, SourceFile};
 use qsys_model::PluginInfo;
+use qsys_runtime::RuntimeEnv;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProgramKind {
@@ -26,6 +27,8 @@ pub struct CompilerOptions {
     pub emit_source_maps: bool,
     pub minify: bool,
     pub filename: String,
+    /// Runtime environment (globals, native types, removed builtins) to compile against.
+    pub env: Arc<RuntimeEnv>,
 }
 
 impl Default for CompilerOptions {
@@ -35,6 +38,7 @@ impl Default for CompilerOptions {
             emit_source_maps: false,
             minify: false,
             filename: "main.py".to_string(),
+            env: RuntimeEnv::qsys(),
         }
     }
 }

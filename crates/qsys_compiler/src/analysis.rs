@@ -5,10 +5,17 @@ use serde::{Deserialize, Serialize};
 use qsys_diagnostics::{FileId, SourceFile};
 use qsys_model::{ControlKind, ControlMember, PropertyKind};
 use qsys_parser::{ParsedModule, ast, parse_module_lossy};
+use qsys_runtime::{
+    Availability, CallStyle, Function, Global, GlobalKind, Lowering, Member, ObjectType, Returns,
+    RuntimeEnv,
+};
 use qsys_sema::{
     DeclaredControl, DeclaredProperty, ResolvedMethod, SemanticModel, TargetKind, Type,
     analyze_lossy,
 };
+
+/// Characters stripped from the front of a dotted receiver expression (`(sock.` -> `sock`).
+const RECEIVER_TRIM: [char; 10] = ['(', '[', '{', ',', '=', ':', '+', '-', '*', '/'];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LspHover {
@@ -277,10 +284,23 @@ impl Analyzer {
             }
         }
 
-        // 5. Built-in Q-SYS symbols & methods
-        if let Some((sig, doc)) = builtin_symbol_doc(word) {
+        // 5. QSysPy declaration DSL symbols
+        if let Some((sig, doc)) = dsl_symbol_doc(word) {
             return Some(LspHover {
                 contents: vec![sig.to_string(), doc.to_string()],
+                start_line,
+                start_col,
+                end_line,
+                end_col,
+            });
+        }
+
+        // 5b. Runtime environment globals and native object members
+        if let Some(contents) = runtime_hover(
+            word, word_start, &file.src, controls, properties, &parsed, &model,
+        ) {
+            return Some(LspHover {
+                contents,
                 start_line,
                 start_col,
                 end_line,
@@ -390,8 +410,7 @@ impl Analyzer {
 
         // B. Dotted member access: `<receiver>.<partial>`
         if let Some((receiver, partial)) = prefix.rsplit_once('.') {
-            let receiver =
-                receiver.trim_start_matches(['(', '[', '{', ',', '=', ':', '+', '-', '*', '/']);
+            let receiver = receiver.trim_start_matches(RECEIVER_TRIM);
 
             // B1. `self.<partial>` -> Controls, Properties, Methods, Metadata
             if receiver == "self" {
@@ -488,63 +507,28 @@ impl Analyzer {
                 return items;
             }
 
-            // B4. `UdpSocket.<partial>`, `TcpSocket.<partial>`, `Timer.<partial>`, `qsys.<partial>`
-            if matches!(receiver, "UdpSocket" | "TcpSocket" | "Timer") {
-                if matches_prefix("New", partial) {
-                    items.push(LspCompletion {
-                        label: "New".to_string(),
-                        kind: "Method".to_string(),
-                        detail: format!("{receiver}.New() -> {receiver}Handle"),
-                        documentation: format!(
-                            "Allocates a new Q-SYS `{receiver}` runtime instance."
-                        ),
-                        insert_text: "New()".to_string(),
-                        is_snippet: false,
-                    });
-                }
-                return items;
-            }
-
-            if receiver == "qsys" {
-                if matches_prefix("lua", partial) {
-                    items.push(LspCompletion {
-                        label: "lua".to_string(),
-                        kind: "Function".to_string(),
-                        detail: "qsys.lua(code: str) -> None".to_string(),
-                        documentation:
-                            "Injects raw, uncompiled Lua 5.3 code directly into the output."
-                                .to_string(),
-                        insert_text: "lua(\"${1:print('hello from lua')}\")".to_string(),
-                        is_snippet: true,
-                    });
-                }
+            // B4. Runtime globals bound to object types (`Timer.`, `UdpSocket.`, `math.`, `qsys.`)
+            if !is_local_symbol(&model, receiver)
+                && let Some(ty) = model.env.object_type_of_global(receiver)
+            {
+                items.extend(
+                    object_type_completions(ty)
+                        .into_iter()
+                        .filter(|item| matches_prefix(&item.label, partial)),
+                );
                 return items;
             }
 
             // B5. Check receiver type (`self.<Control>.<partial>`, `ctl.<partial>`, `sock.<partial>`, `timer.<partial>`)
             let receiver_ty = infer_receiver_type(receiver, controls, properties, &parsed, &model);
             match receiver_ty {
-                Some(Type::UdpSocketHandle) => {
-                    for item in udp_socket_completions() {
-                        if matches_prefix(&item.label, partial) {
-                            items.push(item);
-                        }
-                    }
-                    return items;
-                }
-                Some(Type::TcpSocketHandle) => {
-                    for item in tcp_socket_completions() {
-                        if matches_prefix(&item.label, partial) {
-                            items.push(item);
-                        }
-                    }
-                    return items;
-                }
-                Some(Type::TimerHandle) => {
-                    for item in timer_completions() {
-                        if matches_prefix(&item.label, partial) {
-                            items.push(item);
-                        }
+                Some(Type::Native { ref name }) => {
+                    if let Some(ty) = model.env.object_type(name) {
+                        items.extend(
+                            object_type_completions(ty)
+                                .into_iter()
+                                .filter(|item| matches_prefix(&item.label, partial)),
+                        );
                     }
                     return items;
                 }
@@ -671,8 +655,7 @@ impl Analyzer {
         }
 
         // C. Top-level / statement / identifier completions
-        let ident_partial =
-            prefix.trim_start_matches(['(', '[', '{', ',', '=', ':', '+', '-', '*', '/']);
+        let ident_partial = prefix.trim_start_matches(RECEIVER_TRIM);
 
         // Include custom classes and module-level variables from the AST
         for stmt in &parsed.module.statements {
@@ -720,7 +703,7 @@ impl Analyzer {
             }
         }
 
-        for item in top_level_completions(controls, properties, methods) {
+        for item in top_level_completions(controls, properties, methods, &model.env) {
             if matches_prefix(&item.label, ident_partial) {
                 items.push(item);
             }
@@ -770,8 +753,8 @@ impl Analyzer {
         let cursor_offset = file.offset(line, col);
         let (callee_name, active_parameter) = find_enclosing_call(&file.src, cursor_offset)?;
 
-        let (_, model) = parse_and_analyze_for_ide(source, line);
-        let (_, _, methods) = extract_target_members(&model);
+        let (parsed, model) = parse_and_analyze_for_ide(source, line);
+        let (controls, properties, methods) = extract_target_members(&model);
 
         if let Some(method_name) = callee_name.strip_prefix("self.") {
             for m in methods {
@@ -799,7 +782,16 @@ impl Analyzer {
             }
         }
 
-        builtin_signature_help(&callee_name, active_parameter)
+        dsl_signature_help(&callee_name, active_parameter).or_else(|| {
+            runtime_signature_help(
+                &callee_name,
+                active_parameter,
+                controls,
+                properties,
+                &parsed,
+                &model,
+            )
+        })
     }
 }
 
@@ -872,9 +864,7 @@ fn collect_stmt_inlay_hints(
                     && let Some(ty) = model.type_map.get_type(target.span)
                     && (matches!(
                         ty,
-                        Type::UdpSocketHandle
-                            | Type::TcpSocketHandle
-                            | Type::TimerHandle
+                        Type::Native { .. }
                             | Type::ControlHandle
                             | Type::PropertyHandle
                             | Type::UserInstance { .. }
@@ -943,10 +933,14 @@ fn infer_receiver_type(
     }
 
     // Fallback: inspect AST assignments `receiver = UdpSocket.New()` or `receiver = Foo()`
-    find_assigned_type_in_module(&parsed.module.statements, receiver)
+    find_assigned_type_in_module(&parsed.module.statements, receiver, &model.env)
 }
 
-fn find_assigned_type_in_module(stmts: &[ast::Stmt], var_name: &str) -> Option<Type> {
+fn find_assigned_type_in_module(
+    stmts: &[ast::Stmt],
+    var_name: &str,
+    env: &RuntimeEnv,
+) -> Option<Type> {
     for stmt in stmts {
         match &stmt.kind {
             ast::StmtKind::Assign { target, value } => {
@@ -955,14 +949,20 @@ fn find_assigned_type_in_module(stmts: &[ast::Stmt], var_name: &str) -> Option<T
                     && let ast::ExprKind::Call { callee, .. } = &value.kind
                 {
                     if let ast::ExprKind::Attribute { value: recv, attr } = &callee.kind
-                        && attr == "New"
-                        && let ast::ExprKind::Ident(cls_name) = &recv.kind
+                        && let ast::ExprKind::Ident(global_name) = &recv.kind
                     {
-                        match cls_name.as_str() {
-                            "UdpSocket" => return Some(Type::UdpSocketHandle),
-                            "TcpSocket" => return Some(Type::TcpSocketHandle),
-                            "Timer" => return Some(Type::TimerHandle),
-                            _ => {}
+                        // `X.factory()` on a runtime global, e.g. `UdpSocket.New()`
+                        if let Some(Function {
+                            returns: Returns::Type(ret),
+                            ..
+                        }) = env
+                            .object_type_of_global(global_name)
+                            .and_then(|ty| ty.get_method(attr))
+                        {
+                            let ty = Type::from_ref(ret);
+                            if ty != Type::Any {
+                                return Some(ty);
+                            }
                         }
                     } else if let ast::ExprKind::Ident(cls_name) = &callee.kind
                         && cls_name.chars().next().is_some_and(char::is_uppercase)
@@ -974,7 +974,7 @@ fn find_assigned_type_in_module(stmts: &[ast::Stmt], var_name: &str) -> Option<T
                 }
             }
             ast::StmtKind::ClassDef(cls) => {
-                if let Some(ty) = find_assigned_type_in_module(&cls.body, var_name) {
+                if let Some(ty) = find_assigned_type_in_module(&cls.body, var_name, env) {
                     return Some(ty);
                 }
             }
@@ -987,7 +987,7 @@ fn find_assigned_type_in_module(stmts: &[ast::Stmt], var_name: &str) -> Option<T
                         return Some(Type::ControlHandle);
                     }
                 }
-                if let Some(ty) = find_assigned_type_in_module(&f.body, var_name) {
+                if let Some(ty) = find_assigned_type_in_module(&f.body, var_name, env) {
                     return Some(ty);
                 }
             }
@@ -1001,10 +1001,7 @@ fn format_type_display(ty: &Type) -> Option<String> {
     match ty {
         Type::ControlHandle => Some("ControlHandle".to_string()),
         Type::PropertyHandle => Some("PropertyHandle".to_string()),
-        Type::UdpSocketHandle => Some("UdpSocketHandle".to_string()),
-        Type::TcpSocketHandle => Some("TcpSocketHandle".to_string()),
-        Type::TimerHandle => Some("TimerHandle".to_string()),
-        Type::UserInstance { name } => Some(name.clone()),
+        Type::Native { name } | Type::UserInstance { name } => Some(name.clone()),
         Type::Float => Some("float".to_string()),
         Type::Int => Some("int".to_string()),
         Type::String => Some("str".to_string()),
@@ -1158,142 +1155,291 @@ fn property_factory_completions() -> Vec<LspCompletion> {
     ]
 }
 
-fn udp_socket_completions() -> Vec<LspCompletion> {
-    vec![
-        LspCompletion {
-            label: "Open".to_string(),
-            kind: "Method".to_string(),
-            detail: "sock.Open(ip?: str, port?: int) -> None".to_string(),
-            documentation: "Opens the UDP socket (compiled to `sock:Open(...)`).".to_string(),
-            insert_text: "Open(${0})".to_string(),
-            is_snippet: true,
-        },
-        LspCompletion {
-            label: "Send".to_string(),
-            kind: "Method".to_string(),
-            detail: "sock.Send(ip: str, port: int, data: str) -> None".to_string(),
-            documentation:
-                "Sends a UDP datagram to `(ip, port)` (compiled to `sock:Send(ip, port, data)`)."
-                    .to_string(),
-            insert_text: "Send(${1:self.IPAddress.String}, ${2:9}, ${3:packet})".to_string(),
-            is_snippet: true,
-        },
-        LspCompletion {
-            label: "Close".to_string(),
-            kind: "Method".to_string(),
-            detail: "sock.Close() -> None".to_string(),
-            documentation: "Closes the UDP socket (compiled to `sock:Close()`).".to_string(),
-            insert_text: "Close()".to_string(),
-            is_snippet: false,
-        },
-        LspCompletion {
-            label: "JoinMulticast".to_string(),
-            kind: "Method".to_string(),
-            detail: "sock.JoinMulticast(address: str, local_ip?: str) -> None".to_string(),
-            documentation: "Joins a multicast group address.".to_string(),
-            insert_text: "JoinMulticast(${1:\"224.0.0.1\"})".to_string(),
-            is_snippet: true,
-        },
-        LspCompletion {
-            label: "Data".to_string(),
-            kind: "Event".to_string(),
-            detail: "sock.Data: Callable[[UdpSocketHandle, UdpPacket], None]".to_string(),
-            documentation: "Callback assigned to receive incoming UDP packets.".to_string(),
-            insert_text: "Data".to_string(),
-            is_snippet: false,
-        },
-    ]
+/// Completion items for every method and field of a runtime object type.
+fn object_type_completions(ty: &ObjectType) -> Vec<LspCompletion> {
+    let methods = ty
+        .methods
+        .iter()
+        .map(|m| member_completion(&ty.name, Member::Method(m)));
+    let fields = ty
+        .fields
+        .iter()
+        .map(|f| member_completion(&ty.name, Member::Field(f)));
+    methods.chain(fields).collect()
 }
 
-fn tcp_socket_completions() -> Vec<LspCompletion> {
-    vec![
-        LspCompletion {
-            label: "Connect".to_string(),
+fn member_completion(type_name: &str, member: Member<'_>) -> LspCompletion {
+    match member {
+        Member::Method(method) => LspCompletion {
+            label: method.name.clone(),
             kind: "Method".to_string(),
-            detail: "sock.Connect(ip: str, port: int) -> None".to_string(),
-            documentation: "Initiates a TCP connection (compiled to `sock:Connect(ip, port)`)."
-                .to_string(),
-            insert_text: "Connect(${1:ip}, ${2:port})".to_string(),
-            is_snippet: true,
+            detail: format!(
+                "{type_name}.{}({}) -> {}",
+                method.name,
+                method.params_label(),
+                method.return_annotation()
+            ),
+            documentation: method_documentation(method),
+            insert_text: call_insert_text(method),
+            is_snippet: method.snippet.is_some() || !method.params.is_empty() || method.variadic,
         },
-        LspCompletion {
-            label: "Write".to_string(),
-            kind: "Method".to_string(),
-            detail: "sock.Write(data: str) -> None".to_string(),
-            documentation: "Writes data to the TCP socket (compiled to `sock:Write(data)`)."
-                .to_string(),
-            insert_text: "Write(${1:data})".to_string(),
-            is_snippet: true,
-        },
-        LspCompletion {
-            label: "Read".to_string(),
-            kind: "Method".to_string(),
-            detail: "sock.Read(length: int) -> str".to_string(),
-            documentation: "Reads up to `length` bytes from the TCP receive buffer.".to_string(),
-            insert_text: "Read(${1:1024})".to_string(),
-            is_snippet: true,
-        },
-        LspCompletion {
-            label: "ReadLine".to_string(),
-            kind: "Method".to_string(),
-            detail: "sock.ReadLine(eol: int) -> str | None".to_string(),
-            documentation: "Reads a single line from the TCP receive buffer.".to_string(),
-            insert_text: "ReadLine(${1:TcpSocket.EOL.Any})".to_string(),
-            is_snippet: true,
-        },
-        LspCompletion {
-            label: "Disconnect".to_string(),
-            kind: "Method".to_string(),
-            detail: "sock.Disconnect() -> None".to_string(),
-            documentation: "Closes the active TCP connection.".to_string(),
-            insert_text: "Disconnect()".to_string(),
+        Member::Field(field) => LspCompletion {
+            label: field.name.clone(),
+            kind: if field.is_event() {
+                "Event"
+            } else {
+                "Property"
+            }
+            .to_string(),
+            detail: format!(
+                "({}) {type_name}.{}: {}",
+                if field.is_event() {
+                    "event"
+                } else {
+                    "property"
+                },
+                field.name,
+                field.ty.python_annotation()
+            ),
+            documentation: field.doc.clone(),
+            insert_text: field.name.clone(),
             is_snippet: false,
         },
-        LspCompletion {
-            label: "IsConnected".to_string(),
-            kind: "Property".to_string(),
-            detail: "(property) sock.IsConnected: bool".to_string(),
-            documentation: "True when the TCP socket is currently connected.".to_string(),
-            insert_text: "IsConnected".to_string(),
-            is_snippet: false,
-        },
-    ]
+    }
 }
 
-fn timer_completions() -> Vec<LspCompletion> {
-    vec![
-        LspCompletion {
-            label: "Start".to_string(),
-            kind: "Method".to_string(),
-            detail: "timer.Start(period_seconds: float) -> None".to_string(),
-            documentation: "Starts the Q-SYS timer (compiled to `timer:Start(period)`)."
-                .to_string(),
-            insert_text: "Start(${1:1.0})".to_string(),
-            is_snippet: true,
-        },
-        LspCompletion {
-            label: "Stop".to_string(),
-            kind: "Method".to_string(),
-            detail: "timer.Stop() -> None".to_string(),
-            documentation: "Stops the Q-SYS timer (compiled to `timer:Stop()`).".to_string(),
-            insert_text: "Stop()".to_string(),
-            is_snippet: false,
-        },
-        LspCompletion {
-            label: "EventHandler".to_string(),
-            kind: "Event".to_string(),
-            detail: "timer.EventHandler: Callable[[TimerHandle], None]".to_string(),
-            documentation: "Callback invoked every time the timer period elapses.".to_string(),
-            insert_text: "EventHandler".to_string(),
-            is_snippet: false,
-        },
-    ]
+fn global_completion(global: &Global, env: &RuntimeEnv) -> LspCompletion {
+    let (kind, detail, insert_text, is_snippet) = match &global.kind {
+        GlobalKind::Function(function) => (
+            "Function",
+            format!(
+                "{}({}) -> {}",
+                function.name,
+                function.params_label(),
+                function.return_annotation()
+            ),
+            call_insert_text(function),
+            function.snippet.is_some() || !function.params.is_empty() || function.variadic,
+        ),
+        GlobalKind::Value(ty) => {
+            let is_class = global.object_type_name() == Some(global.name.as_str())
+                && env.object_type(&global.name).is_some();
+            if is_class {
+                (
+                    "Class",
+                    format!("class {}", global.name),
+                    global.name.clone(),
+                    false,
+                )
+            } else {
+                (
+                    "Variable",
+                    format!("{}: {}", global.name, ty.python_annotation()),
+                    global.name.clone(),
+                    false,
+                )
+            }
+        }
+    };
+
+    LspCompletion {
+        label: global.name.clone(),
+        kind: kind.to_string(),
+        detail,
+        documentation: global_documentation(global),
+        insert_text,
+        is_snippet,
+    }
+}
+
+fn call_insert_text(function: &Function) -> String {
+    if let Some(snippet) = &function.snippet {
+        snippet.clone()
+    } else if function.params.is_empty() && !function.variadic {
+        format!("{}()", function.name)
+    } else {
+        format!("{}(${{0}})", function.name)
+    }
+}
+
+fn method_documentation(method: &Function) -> String {
+    match method.call_style {
+        CallStyle::Colon => format!("{} (compiled to `obj:{}(...)`)", method.doc, method.name),
+        CallStyle::Dot => method.doc.clone(),
+    }
+}
+
+fn global_documentation(global: &Global) -> String {
+    let mut doc = global.doc.clone();
+    if let Some(function) = global.as_function() {
+        let lowered = match &function.lowering {
+            Lowering::Direct => None,
+            Lowering::Rename(target) => Some(format!("`{target}(...)`")),
+            Lowering::Qualified { module, name } => Some(format!("`{module}.{name}(...)`")),
+            Lowering::LengthOperator => Some("the `#` length operator".to_string()),
+        };
+        if let Some(lowered) = lowered {
+            doc.push_str(&format!("\n\nCompiles to {lowered} in Lua."));
+        }
+    }
+    if global.availability != Availability::Always {
+        doc.push_str(&format!(
+            "\n\n_Only available {}._",
+            global.availability.describe()
+        ));
+    }
+    doc
+}
+
+/// Whether `name` is bound to a user-defined local/parameter (which shadows runtime globals).
+fn is_local_symbol(model: &SemanticModel, name: &str) -> bool {
+    model.type_map.symbol_names().values().any(|n| n == name)
+}
+
+/// Resolves the runtime object type of a dotted receiver (`Timer`, `sock`, `self.timer`).
+fn resolve_receiver_object_type(
+    receiver: &str,
+    controls: &[DeclaredControl],
+    properties: &[DeclaredProperty],
+    parsed: &ParsedModule,
+    model: &SemanticModel,
+) -> Option<String> {
+    if !is_local_symbol(model, receiver)
+        && let Some(ty) = model.env.object_type_of_global(receiver)
+    {
+        return Some(ty.name.clone());
+    }
+    match infer_receiver_type(receiver, controls, properties, parsed, model)? {
+        Type::Native { name } => Some(name),
+        _ => None,
+    }
+}
+
+/// Hover contents for runtime globals (`Timer`, `print`) and native members (`sock.Send`).
+fn runtime_hover(
+    word: &str,
+    word_start: usize,
+    src: &str,
+    controls: &[DeclaredControl],
+    properties: &[DeclaredProperty],
+    parsed: &ParsedModule,
+    model: &SemanticModel,
+) -> Option<Vec<String>> {
+    let env = &model.env;
+    let before = &src[..word_start.min(src.len())];
+
+    if let Some(receiver_text) = before.strip_suffix('.') {
+        let receiver = get_prefix_before_cursor(receiver_text, receiver_text.len())
+            .trim_start_matches(RECEIVER_TRIM);
+        let resolved = resolve_receiver_object_type(receiver, controls, properties, parsed, model)
+            .and_then(|type_name| {
+                env.member(&type_name, word)
+                    .map(|member| member_hover(&type_name, member))
+            });
+        // Fall back to the first runtime type declaring this member when the receiver's type is unknown.
+        return resolved.or_else(|| {
+            env.object_types()
+                .iter()
+                .find_map(|ty| ty.member(word).map(|member| member_hover(&ty.name, member)))
+        });
+    }
+
+    if is_local_symbol(model, word) {
+        return None;
+    }
+    let global = env.global(word)?;
+    let signature = match &global.kind {
+        GlobalKind::Function(function) => format!(
+            "*(function)* {}({}) -> {}",
+            function.name,
+            function.params_label(),
+            function.return_annotation()
+        ),
+        GlobalKind::Value(ty) => {
+            if global.object_type_name() == Some(global.name.as_str()) {
+                format!("*(class)* {}", global.name)
+            } else {
+                format!("*(variable)* {}: {}", global.name, ty.python_annotation())
+            }
+        }
+    };
+    Some(vec![signature, global_documentation(global)])
+}
+
+fn member_hover(type_name: &str, member: Member<'_>) -> Vec<String> {
+    match member {
+        Member::Method(method) => vec![
+            format!(
+                "*(method)* {type_name}.{}({}) -> {}",
+                method.name,
+                method.params_label(),
+                method.return_annotation()
+            ),
+            method_documentation(method),
+        ],
+        Member::Field(field) => vec![
+            format!(
+                "*({})* {type_name}.{}: {}",
+                if field.is_event() {
+                    "event"
+                } else {
+                    "property"
+                },
+                field.name,
+                field.ty.python_annotation()
+            ),
+            field.doc.clone(),
+        ],
+    }
+}
+
+/// Signature help for runtime functions (`print(`) and native methods (`sock.Send(`).
+fn runtime_signature_help(
+    callee: &str,
+    active_parameter: usize,
+    controls: &[DeclaredControl],
+    properties: &[DeclaredProperty],
+    parsed: &ParsedModule,
+    model: &SemanticModel,
+) -> Option<LspSignatureHelp> {
+    let env = &model.env;
+    let function = if let Some((receiver, member)) = callee.rsplit_once('.') {
+        resolve_receiver_object_type(receiver, controls, properties, parsed, model)
+            .and_then(|type_name| env.object_type(&type_name))
+            .and_then(|ty| ty.get_method(member))
+            .or_else(|| {
+                env.object_types()
+                    .iter()
+                    .find_map(|ty| ty.get_method(member))
+            })
+    } else if is_local_symbol(model, callee) {
+        None
+    } else {
+        env.global(callee).and_then(Global::as_function)
+    }?;
+
+    let parameters: Vec<LspParameterInfo> = function
+        .params
+        .iter()
+        .map(|p| LspParameterInfo {
+            label: p.label(),
+            documentation: p.doc.clone(),
+        })
+        .collect();
+
+    Some(LspSignatureHelp {
+        label: format!("{callee}({})", function.params_label()),
+        documentation: function.doc.clone(),
+        active_parameter: active_parameter.min(parameters.len().saturating_sub(1)),
+        parameters,
+    })
 }
 
 fn top_level_completions(
     controls: &[DeclaredControl],
     properties: &[DeclaredProperty],
     methods: &[ResolvedMethod],
+    env: &RuntimeEnv,
 ) -> Vec<LspCompletion> {
     let mut items = vec![
         LspCompletion {
@@ -1326,30 +1472,6 @@ fn top_level_completions(
             detail: "Q-SYS Property factory namespace".to_string(),
             documentation: "Declare Q-SYS Properties panel settings (`Property.Integer`, `Property.Float`, `Property.String`, `Property.Enum`, `Property.Boolean`).".to_string(),
             insert_text: "Property".to_string(),
-            is_snippet: false,
-        },
-        LspCompletion {
-            label: "UdpSocket".to_string(),
-            kind: "Class".to_string(),
-            detail: "Q-SYS UdpSocket runtime API".to_string(),
-            documentation: "Create UDP sockets via `UdpSocket.New()`.".to_string(),
-            insert_text: "UdpSocket".to_string(),
-            is_snippet: false,
-        },
-        LspCompletion {
-            label: "TcpSocket".to_string(),
-            kind: "Class".to_string(),
-            detail: "Q-SYS TcpSocket runtime API".to_string(),
-            documentation: "Create TCP client sockets via `TcpSocket.New()`.".to_string(),
-            insert_text: "TcpSocket".to_string(),
-            is_snippet: false,
-        },
-        LspCompletion {
-            label: "Timer".to_string(),
-            kind: "Class".to_string(),
-            detail: "Q-SYS Timer runtime API".to_string(),
-            documentation: "Create periodic or one-shot timers via `Timer.New()`.".to_string(),
-            insert_text: "Timer".to_string(),
             is_snippet: false,
         },
         LspCompletion {
@@ -1411,6 +1533,10 @@ fn top_level_completions(
         });
     }
 
+    for global in env.globals() {
+        items.push(global_completion(global, env));
+    }
+
     items
 }
 
@@ -1446,7 +1572,9 @@ fn control_member_doc(name: &str) -> (&'static str, &'static str) {
     }
 }
 
-fn builtin_symbol_doc(word: &str) -> Option<(&'static str, &'static str)> {
+/// Hover documentation for names owned by the QSysPy declaration DSL.
+/// Runtime globals and native members are documented by the `RuntimeEnv` instead.
+fn dsl_symbol_doc(word: &str) -> Option<(&'static str, &'static str)> {
     match word {
         "QSysPlugin" => Some((
             "*(class)* QSysPlugin",
@@ -1468,51 +1596,11 @@ fn builtin_symbol_doc(word: &str) -> Option<(&'static str, &'static str)> {
             "*(class)* ControlHandle",
             "Runtime handle to a Q-SYS `Controls[...]` object providing `.Value`, `.String`, `.Boolean`, `.Legend`, `.Color`, `.IsDisabled`, `.IsInvisible`, and `.RampTime`.",
         )),
-        "UdpSocket" => Some((
-            "*(class)* UdpSocket",
-            "Q-SYS native UDP networking class. Instantiate via `UdpSocket.New()`.",
-        )),
-        "TcpSocket" => Some((
-            "*(class)* TcpSocket",
-            "Q-SYS native TCP client networking class. Instantiate via `TcpSocket.New()`.",
-        )),
-        "Timer" => Some((
-            "*(class)* Timer",
-            "Q-SYS native event loop timer. Instantiate via `Timer.New()`.",
-        )),
-        "Open" => Some((
-            "*(method)* UdpSocketHandle.Open(ip?: str, port?: int) -> None",
-            "Binds and opens the UDP socket (`sock:Open(...)` in Lua).",
-        )),
-        "Send" => Some((
-            "*(method)* UdpSocketHandle.Send(ip: str, port: int, data: str) -> None",
-            "Sends a UDP packet to the target IP and port (`sock:Send(ip, port, data)` in Lua).",
-        )),
-        "Close" => Some((
-            "*(method)* UdpSocketHandle.Close() -> None",
-            "Closes the UDP socket (`sock:Close()` in Lua).",
-        )),
-        "Connect" => Some((
-            "*(method)* TcpSocketHandle.Connect(ip: str, port: int) -> None",
-            "Connects the TCP socket to the target host and port (`sock:Connect(ip, port)` in Lua).",
-        )),
-        "Write" => Some((
-            "*(method)* TcpSocketHandle.Write(data: str) -> None",
-            "Writes string or binary payload over the TCP socket (`sock:Write(data)` in Lua).",
-        )),
-        "Start" => Some((
-            "*(method)* TimerHandle.Start(seconds: float) -> None",
-            "Starts or restarts the Q-SYS timer with the given interval in seconds (`timer:Start(seconds)` in Lua).",
-        )),
-        "Stop" => Some((
-            "*(method)* TimerHandle.Stop() -> None",
-            "Stops the Q-SYS timer (`timer:Stop()` in Lua).",
-        )),
         _ => None,
     }
 }
 
-fn builtin_signature_help(callee: &str, active_parameter: usize) -> Option<LspSignatureHelp> {
+fn dsl_signature_help(callee: &str, active_parameter: usize) -> Option<LspSignatureHelp> {
     let (label, doc, params): (&str, &str, &[(&str, &str)]) = match callee {
         "Control.Float" | "Control.Knob" | "Control.Fader" => (
             "Control.Float(name, min=-100.0, max=20.0, default=0.0, unit=\"Float\", pins=\"Both\", count=1)",
@@ -1629,46 +1717,6 @@ fn builtin_signature_help(callee: &str, active_parameter: usize) -> Option<LspSi
                 ("default: bool", "Default boolean state."),
                 ("description: str", "Tooltip description in Designer."),
             ],
-        ),
-        "qsys.lua" => (
-            "qsys.lua(code: str)",
-            "Injects raw Lua 5.3 source directly into the compiled output.",
-            &[("code: str", "Raw Lua 5.3 string literal.")],
-        ),
-        s if s.ends_with(".Send") => (
-            "sock.Send(ip: str, port: int, data: str)",
-            "Transmits a UDP datagram over the Q-SYS UdpSocket (`sock:Send(ip, port, data)`).",
-            &[
-                ("ip: str", "Destination IPv4/IPv6 or broadcast address."),
-                ("port: int", "Destination UDP port number (1-65535)."),
-                ("data: str", "Binary or text payload to send."),
-            ],
-        ),
-        s if s.ends_with(".Open") => (
-            "sock.Open(ip?: str, port?: int)",
-            "Binds and opens the UDP socket (`sock:Open(ip, port)`).",
-            &[
-                ("ip?: str", "Optional local interface IP to bind."),
-                ("port?: int", "Optional local UDP port to bind."),
-            ],
-        ),
-        s if s.ends_with(".Connect") => (
-            "sock.Connect(ip: str, port: int)",
-            "Opens a TCP connection to `(ip, port)` (`sock:Connect(ip, port)`).",
-            &[
-                ("ip: str", "Remote host IP or hostname."),
-                ("port: int", "Remote TCP port."),
-            ],
-        ),
-        s if s.ends_with(".Write") => (
-            "sock.Write(data: str)",
-            "Writes data to the connected TCP socket (`sock:Write(data)`).",
-            &[("data: str", "String or binary payload to transmit.")],
-        ),
-        s if s.ends_with(".Start") => (
-            "timer.Start(seconds: float)",
-            "Starts the Q-SYS timer with the specified interval in seconds (`timer:Start(seconds)`).",
-            &[("seconds: float", "Timer interval in seconds.")],
         ),
         _ => return None,
     };

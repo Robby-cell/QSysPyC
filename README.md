@@ -32,6 +32,7 @@ crates/
 ├── qsys_model/        # Authoritative Q-SYS domain model (Controls, Properties, Pin styles, Layout)
 ├── qsys_diagnostics/  # Diagnostic catalog (E0001–E0205), span tracking, Monaco/LSP markers
 ├── qsys_parser/       # AST lowering from ruff_python_parser; strict syntax validation
+├── qsys_runtime/      # Runtime plugins (PythonCore, LuaStdlib, QSysRuntime): globals, native types, removed builtins
 ├── qsys_sema/         # Scope management, symbol resolution, stable IDs, type inference
 ├── qsys_ir/           # Target-agnostic Intermediate Representation (Typed IR)
 ├── qsys_codegen_lua/  # Q-SYS Lua 5.3 code generator (PluginInfo, GetControls, runtime guard)

@@ -272,3 +272,91 @@ class MatrixMixer(QSysPlugin):
         "Subclass super().show() must lower to Foo.show(self):\n{lua}"
     );
 }
+
+#[test]
+fn test_runtime_env_call_styles() {
+    let src = r#"
+t = Timer.New()
+t.Start(0.5)
+sock = UdpSocket.New()
+sock.Send("255.255.255.255", 9, "hi")
+n = math.floor(2.5)
+qsys.lua("print('raw')")
+"#;
+    let lua = compile_to_lua(src);
+
+    assert!(
+        lua.contains("Timer.New()"),
+        "Factories use dot calls:\n{lua}"
+    );
+    assert!(
+        lua.contains("t:Start(0.5)"),
+        "Handle methods use colon calls:\n{lua}"
+    );
+    assert!(
+        lua.contains("UdpSocket.New()"),
+        "Factories use dot calls:\n{lua}"
+    );
+    assert!(
+        lua.contains("sock:Send(\"255.255.255.255\", 9, \"hi\")"),
+        "Handle methods use colon calls:\n{lua}"
+    );
+    assert!(
+        lua.contains("math.floor(2.5)"),
+        "Library functions use dot calls:\n{lua}"
+    );
+    assert!(
+        lua.contains("print('raw')"),
+        "Escape hatch emits raw Lua:\n{lua}"
+    );
+}
+
+#[test]
+fn test_runtime_env_builtin_lowering() {
+    let src = r#"
+items = [1, 2, 3]
+n = len(items)
+s = str(n)
+m = abs(-3)
+c = chr(65)
+"#;
+    let lua = compile_to_lua(src);
+
+    assert!(
+        lua.contains("#items"),
+        "len() lowers to the # operator:\n{lua}"
+    );
+    assert!(
+        lua.contains("tostring(n)"),
+        "str() lowers to tostring():\n{lua}"
+    );
+    assert!(
+        lua.contains("math.abs("),
+        "abs() lowers to math.abs():\n{lua}"
+    );
+    assert!(
+        lua.contains("string.char(65)"),
+        "chr() lowers to string.char():\n{lua}"
+    );
+}
+
+#[test]
+fn test_user_functions_shadow_builtin_lowering() {
+    let src = r#"
+def len(x):
+    return 42
+
+items = [1, 2, 3]
+n = len(items)
+"#;
+    let lua = compile_to_lua(src);
+
+    assert!(
+        !lua.contains("#items"),
+        "A user-defined len() must not be lowered to the # operator:\n{lua}"
+    );
+    assert!(
+        lua.contains("len(items)"),
+        "User len() is called as written:\n{lua}"
+    );
+}

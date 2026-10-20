@@ -9,6 +9,7 @@ qsys_diagnostics.workspace = true
 qsys_ir.workspace = true
 qsys_model.workspace = true
 qsys_parser.workspace = true
+qsys_runtime.workspace = true
 qsys_sema.workspace = true
 qsys_codegen_lua = { path = "../qsys_codegen_lua" }
 

@@ -13,6 +13,25 @@ pub use layout::{
 pub use plugin_info::PluginInfo;
 pub use properties::{PropertyDef, PropertyKind};
 
+/// Plugin methods that compile to Q-SYS design-time lifecycle functions
+/// (`GetControls`, `GetControlLayout`, ...) instead of runtime code.
+pub const DESIGN_TIME_METHODS: &[&str] = &[
+    "get_properties",
+    "get_controls",
+    "get_control_layout",
+    "get_pages",
+    "get_color",
+    "get_pretty_name",
+    "rectify_properties",
+    "get_components",
+    "get_pins",
+    "get_wiring",
+];
+
+pub fn is_design_time_method(name: &str) -> bool {
+    DESIGN_TIME_METHODS.contains(&name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

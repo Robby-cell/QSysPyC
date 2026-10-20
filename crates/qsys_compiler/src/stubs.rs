@@ -1,9 +1,11 @@
 use std::fs;
 use std::path::Path;
 
-/// The authoritative PEP 484/561 Python type stub definition for QSysPy.
-pub const QSYS_PYI: &str = r#"""
-# Python type stubs for QSysPy (Q-SYS Core Compiler)
+use qsys_runtime::{QSysRuntime, RuntimeEnv, pyi};
+
+/// Hand-written stubs for the QSysPy declaration DSL (`QSysPlugin`, `Control.*`, `Property.*`).
+/// Runtime globals and native object types are generated from the `RuntimeEnv` (see [`generate_pyi`]).
+const DSL_PYI: &str = r#"# Python type stubs for QSysPy (Q-SYS Core Compiler)
 # Compatible with Pyright, Pylance, mypy, and PyCharm
 
 from typing import Any, Callable, Literal, TypeVar, overload
@@ -229,123 +231,48 @@ class TextController:
         """Access bound pin controls on self."""
         ...
 
-class UdpPacket:
-    """Incoming UDP packet received by a UdpSocket."""
-    Address: str
-    Port: int
-    Data: str
-
-class UdpSocketHandle:
-    """Active UDP socket handle."""
-    Data: Callable[[UdpSocketHandle, UdpPacket], None]
-    Closed: Callable[[UdpSocketHandle], None]
-
-    def Open(self, port: int = ..., ip: str = ...) -> None:
-        """Binds the socket to a port and optional local IP."""
-        ...
-    def Close(self) -> None:
-        """Closes the socket."""
-        ...
-    def Send(self, ip: str, port: int, data: str | bytes) -> None:
-        """Transmits a datagram to the specified destination."""
-        ...
-    def JoinMulticast(self, address: str) -> None:
-        """Joins an IP multicast group."""
-        ...
-    def LeaveMulticast(self, address: str) -> None:
-        """Leaves an IP multicast group."""
-        ...
-
-class UdpSocket:
-    """Factory for Q-SYS UDP sockets."""
-    @staticmethod
-    def New() -> UdpSocketHandle:
-        """Creates a new UDP socket."""
-        ...
-
-class TcpSocketHandle:
-    """Active TCP socket handle."""
-    IsConnected: bool
-    Connected: Callable[[TcpSocketHandle], None]
-    Data: Callable[[TcpSocketHandle], None]
-    Closed: Callable[[TcpSocketHandle], None]
-    Error: Callable[[TcpSocketHandle, str], None]
-    Timeout: Callable[[TcpSocketHandle], None]
-
-    def Connect(self, ip: str, port: int) -> None:
-        """Opens a TCP connection to the host and port."""
-        ...
-    def Disconnect(self) -> None:
-        """Disconnects an active TCP connection."""
-        ...
-    def Write(self, data: str | bytes) -> None:
-        """Transmits raw data across the TCP socket."""
-        ...
-    def Read(self, length: int = ...) -> str:
-        """Reads a specified number of bytes from the buffer."""
-        ...
-    def ReadLine(self, eol: str = ...) -> str:
-        """Reads from the buffer until the EOL delimiter."""
-        ...
-
-class TcpSocket:
-    """Factory for Q-SYS TCP sockets."""
-    @staticmethod
-    def New() -> TcpSocketHandle:
-        """Creates a new TCP socket."""
-        ...
-
-class TimerHandle:
-    """Active Q-SYS event timer."""
-    EventHandler: Callable[[TimerHandle], None]
-
-    def Start(self, seconds: float) -> None:
-        """Starts or restarts the timer with the specified interval in seconds."""
-        ...
-    def Stop(self) -> None:
-        """Stops the timer."""
-        ...
-    def Reset(self) -> None:
-        """Resets the timer counter."""
-        ...
-
-class Timer:
-    """Factory for Q-SYS Timers."""
-    @staticmethod
-    def New() -> TimerHandle:
-        """Creates a new timer instance."""
-        ...
-
-class _QSysNamespace:
-    """Built-in compiler escape hatches and runtime utilities."""
-
-    @staticmethod
-    def lua(code: str) -> None:
-        """
-        Escape hatch: Injects raw, uncompiled Lua 5.3 code directly into the compiled output.
-
-        Example:
-            qsys.lua("UdpSocket.New():Send('255.255.255.255', 9, packet)")
-        """
-        ...
-
-qsys: _QSysNamespace
-Controls: dict[str, ControlHandle]
-Properties: dict[str, PropertyHandle]
 "#;
+
+/// Builds the complete `qsys.pyi` source: the DSL stubs followed by every type and global
+/// registered by the [`QSysRuntime`] plugin in `env`.
+pub fn generate_pyi(env: &RuntimeEnv) -> String {
+    let runtime = pyi::render_pyi(env, |origin| origin == QSysRuntime::NAME);
+    format!(
+        "{DSL_PYI}# --- Q-SYS runtime (generated from the `{}` runtime plugin) ---\n\n{runtime}",
+        QSysRuntime::NAME
+    )
+}
 
 /// Generates standard PEP 561 stub files (`qsys/__init__.pyi`, `qsys/py.typed`, `qsys.pyi`).
 pub fn write_stubs_to_dir(out_dir: &Path) -> std::io::Result<()> {
+    let pyi_source = generate_pyi(&RuntimeEnv::qsys());
+
     // 1. Write standalone qsys.pyi (for single-file imports)
     fs::create_dir_all(out_dir)?;
     let single_pyi = out_dir.join("qsys.pyi");
-    fs::write(single_pyi, QSYS_PYI)?;
+    fs::write(single_pyi, &pyi_source)?;
 
     // 2. Write package layout: qsys/__init__.pyi and qsys/py.typed (PEP 561)
     let pkg_dir = out_dir.join("qsys");
     fs::create_dir_all(&pkg_dir)?;
-    fs::write(pkg_dir.join("__init__.pyi"), QSYS_PYI)?;
+    fs::write(pkg_dir.join("__init__.pyi"), &pyi_source)?;
     fs::write(pkg_dir.join("py.typed"), "")?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generated_stubs_cover_dsl_and_runtime() {
+        let pyi = generate_pyi(&RuntimeEnv::qsys());
+        assert!(pyi.starts_with("# Python type stubs for QSysPy"));
+        assert!(pyi.contains("class QSysPlugin:"));
+        assert!(pyi.contains("class UdpSocketHandle:"));
+        assert!(pyi.contains("    def Send(self, ip: str, port: int, data: str) -> None:"));
+        assert!(pyi.contains("class UdpSocket:\n"));
+        assert!(pyi.contains("Properties: dict[str, PropertyHandle]"));
+    }
 }

@@ -3,60 +3,15 @@ use strsim::levenshtein;
 use qsys_diagnostics::{DiagnosticKind, Diagnostics};
 use qsys_model::{ControlMember, PropertyKind};
 use qsys_parser::ast;
+use qsys_runtime::{ExecutionContext, GlobalKind, Member, Returns, RuntimeEnv};
 
 use crate::binding::find_closest_member;
 use crate::symbols::{ScopeKind, ScopeStack, Symbol, SymbolKind};
 use crate::types::{ResolvedTarget, Type, TypeMap};
 
-const KNOWN_GLOBALS: &[&str] = &[
-    "print",
-    "qsys",
-    "Controls",
-    "Properties",
-    "Timer",
-    "TcpSocket",
-    "UdpSocket",
-    "SerialPort",
-    "HttpClient",
-    "NamedControl",
-    "Notifications",
-    "Component",
-    "Log",
-    "System",
-    "Crypto",
-    "rapidjson",
-    "json",
-    "math",
-    "string",
-    "table",
-    "bit32",
-    "tonumber",
-    "tostring",
-    "type",
-    "ipairs",
-    "pairs",
-    "next",
-    "unpack",
-    "pcall",
-    "error",
-    "assert",
-    "range",
-    "len",
-    "str",
-    "int",
-    "float",
-    "bool",
-    "abs",
-    "min",
-    "max",
-    "chr",
-    "ord",
-    "Control",
-    "Property",
-    "QSysPlugin",
-    "TextController",
-    "super",
-];
+/// Names owned by the QSysPy declaration DSL (`class X(QSysPlugin)`, `Control.Float(...)`).
+/// Everything else in the global scope comes from the `RuntimeEnv`.
+const DSL_GLOBALS: &[&str] = &["Control", "Property", "QSysPlugin", "TextController"];
 
 fn find_closest_match(target: &str, candidates: &[String]) -> Option<String> {
     let mut best_match = None;
@@ -85,6 +40,9 @@ pub struct ExprAnalyzer<'a> {
     pub scope_stack: &'a mut ScopeStack,
     pub type_map: &'a mut TypeMap,
     pub diagnostics: &'a mut Diagnostics,
+    pub env: &'a RuntimeEnv,
+    /// Execution phase of the code being analyzed, used to enforce global availability.
+    pub context: ExecutionContext,
 }
 
 impl<'a> ExprAnalyzer<'a> {
@@ -92,12 +50,20 @@ impl<'a> ExprAnalyzer<'a> {
         scope_stack: &'a mut ScopeStack,
         type_map: &'a mut TypeMap,
         diagnostics: &'a mut Diagnostics,
+        env: &'a RuntimeEnv,
     ) -> Self {
         Self {
             scope_stack,
             type_map,
             diagnostics,
+            env,
+            context: ExecutionContext::Unknown,
         }
+    }
+
+    pub fn with_context(mut self, context: ExecutionContext) -> Self {
+        self.context = context;
+        self
     }
 
     pub fn analyze_statements(&mut self, stmts: &[ast::Stmt]) {
@@ -280,7 +246,7 @@ impl<'a> ExprAnalyzer<'a> {
                             Type::Any
                         }
                     } else {
-                        crate::type_from_annotation(param.type_annotation.as_deref())
+                        crate::type_from_annotation(param.type_annotation.as_deref(), self.env)
                     };
                     self.type_map
                         .insert_symbol_name(param_sym_id, param.name.clone());
@@ -299,10 +265,13 @@ impl<'a> ExprAnalyzer<'a> {
                     ));
                 }
 
+                // A nested function body only runs when called, so its execution phase is unknown.
+                let outer_context = std::mem::replace(&mut self.context, ExecutionContext::Unknown);
                 self.analyze_statements(&f.body);
+                self.context = outer_context;
                 self.scope_stack.pop_scope();
 
-                let mut ret_ty = crate::type_from_annotation(f.return_type.as_deref());
+                let mut ret_ty = crate::type_from_annotation(f.return_type.as_deref(), self.env);
                 if ret_ty == Type::Any {
                     for body_stmt in &f.body {
                         if let ast::StmtKind::Return(Some(ret_expr)) = &body_stmt.kind
@@ -350,7 +319,8 @@ impl<'a> ExprAnalyzer<'a> {
                 // Pre-register methods on the class so intra-class `self.method()` calls resolve cleanly
                 for body_stmt in &c.body {
                     if let ast::StmtKind::FunctionDef(f) = &body_stmt.kind {
-                        let annotated_ret = crate::type_from_annotation(f.return_type.as_deref());
+                        let annotated_ret =
+                            crate::type_from_annotation(f.return_type.as_deref(), self.env);
                         self.type_map.insert_class_member_type(
                             c.name.clone(),
                             f.name.clone(),
@@ -405,27 +375,40 @@ impl<'a> ExprAnalyzer<'a> {
                             Type::UserClass { name: name.clone() }
                         }
                     }
-                } else if name == "UdpSocket" {
+                } else if let Some(global) = self.env.global(name) {
+                    if !global.availability.permits(self.context) {
+                        self.diagnostics.report(
+                            DiagnosticKind::UnavailableInContext {
+                                name: name.clone(),
+                                available: global.availability.describe().to_string(),
+                                context: self.context.describe().to_string(),
+                            },
+                            expr.span,
+                        );
+                    }
                     self.type_map
                         .insert_resolution(expr.span, ResolvedTarget::Global(name.clone()));
-                    Type::UdpSocketClass
-                } else if name == "TcpSocket" {
-                    self.type_map
-                        .insert_resolution(expr.span, ResolvedTarget::Global(name.clone()));
-                    Type::TcpSocketClass
-                } else if name == "Timer" {
-                    self.type_map
-                        .insert_resolution(expr.span, ResolvedTarget::Global(name.clone()));
-                    Type::TimerClass
-                } else if KNOWN_GLOBALS.contains(&name.as_str()) {
+                    match &global.kind {
+                        GlobalKind::Value(ty) => Type::from_ref(ty),
+                        GlobalKind::Function(_) => Type::Any,
+                    }
+                } else if DSL_GLOBALS.contains(&name.as_str()) {
                     self.type_map
                         .insert_resolution(expr.span, ResolvedTarget::Global(name.clone()));
                     Type::Any
+                } else if let Some(reason) = self.env.removed_reason(name) {
+                    self.diagnostics.report(
+                        DiagnosticKind::RemovedBuiltin {
+                            name: name.clone(),
+                            reason: reason.to_string(),
+                        },
+                        expr.span,
+                    );
+                    Type::Any
                 } else {
                     let mut visible = self.scope_stack.all_visible_names();
-                    for g in KNOWN_GLOBALS {
-                        visible.push((*g).to_string());
-                    }
+                    visible.extend(self.env.global_names().map(str::to_string));
+                    visible.extend(DSL_GLOBALS.iter().map(|g| (*g).to_string()));
                     let candidates = find_closest_match(name, &visible)
                         .map(|c| vec![c])
                         .unwrap_or_default();
@@ -600,6 +583,10 @@ impl<'a> ExprAnalyzer<'a> {
                             Type::Any
                         }
                     }
+                    Type::Native { ref name } => match self.env.member(name, attr) {
+                        Some(Member::Field(field)) => Type::from_ref(&field.ty),
+                        Some(Member::Method(_)) | None => Type::Any,
+                    },
                     _ => Type::Any,
                 }
             }
@@ -607,26 +594,11 @@ impl<'a> ExprAnalyzer<'a> {
             ast::ExprKind::Subscript { value, index } => {
                 let val_ty = self.infer_expr(value);
                 let _ = self.infer_expr(index);
-                if let ast::ExprKind::Ident(ref name) = value.kind {
-                    if name == "Controls" {
-                        Type::ControlHandle
-                    } else if name == "Properties" {
-                        Type::PropertyHandle
-                    } else {
-                        match val_ty {
-                            Type::List(elem) => *elem,
-                            Type::Dict(_, val) => *val,
-                            Type::String => Type::String,
-                            _ => Type::Any,
-                        }
-                    }
-                } else {
-                    match val_ty {
-                        Type::List(elem) => *elem,
-                        Type::Dict(_, val) => *val,
-                        Type::String => Type::String,
-                        _ => Type::Any,
-                    }
+                match val_ty {
+                    Type::List(elem) => *elem,
+                    Type::Dict(_, val) => *val,
+                    Type::String => Type::String,
+                    _ => Type::Any,
                 }
             }
 
@@ -759,12 +731,12 @@ impl<'a> ExprAnalyzer<'a> {
                     Type::UserInstance { name }
                 } else if let ast::ExprKind::Attribute { value, attr } = &callee.kind {
                     let receiver_ty = self.type_map.get_type(value.span).cloned();
-                    if attr == "New" {
-                        match receiver_ty {
-                            Some(Type::UdpSocketClass) => Type::UdpSocketHandle,
-                            Some(Type::TcpSocketClass) => Type::TcpSocketHandle,
-                            Some(Type::TimerClass) => Type::TimerHandle,
-                            _ => Type::Any,
+                    if let Some(Type::Native { ref name }) = receiver_ty {
+                        match self.env.member(name, attr) {
+                            Some(Member::Method(method)) => {
+                                self.return_type_of(&method.returns, &arg_types)
+                            }
+                            Some(Member::Field(_)) | None => Type::Any,
                         }
                     } else if let Some(
                         Type::UserInstance { ref name } | Type::ClassInstance { ref name },
@@ -781,51 +753,42 @@ impl<'a> ExprAnalyzer<'a> {
                             "find" | "byte" => Type::Int,
                             _ => Type::Any,
                         }
-                    } else if attr == "char" || attr == "rep" || attr == "format" || attr == "sub" {
-                        Type::String
-                    } else if attr == "byte" || attr == "len" {
-                        Type::Int
                     } else {
                         Type::Any
                     }
                 } else if let ast::ExprKind::Ident(fn_name) = &callee.kind {
-                    match fn_name.as_str() {
-                        "str" | "tostring" | "chr" => Type::String,
-                        "int" | "len" | "ord" => Type::Int,
-                        "float" | "tonumber" => Type::Float,
-                        "bool" => Type::Bool,
-                        "range" => Type::List(Box::new(Type::Int)),
-                        "abs" | "min" | "max" => {
-                            if !arg_types.is_empty() && arg_types.iter().all(|t| *t == Type::Int) {
-                                Type::Int
-                            } else {
-                                Type::Float
+                    let is_runtime_global = matches!(
+                        self.type_map.get_resolution(callee.span),
+                        Some(ResolvedTarget::Global(_))
+                    );
+                    if is_runtime_global && fn_name == "super" {
+                        if let Some(sym) = self.scope_stack.lookup("self")
+                            && let SymbolKind::Variable {
+                                ty: Type::UserInstance { ref name },
+                                ..
                             }
-                        }
-                        "super" => {
-                            if let Some(sym) = self.scope_stack.lookup("self")
-                                && let SymbolKind::Variable {
-                                    ty: Type::UserInstance { ref name },
-                                    ..
-                                }
-                                | SymbolKind::Parameter {
-                                    ty: Type::UserInstance { ref name },
-                                    ..
-                                } = sym.kind
-                                && let Some(base_name) = self.type_map.get_class_base(name)
-                            {
-                                Type::UserInstance {
-                                    name: base_name.to_string(),
-                                }
-                            } else {
-                                Type::Any
+                            | SymbolKind::Parameter {
+                                ty: Type::UserInstance { ref name },
+                                ..
+                            } = sym.kind
+                            && let Some(base_name) = self.type_map.get_class_base(name)
+                        {
+                            Type::UserInstance {
+                                name: base_name.to_string(),
                             }
+                        } else {
+                            Type::Any
                         }
-                        _ => self
-                            .type_map
+                    } else if is_runtime_global
+                        && let Some(function) =
+                            self.env.global(fn_name).and_then(|g| g.as_function())
+                    {
+                        self.return_type_of(&function.returns, &arg_types)
+                    } else {
+                        self.type_map
                             .get_function_return_type(fn_name)
                             .cloned()
-                            .unwrap_or(Type::Any),
+                            .unwrap_or(Type::Any)
                     }
                 } else {
                     Type::Any
@@ -837,6 +800,19 @@ impl<'a> ExprAnalyzer<'a> {
 
         self.type_map.insert_type(expr.span, ty.clone());
         ty
+    }
+
+    fn return_type_of(&self, returns: &Returns, arg_types: &[Type]) -> Type {
+        match returns {
+            Returns::Type(ty) => Type::from_ref(ty),
+            Returns::NumericPromotion => {
+                if !arg_types.is_empty() && arg_types.iter().all(|t| *t == Type::Int) {
+                    Type::Int
+                } else {
+                    Type::Float
+                }
+            }
+        }
     }
 }
 
