@@ -12,8 +12,9 @@ use rustc_hash::FxHashMap;
 
 use qsys_diagnostics::{Diagnostics, SourceFile, Span};
 use qsys_ir::{FunctionId, SymbolId};
-use qsys_model::PluginInfo;
+use qsys_model::{PluginInfo, is_design_time_method};
 use qsys_parser::{ParsedModule, ast};
+use qsys_runtime::{ExecutionContext, RuntimeEnv};
 
 use crate::analyzer::ExprAnalyzer;
 pub use crate::binding::{ResolvedBinding, resolve_event_decorator};
@@ -44,6 +45,8 @@ pub struct SemanticModel {
     pub file: Arc<SourceFile>,
     pub target: TargetKind,
     pub type_map: TypeMap,
+    /// The runtime environment the program was analyzed against.
+    pub env: Arc<RuntimeEnv>,
 }
 
 #[derive(Debug, Clone)]
@@ -90,7 +93,7 @@ pub struct ResolvedMethod {
     pub span: Span,
 }
 
-pub(crate) fn type_from_annotation(ann: Option<&str>) -> Type {
+pub(crate) fn type_from_annotation(ann: Option<&str>, env: &RuntimeEnv) -> Type {
     match ann {
         Some("str") | Some("String") => Type::String,
         Some("int") | Some("Integer") => Type::Int,
@@ -99,6 +102,9 @@ pub(crate) fn type_from_annotation(ann: Option<&str>) -> Type {
         Some("None") => Type::None,
         Some("ControlHandle") => Type::ControlHandle,
         Some("PropertyHandle") => Type::PropertyHandle,
+        Some(name) if env.object_type(name).is_some() => Type::Native {
+            name: name.to_string(),
+        },
         _ => Type::Any,
     }
 }
@@ -106,7 +112,17 @@ pub(crate) fn type_from_annotation(ann: Option<&str>) -> Type {
 /// Fault-tolerant semantic analysis that always returns a `SemanticModel` alongside any diagnostics.
 /// Used by IDE / LSP features (`Analyzer`) so completions, hover, and inlay hints continue to work
 /// even when the user is mid-edit and diagnostics are present.
+///
+/// Analyzes against the default Q-SYS runtime environment ([`RuntimeEnv::qsys`]).
 pub fn analyze_lossy(parsed: &ParsedModule) -> (SemanticModel, Diagnostics) {
+    analyze_lossy_with_env(parsed, RuntimeEnv::qsys())
+}
+
+/// Fault-tolerant semantic analysis against a custom runtime environment.
+pub fn analyze_lossy_with_env(
+    parsed: &ParsedModule,
+    env: Arc<RuntimeEnv>,
+) -> (SemanticModel, Diagnostics) {
     let mut diagnostics = Diagnostics::new();
 
     // 1. Collect helper classes
@@ -144,6 +160,7 @@ pub fn analyze_lossy(parsed: &ParsedModule) -> (SemanticModel, Diagnostics) {
                     file: parsed.file.clone(),
                     target: TargetKind::ProceduralScript(ScriptSemantic::default()),
                     type_map,
+                    env,
                 },
                 diagnostics,
             );
@@ -155,8 +172,16 @@ pub fn analyze_lossy(parsed: &ParsedModule) -> (SemanticModel, Diagnostics) {
         classification,
         TargetClassification::Plugin { .. } | TargetClassification::TextController { .. }
     ) {
+        // A plugin's module-level statements are emitted before `PluginInfo`, so they execute
+        // in both the design-time and runtime phases. Text controllers only run at runtime.
+        let module_context = if matches!(classification, TargetClassification::Plugin { .. }) {
+            ExecutionContext::Both
+        } else {
+            ExecutionContext::Runtime
+        };
         let mut module_analyzer =
-            ExprAnalyzer::new(&mut scope_stack, &mut type_map, &mut diagnostics);
+            ExprAnalyzer::new(&mut scope_stack, &mut type_map, &mut diagnostics, &env)
+                .with_context(module_context);
         for stmt in &parsed.module.statements {
             if let ast::StmtKind::ClassDef(cls) = &stmt.kind
                 && cls
@@ -276,7 +301,7 @@ pub fn analyze_lossy(parsed: &ParsedModule) -> (SemanticModel, Diagnostics) {
                             let param_ty = if is_event_handler && idx == 1 {
                                 Type::ControlHandle
                             } else {
-                                type_from_annotation(param.type_annotation.as_deref())
+                                type_from_annotation(param.type_annotation.as_deref(), &env)
                             };
 
                             let param_sym = scope_stack.alloc_symbol_id();
@@ -297,8 +322,18 @@ pub fn analyze_lossy(parsed: &ParsedModule) -> (SemanticModel, Diagnostics) {
                             resolved_params.push((param_sym, param.name.clone()));
                         }
 
-                        let mut analyzer =
-                            ExprAnalyzer::new(&mut scope_stack, &mut type_map, &mut diagnostics);
+                        let method_context = if is_design_time_method(&f.name) {
+                            ExecutionContext::DesignTime
+                        } else {
+                            ExecutionContext::Runtime
+                        };
+                        let mut analyzer = ExprAnalyzer::new(
+                            &mut scope_stack,
+                            &mut type_map,
+                            &mut diagnostics,
+                            &env,
+                        )
+                        .with_context(method_context);
                         analyzer.analyze_statements(&f.body);
 
                         scope_stack.pop_scope();
@@ -334,7 +369,8 @@ pub fn analyze_lossy(parsed: &ParsedModule) -> (SemanticModel, Diagnostics) {
                     class.span,
                 ));
                 let mut analyzer =
-                    ExprAnalyzer::new(&mut scope_stack, &mut type_map, &mut diagnostics);
+                    ExprAnalyzer::new(&mut scope_stack, &mut type_map, &mut diagnostics, &env)
+                        .with_context(ExecutionContext::Runtime);
                 analyzer.analyze_statements(&init_statements);
             }
 
@@ -442,7 +478,7 @@ pub fn analyze_lossy(parsed: &ParsedModule) -> (SemanticModel, Diagnostics) {
                             let param_ty = if is_event_handler && idx == 1 {
                                 Type::ControlHandle
                             } else {
-                                type_from_annotation(param.type_annotation.as_deref())
+                                type_from_annotation(param.type_annotation.as_deref(), &env)
                             };
 
                             let param_sym = scope_stack.alloc_symbol_id();
@@ -463,8 +499,13 @@ pub fn analyze_lossy(parsed: &ParsedModule) -> (SemanticModel, Diagnostics) {
                             resolved_params.push((param_sym, param.name.clone()));
                         }
 
-                        let mut analyzer =
-                            ExprAnalyzer::new(&mut scope_stack, &mut type_map, &mut diagnostics);
+                        let mut analyzer = ExprAnalyzer::new(
+                            &mut scope_stack,
+                            &mut type_map,
+                            &mut diagnostics,
+                            &env,
+                        )
+                        .with_context(ExecutionContext::Runtime);
                         analyzer.analyze_statements(&f.body);
 
                         scope_stack.pop_scope();
@@ -500,7 +541,8 @@ pub fn analyze_lossy(parsed: &ParsedModule) -> (SemanticModel, Diagnostics) {
                     class.span,
                 ));
                 let mut analyzer =
-                    ExprAnalyzer::new(&mut scope_stack, &mut type_map, &mut diagnostics);
+                    ExprAnalyzer::new(&mut scope_stack, &mut type_map, &mut diagnostics, &env)
+                        .with_context(ExecutionContext::Runtime);
                 analyzer.analyze_statements(&init_statements);
             }
 
@@ -554,7 +596,8 @@ pub fn analyze_lossy(parsed: &ParsedModule) -> (SemanticModel, Diagnostics) {
 
                         let mut resolved_params = Vec::new();
                         for (idx, param) in f.params.iter().enumerate() {
-                            let param_ty = type_from_annotation(param.type_annotation.as_deref());
+                            let param_ty =
+                                type_from_annotation(param.type_annotation.as_deref(), &env);
                             let param_sym = scope_stack.alloc_symbol_id();
                             type_map.insert_symbol_name(param_sym, param.name.clone());
                             scope_stack.define(Symbol::new(
@@ -573,13 +616,18 @@ pub fn analyze_lossy(parsed: &ParsedModule) -> (SemanticModel, Diagnostics) {
                             resolved_params.push((param_sym, param.name.clone()));
                         }
 
-                        let mut analyzer =
-                            ExprAnalyzer::new(&mut scope_stack, &mut type_map, &mut diagnostics);
+                        let mut analyzer = ExprAnalyzer::new(
+                            &mut scope_stack,
+                            &mut type_map,
+                            &mut diagnostics,
+                            &env,
+                        )
+                        .with_context(ExecutionContext::Runtime);
                         analyzer.analyze_statements(&f.body);
 
                         scope_stack.pop_scope();
 
-                        let mut ret_ty = type_from_annotation(f.return_type.as_deref());
+                        let mut ret_ty = type_from_annotation(f.return_type.as_deref(), &env);
                         if ret_ty == Type::Any {
                             for body_stmt in &f.body {
                                 if let ast::StmtKind::Return(Some(ret_expr)) = &body_stmt.kind
@@ -602,15 +650,25 @@ pub fn analyze_lossy(parsed: &ParsedModule) -> (SemanticModel, Diagnostics) {
                         });
                     }
                     ast::StmtKind::ClassDef(_) => {
-                        let mut analyzer =
-                            ExprAnalyzer::new(&mut scope_stack, &mut type_map, &mut diagnostics);
+                        let mut analyzer = ExprAnalyzer::new(
+                            &mut scope_stack,
+                            &mut type_map,
+                            &mut diagnostics,
+                            &env,
+                        )
+                        .with_context(ExecutionContext::Runtime);
                         analyzer.analyze_stmt(stmt);
                         top_level_statements.push(stmt.clone());
                     }
                     ast::StmtKind::Import { .. } | ast::StmtKind::ImportFrom { .. } => {}
                     _ => {
-                        let mut analyzer =
-                            ExprAnalyzer::new(&mut scope_stack, &mut type_map, &mut diagnostics);
+                        let mut analyzer = ExprAnalyzer::new(
+                            &mut scope_stack,
+                            &mut type_map,
+                            &mut diagnostics,
+                            &env,
+                        )
+                        .with_context(ExecutionContext::Runtime);
                         analyzer.analyze_stmt(stmt);
                         top_level_statements.push(stmt.clone());
                     }
@@ -632,13 +690,23 @@ pub fn analyze_lossy(parsed: &ParsedModule) -> (SemanticModel, Diagnostics) {
             file: parsed.file.clone(),
             target,
             type_map,
+            env,
         },
         diagnostics,
     )
 }
 
+/// Strict semantic analysis against the default Q-SYS runtime environment.
 pub fn analyze(parsed: &ParsedModule) -> Result<SemanticModel, Diagnostics> {
-    let (model, diagnostics) = analyze_lossy(parsed);
+    analyze_with_env(parsed, RuntimeEnv::qsys())
+}
+
+/// Strict semantic analysis against a custom runtime environment.
+pub fn analyze_with_env(
+    parsed: &ParsedModule,
+    env: Arc<RuntimeEnv>,
+) -> Result<SemanticModel, Diagnostics> {
+    let (model, diagnostics) = analyze_lossy_with_env(parsed, env);
     if diagnostics.has_errors() {
         Err(diagnostics)
     } else {

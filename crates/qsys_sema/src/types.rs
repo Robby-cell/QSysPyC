@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 
 use qsys_diagnostics::Span;
 use qsys_ir::{ControlId, FunctionId, PropertyId, SymbolId};
+use qsys_runtime::TypeRef;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ResolvedTarget {
@@ -27,17 +28,20 @@ pub enum Type {
     ControlHandle,
     PropertyHandle,
 
-    // Q-SYS Native Runtime Objects
-    UdpSocketClass,
-    UdpSocketHandle,
-    TcpSocketClass,
-    TcpSocketHandle,
-    TimerClass,
-    TimerHandle,
+    /// A native runtime object described by the `RuntimeEnv` (e.g. `Timer`, `TimerHandle`, `math`).
+    Native {
+        name: String,
+    },
 
-    ClassInstance { name: String }, // QSysPlugin instance (`self`)
-    UserClass { name: String },     // Custom class constructor (e.g. `Device`)
-    UserInstance { name: String },  // Custom class instance object (e.g. `dev = Device(...)`)
+    ClassInstance {
+        name: String,
+    }, // QSysPlugin instance (`self`)
+    UserClass {
+        name: String,
+    }, // Custom class constructor (e.g. `Device`)
+    UserInstance {
+        name: String,
+    }, // Custom class instance object (e.g. `dev = Device(...)`)
 
     Any,
 }
@@ -47,13 +51,32 @@ impl Type {
         matches!(self, Self::Int | Self::Float)
     }
 
+    /// Converts a runtime plugin type reference into a semantic type.
+    pub fn from_ref(ty: &TypeRef) -> Self {
+        match ty {
+            TypeRef::Any | TypeRef::Callable(_) => Self::Any,
+            TypeRef::None => Self::None,
+            TypeRef::Bool => Self::Bool,
+            TypeRef::Int => Self::Int,
+            TypeRef::Float => Self::Float,
+            TypeRef::Str => Self::String,
+            TypeRef::List(elem) => Self::List(Box::new(Self::from_ref(elem))),
+            TypeRef::Dict(k, v) => {
+                Self::Dict(Box::new(Self::from_ref(k)), Box::new(Self::from_ref(v)))
+            }
+            TypeRef::Object(name) => match name.as_str() {
+                "ControlHandle" => Self::ControlHandle,
+                "PropertyHandle" => Self::PropertyHandle,
+                _ => Self::Native { name: name.clone() },
+            },
+        }
+    }
+
     pub fn truthiness_strategy(&self) -> TruthinessStrategy {
         match self {
             Self::Bool
             | Self::ControlHandle
-            | Self::UdpSocketHandle
-            | Self::TcpSocketHandle
-            | Self::TimerHandle
+            | Self::Native { .. }
             | Self::ClassInstance { .. }
             | Self::UserInstance { .. } => TruthinessStrategy::Direct,
 
@@ -61,12 +84,9 @@ impl Type {
             Self::String => TruthinessStrategy::StringNonEmpty,
             Self::List(_) | Self::Dict(_, _) => TruthinessStrategy::CollectionNonEmpty,
             Self::None => TruthinessStrategy::AlwaysFalse,
-            Self::Any
-            | Self::PropertyHandle
-            | Self::UdpSocketClass
-            | Self::TcpSocketClass
-            | Self::TimerClass
-            | Self::UserClass { .. } => TruthinessStrategy::Dynamic,
+            Self::Any | Self::PropertyHandle | Self::UserClass { .. } => {
+                TruthinessStrategy::Dynamic
+            }
         }
     }
 }

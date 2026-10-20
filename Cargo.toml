@@ -7,6 +7,7 @@ members = [
     "crates/qsys_ir",
     "crates/qsys_model",
     "crates/qsys_parser",
+    "crates/qsys_runtime",
     "crates/qsys_sema",
     "crates/qsys_wasm",
     "crates/qsyspyc",
@@ -24,4 +25,5 @@ qsys_diagnostics = { path = "crates/qsys_diagnostics" }
 qsys_ir = { path = "crates/qsys_ir" }
 qsys_model = { path = "crates/qsys_model" }
 qsys_parser = { path = "crates/qsys_parser" }
+qsys_runtime = { path = "crates/qsys_runtime" }
 qsys_sema = { path = "crates/qsys_sema" }

@@ -1,25 +1,8 @@
 use qsys_ir::*;
-use qsys_model::{ControlKind, PropertyKind};
+use qsys_model::{ControlKind, PropertyKind, is_design_time_method};
 
 use crate::context::CodegenContext;
 use crate::emitter::{LuaEmitter, escape_lua_string, format_lua_float};
-
-// Helper to identify lifecycle methods
-fn is_lifecycle_method(name: &str) -> bool {
-    matches!(
-        name,
-        "get_properties"
-            | "get_controls"
-            | "get_control_layout"
-            | "get_pages"
-            | "get_color"
-            | "get_pretty_name"
-            | "rectify_properties"
-            | "get_components"
-            | "get_pins"
-            | "get_wiring"
-    )
-}
 
 pub fn emit_plugin(plugin: &IRPlugin, ctx: &mut CodegenContext) -> String {
     // Register controls and properties
@@ -114,7 +97,7 @@ pub fn emit_plugin(plugin: &IRPlugin, ctx: &mut CodegenContext) -> String {
 
     // Emit runtime methods (excluding design-time lifecycle methods)
     for method in &plugin.methods {
-        if is_lifecycle_method(&method.name) {
+        if is_design_time_method(&method.name) {
             continue;
         }
         emit_method(&mut emitter, &plugin.class_name, method);

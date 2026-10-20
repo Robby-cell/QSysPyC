@@ -9,6 +9,7 @@ qsys_model.workspace = true
 qsys_diagnostics.workspace = true
 qsys_parser.workspace = true
 qsys_ir.workspace = true
+qsys_runtime.workspace = true
 
 strsim = { version = "0.11.1" }
 

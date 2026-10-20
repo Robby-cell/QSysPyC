@@ -4,7 +4,8 @@ use qsys_codegen_lua::LuaBackend;
 use qsys_diagnostics::{DiagnosticKind, Diagnostics, FileId, SourceFile, Span};
 use qsys_ir::{Backend, CodegenConfig};
 use qsys_parser::parse_module;
-use qsys_sema::{TargetKind, analyze};
+use qsys_runtime::RuntimeEnv;
+use qsys_sema::{TargetKind, analyze_with_env};
 
 use crate::options::{CheckResult, CompiledArtifact, CompilerOptions, ProgramKind};
 
@@ -31,7 +32,7 @@ impl Compiler {
         let parsed = parse_module(file.clone())?;
 
         // Semantic Analysis (AST -> Semantic Model with stable IDs)
-        let model = analyze(&parsed)?;
+        let model = analyze_with_env(&parsed, options.env.clone())?;
 
         // Extract metadata for reports & CLI summaries
         let (program_kind, plugin_info, control_count, property_count) = match &model.target {
@@ -93,10 +94,18 @@ impl Compiler {
         Self::check_file(file)
     }
 
-    /// Checks an in-memory `SourceFile` without performing code generation.
+    /// Checks an in-memory `SourceFile` against the default Q-SYS runtime environment.
     pub fn check_file(file: Arc<SourceFile>) -> Result<CheckResult, Diagnostics> {
+        Self::check_file_with_env(file, RuntimeEnv::qsys())
+    }
+
+    /// Checks an in-memory `SourceFile` against a custom runtime environment.
+    pub fn check_file_with_env(
+        file: Arc<SourceFile>,
+        env: Arc<RuntimeEnv>,
+    ) -> Result<CheckResult, Diagnostics> {
         let parsed = parse_module(file.clone())?;
-        let model = analyze(&parsed)?;
+        let model = analyze_with_env(&parsed, env)?;
 
         let (program_kind, plugin_info, control_count, property_count) = match &model.target {
             TargetKind::Plugin(p) => (

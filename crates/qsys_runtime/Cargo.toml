@@ -1,0 +1,9 @@
+[package]
+name = "qsys_runtime"
+version = "0.1.0"
+edition = "2024"
+description = "Declarative runtime environment (globals, native object types, removed builtins) and the plugins that build it for QSysPy"
+
+[dependencies]
+rustc-hash = { workspace = true }
+serde = { workspace = true, features = ["derive"] }

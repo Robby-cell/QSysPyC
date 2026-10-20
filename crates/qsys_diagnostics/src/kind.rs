@@ -67,6 +67,15 @@ pub enum DiagnosticKind {
         member: String,
         candidates: Vec<String>,
     },
+    UnavailableInContext {
+        name: String,
+        available: String,
+        context: String,
+    },
+    RemovedBuiltin {
+        name: String,
+        reason: String,
+    },
 }
 
 impl DiagnosticKind {
@@ -112,6 +121,8 @@ impl DiagnosticKind {
             Self::InvalidEscapeHatchCall { .. } => "E0205",
             Self::UndefinedVariable { .. } => "E0206",
             Self::UnknownClassMember { .. } => "E0207",
+            Self::UnavailableInContext { .. } => "E0208",
+            Self::RemovedBuiltin { .. } => "E0209",
         }
     }
 
@@ -194,6 +205,16 @@ impl DiagnosticKind {
                 };
                 format!("Class '{class_name}' has no control or property '{member}'{hint}")
             }
+            Self::UnavailableInContext {
+                name,
+                available,
+                context,
+            } => {
+                format!("'{name}' is only available {available}, but is used {context}")
+            }
+            Self::RemovedBuiltin { name, reason } => {
+                format!("'{name}' is not available on this target: {reason}")
+            }
         }
     }
 
@@ -225,6 +246,9 @@ impl DiagnosticKind {
             Self::UnknownClassMember { .. } => Some(
                 "Controls and properties must be declared at the class level: 'name = Control.<Type>()'.".to_string(),
             ),
+            Self::UnavailableInContext { available, .. } => Some(format!(
+                "Move this usage into code that runs {available}, such as a runtime method or event handler."
+            )),
             _ => None,
         }
     }

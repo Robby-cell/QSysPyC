@@ -1,5 +1,6 @@
 use qsys_ir::*;
 use qsys_parser::ast;
+use qsys_runtime::{CallStyle, Lowering, RuntimeEnv};
 
 use crate::types::{ResolvedTarget, Type};
 use crate::{SemanticModel, TargetKind, TruthinessStrategy, TypeMap};
@@ -7,7 +8,7 @@ use crate::{SemanticModel, TargetKind, TruthinessStrategy, TypeMap};
 pub fn lower_to_ir(model: &SemanticModel) -> IRProgram {
     match &model.target {
         TargetKind::Plugin(p) => {
-            let mut lowerer = StmtLowerer::new(&model.type_map, true, &p.helper_classes);
+            let mut lowerer = StmtLowerer::new(model, true, &p.helper_classes);
 
             let classes = p
                 .helper_classes
@@ -74,7 +75,7 @@ pub fn lower_to_ir(model: &SemanticModel) -> IRProgram {
         }
 
         TargetKind::TextController(c) => {
-            let mut lowerer = StmtLowerer::new(&model.type_map, false, &c.helper_classes);
+            let mut lowerer = StmtLowerer::new(model, false, &c.helper_classes);
 
             let classes = c
                 .helper_classes
@@ -130,7 +131,7 @@ pub fn lower_to_ir(model: &SemanticModel) -> IRProgram {
         }
 
         TargetKind::ProceduralScript(s) => {
-            let mut lowerer = StmtLowerer::new(&model.type_map, false, &s.classes);
+            let mut lowerer = StmtLowerer::new(model, false, &s.classes);
 
             let classes = s
                 .classes
@@ -163,15 +164,17 @@ pub fn lower_to_ir(model: &SemanticModel) -> IRProgram {
 
 struct StmtLowerer<'a> {
     type_map: &'a TypeMap,
+    env: &'a RuntimeEnv,
     is_plugin: bool,
     custom_classes: &'a [ast::ClassDef],
     current_class_base: Option<String>,
 }
 
 impl<'a> StmtLowerer<'a> {
-    fn new(type_map: &'a TypeMap, is_plugin: bool, custom_classes: &'a [ast::ClassDef]) -> Self {
+    fn new(model: &'a SemanticModel, is_plugin: bool, custom_classes: &'a [ast::ClassDef]) -> Self {
         Self {
-            type_map,
+            type_map: &model.type_map,
+            env: &model.env,
             is_plugin,
             custom_classes,
             current_class_base: None,
@@ -548,61 +551,45 @@ impl<'a> StmtLowerer<'a> {
                         };
                     }
 
-                    // Python built-in function lowering
-                    if let ast::ExprKind::Ident(fn_name) = &callee.kind {
-                        match fn_name.as_str() {
-                            "len" if args_ir.len() == 1 && kwargs_ir.is_empty() => {
+                    // Builtin lowering declared by the runtime env (e.g. `len(x)` -> `#x`).
+                    // Only applies when the name resolved to the runtime global, so user
+                    // definitions that shadow a builtin are called as written.
+                    if let ast::ExprKind::Ident(fn_name) = &callee.kind
+                        && matches!(
+                            self.type_map.get_resolution(callee.span),
+                            Some(ResolvedTarget::Global(_))
+                        )
+                        && let Some(function) =
+                            self.env.global(fn_name).and_then(|g| g.as_function())
+                    {
+                        match &function.lowering {
+                            Lowering::LengthOperator
+                                if args_ir.len() == 1 && kwargs_ir.is_empty() =>
+                            {
                                 return IRExpr::Unary {
                                     op: IRUnaryOp::Len,
                                     operand: Box::new(args_ir.remove(0)),
                                     truthiness: IRTruthiness::NumericNotZero,
                                 };
                             }
-                            "str" => {
+                            Lowering::Rename(target) => {
                                 return IRExpr::Call {
-                                    callee: Box::new(IRExpr::Global("tostring".to_string())),
+                                    callee: Box::new(IRExpr::Global(target.clone())),
                                     args: args_ir,
                                     kwargs: kwargs_ir,
                                 };
                             }
-                            "int" | "float" => {
-                                return IRExpr::Call {
-                                    callee: Box::new(IRExpr::Global("tonumber".to_string())),
-                                    args: args_ir,
-                                    kwargs: kwargs_ir,
-                                };
-                            }
-                            "abs" | "min" | "max" => {
+                            Lowering::Qualified { module, name } => {
                                 return IRExpr::Call {
                                     callee: Box::new(IRExpr::Attribute {
-                                        object: Box::new(IRExpr::Global("math".to_string())),
-                                        attr: fn_name.clone(),
+                                        object: Box::new(IRExpr::Global(module.clone())),
+                                        attr: name.clone(),
                                     }),
                                     args: args_ir,
                                     kwargs: kwargs_ir,
                                 };
                             }
-                            "chr" => {
-                                return IRExpr::Call {
-                                    callee: Box::new(IRExpr::Attribute {
-                                        object: Box::new(IRExpr::Global("string".to_string())),
-                                        attr: "char".to_string(),
-                                    }),
-                                    args: args_ir,
-                                    kwargs: kwargs_ir,
-                                };
-                            }
-                            "ord" => {
-                                return IRExpr::Call {
-                                    callee: Box::new(IRExpr::Attribute {
-                                        object: Box::new(IRExpr::Global("string".to_string())),
-                                        attr: "byte".to_string(),
-                                    }),
-                                    args: args_ir,
-                                    kwargs: kwargs_ir,
-                                };
-                            }
-                            _ => {}
+                            Lowering::LengthOperator | Lowering::Direct => {}
                         }
                     }
 
@@ -688,16 +675,17 @@ impl<'a> StmtLowerer<'a> {
 
                         let obj_ty = self.type_map.get_type(value.span);
 
-                        // Socket, Timer, or custom class instance method call -> `obj:method(...)`
-                        if matches!(
-                            obj_ty,
-                            Some(
-                                Type::UdpSocketHandle
-                                    | Type::TcpSocketHandle
-                                    | Type::TimerHandle
-                                    | Type::UserInstance { .. }
-                            )
-                        ) {
+                        // Native runtime objects use the call style declared by the runtime env
+                        // (`timer:Start(1)` for handles, `Timer.New()` for factories); custom class
+                        // instances always dispatch with `obj:method(...)`.
+                        let uses_colon = match obj_ty {
+                            Some(Type::Native { name }) => {
+                                self.env.call_style(name, attr) == CallStyle::Colon
+                            }
+                            Some(Type::UserInstance { .. }) => true,
+                            _ => false,
+                        };
+                        if uses_colon {
                             return IRExpr::MethodCall {
                                 object: Box::new(self.lower_expr(value)),
                                 method: attr.clone(),

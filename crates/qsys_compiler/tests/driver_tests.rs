@@ -191,3 +191,61 @@ class Wol(QSysPlugin):
             .any(|h| h.line == 7 && h.col == 13 && h.label == ": UdpSocketHandle")
     );
 }
+
+#[test]
+fn test_runtime_env_powers_ide_features() {
+    // Completions on a runtime global come from its object type in the RuntimeEnv
+    let timer_src = "t = Timer.\n";
+    let timer_items = Analyzer::completions(timer_src, 1, 11);
+    assert!(timer_items.iter().any(|c| c.label == "New"));
+    assert!(timer_items.iter().any(|c| c.label == "CallAfter"));
+
+    // Members of a handle returned by a factory method
+    let handle_src = "t = Timer.New()\nt.\n";
+    let handle_items = Analyzer::completions(handle_src, 2, 3);
+    assert!(
+        handle_items
+            .iter()
+            .any(|c| c.label == "Start" && c.kind == "Method")
+    );
+    assert!(
+        handle_items
+            .iter()
+            .any(|c| c.label == "EventHandler" && c.kind == "Event")
+    );
+
+    // Library tables registered by LuaStdlib
+    let math_items = Analyzer::completions("x = math.fl\n", 1, 12);
+    assert!(math_items.iter().any(|c| c.label == "floor"));
+    assert!(!math_items.iter().any(|c| c.label == "ceil"));
+
+    // Top-level completions include runtime globals
+    let top_items = Analyzer::completions("Tcp\n", 1, 4);
+    assert!(
+        top_items
+            .iter()
+            .any(|c| c.label == "TcpSocket" && c.kind == "Class")
+    );
+
+    // Hover on a runtime global and on a runtime-only global
+    let hover = Analyzer::hover("t = Timer.New()\n", 1, 6).expect("Hover for Timer");
+    assert_eq!(hover.contents[0], "*(class)* Timer");
+    let hover = Analyzer::hover(
+        "class P(QSysPlugin):\n    def runtime(self):\n        Controls[\"x\"].Value = 1\n",
+        3,
+        10,
+    )
+    .expect("Hover for Controls");
+    assert!(hover.contents[0].contains("Controls: dict[str, ControlHandle]"));
+    assert!(hover.contents[1].contains("Only available at runtime"));
+
+    // Hover on a native member resolves through the receiver type
+    let hover = Analyzer::hover("t = Timer.New()\nt.Start(1.0)\n", 2, 4).expect("Hover for Start");
+    assert!(hover.contents[0].contains("TimerHandle.Start(seconds: float) -> None"));
+
+    // Signature help for a library function and for a Python builtin
+    let sig = Analyzer::signature_help("x = math.floor(", 1, 16).expect("Signature for math.floor");
+    assert_eq!(sig.label, "math.floor(x: float)");
+    let sig = Analyzer::signature_help("x = len(", 1, 9).expect("Signature for len");
+    assert_eq!(sig.label, "len(obj: Any)");
+}
