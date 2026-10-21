@@ -8,4 +8,4 @@ pub use crate::analysis::{
 };
 pub use crate::driver::Compiler;
 pub use crate::options::{CheckResult, CompiledArtifact, CompilerOptions, ProgramKind};
-pub use crate::stubs::write_stubs_to_dir;
+pub use crate::stubs::{generate_default_pyi, write_stubs_to_dir};

@@ -1,6 +1,6 @@
 use wasm_bindgen::prelude::*;
 
-use qsys_compiler::{Analyzer, Compiler, CompilerOptions};
+use qsys_compiler::{Analyzer, Compiler, CompilerOptions, generate_default_pyi};
 
 #[wasm_bindgen]
 pub struct CompilationResult {
@@ -88,4 +88,10 @@ pub fn get_inlay_hints(source: &str) -> String {
 #[wasm_bindgen]
 pub fn get_signature_help(source: &str, line: usize, col: usize) -> Option<String> {
     Analyzer::signature_help(source, line, col).and_then(|s| serde_json::to_string(&s).ok())
+}
+
+/// Generate the PEP 561 `qsys.pyi` Python type stub file for IDE integration.
+#[wasm_bindgen]
+pub fn get_qsys_stubs() -> String {
+    generate_default_pyi()
 }
