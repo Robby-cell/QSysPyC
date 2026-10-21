@@ -243,9 +243,14 @@ pub fn generate_pyi(env: &RuntimeEnv) -> String {
     )
 }
 
+/// Builds the complete `qsys.pyi` source for the default Q-SYS runtime environment.
+pub fn generate_default_pyi() -> String {
+    generate_pyi(&RuntimeEnv::qsys())
+}
+
 /// Generates standard PEP 561 stub files (`qsys/__init__.pyi`, `qsys/py.typed`, `qsys.pyi`).
 pub fn write_stubs_to_dir(out_dir: &Path) -> std::io::Result<()> {
-    let pyi_source = generate_pyi(&RuntimeEnv::qsys());
+    let pyi_source = generate_default_pyi();
 
     // 1. Write standalone qsys.pyi (for single-file imports)
     fs::create_dir_all(out_dir)?;

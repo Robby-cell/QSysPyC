@@ -14,12 +14,13 @@ A strict, deterministic Python-to-Lua compiler and toolchain designed specifical
 
 > **"Unsupported Python must produce an actionable diagnostic, never an approximation."**
 
-Q-SYS Core processors operate mission-critical audio, video, and control engines. Naive transpilation (substituting operators, flattening control flow, or ignoring semantics) can cause silent runtime crashes or corrupt DSP states. 
+Q-SYS Core processors operate mission-critical audio, video, and control engines. Naive transpilation (substituting operators, flattening control flow, or ignoring semantics) can cause silent runtime crashes or corrupt DSP states.
 
 `qsyspyc` enforces total soundness:
-* **Truthiness Protection**: In Lua, `0` and `""` are truthy. In Python, they are falsy. QSysPy’s semantic engine infers operand types and lowers `if ctl.Value:` to `if (ctl.Value ~= 0) then` and `if name:` to `if (#name > 0) then`.
-* **Zero Silent Drops**: Chained assignments (`a = b = 1`), unsupported operators, and tuple unpacking in for-loops produce clear diagnostics (`E0101`–`E0205`) with line and column numbers.
-* **Stable IDs & Fuzzy Member Checks**: References like `self.Master.Value` resolve to internal IDs (`ControlId`, `SymbolId`), and typos like `ctl.Valu` emit actionable suggestions (`did you mean 'Value'?`).
+
+- **Truthiness Protection**: In Lua, `0` and `""` are truthy. In Python, they are falsy. QSysPy’s semantic engine infers operand types and lowers `if ctl.Value:` to `if (ctl.Value ~= 0) then` and `if name:` to `if (#name > 0) then`.
+- **Zero Silent Drops**: Chained assignments (`a = b = 1`), unsupported operators, and tuple unpacking in for-loops produce clear diagnostics (`E0101`–`E0205`) with line and column numbers.
+- **Stable IDs & Fuzzy Member Checks**: References like `self.Master.Value` resolve to internal IDs (`ControlId`, `SymbolId`), and typos like `ctl.Valu` emit actionable suggestions (`did you mean 'Value'?`).
 
 ---
 
@@ -48,8 +49,8 @@ web/                   # Monaco Editor-based static playground studio
 
 ### Prerequisites
 
-* [Rust](https://rustup.rs/) (2024 edition / Rust 1.85+)
-* [wasm-pack](https://rustwasm.github.io/wasm-pack/installer/) *(optional, for WASM/Web Playground)*
+- [Rust](https://rustup.rs/) (2024 edition / Rust 1.85+)
+- [wasm-pack](https://rustwasm.github.io/wasm-pack/installer/) _(optional, for WASM/Web Playground)_
 
 ### Building the CLI
 
@@ -92,6 +93,7 @@ qsyspyc check mixer.py
 ```
 
 If an error is found, `qsyspyc` prints formatted diagnostics with line numbers, code snippets, and suggestions:
+
 ```text
 error[E0201]: Control 'ctl' has no member 'Valu'; did you mean 'Value'? at mixer.py:8:17
   = help: Declare controls using Control.<Type>() or check member casing.
@@ -103,9 +105,10 @@ error[E0201]: Control 'ctl' has no member 'Valu'; did you mean 'Value'? at mixer
 qsyspyc gen-stubs
 ```
 
-This creates standard PEP 561 stub files (`typings/qsys/__init__.pyi`, `typings/qsys/py.typed`, `typings/qsys.pyi`). 
+This creates standard PEP 561 stub files (`typings/qsys/__init__.pyi`, `typings/qsys/py.typed`, `typings/qsys.pyi`).
 
 Add this to `.vscode/settings.json` for full IDE autocompletion:
+
 ```json
 {
   "python.analysis.extraPaths": ["./typings"]
@@ -148,11 +151,12 @@ class MatrixMixer(QSysPlugin):
 ```
 
 When compiled with `qsyspyc build`, this produces:
-* Complete `PluginInfo` metadata table.
-* `GetProperties()` and `GetControls(props)` definitions matching Q-SYS plugin architecture.
-* A default `GetControlLayout(props)` layout envelope.
-* Runtime lifecycle code guarded by `if Controls then ... end`.
-* Event handler bindings mapped to `Controls["MasterGain"].EventHandler`.
+
+- Complete `PluginInfo` metadata table.
+- `GetProperties()` and `GetControls(props)` definitions matching Q-SYS plugin architecture.
+- A default `GetControlLayout(props)` layout envelope.
+- Runtime lifecycle code guarded by `if Controls then ... end`.
+- Event handler bindings mapped to `Controls["MasterGain"].EventHandler`.
 
 ---
 
@@ -163,17 +167,20 @@ The project includes an in-browser playground powered by Monaco Editor and WebAs
 ### Running the Web Studio Locally
 
 Compile the WASM crate
+
 ```bash
 wasm-pack build crates/qsys_wasm --target web --out-dir ../../web/pkg
 ```
 
 Serve the web folder
+
 ```bash
 cd web
 python3 -m http.server 3000
 ```
 
 Or to serve with `npm`:
+
 ```bash
 npx serve ./web
 ```
@@ -184,11 +191,11 @@ Open `http://localhost:3000` in any browser.
 
 ## Compiler Diagnostic Codes
 
-| Code Range | Category | Examples |
-|---|---|---|
-| **E0001–E0099** | Syntax & Structure | Python syntax errors, unclosed parentheses, missing module body |
+| Code Range      | Category                   | Examples                                                                        |
+| --------------- | -------------------------- | ------------------------------------------------------------------------------- |
+| **E0001–E0099** | Syntax & Structure         | Python syntax errors, unclosed parentheses, missing module body                 |
 | **E0101–E0199** | Language Subset Guardrails | Unsupported `async/await`, generators (`yield`), match/case, chained assignment |
-| **E0201–E0299** | Semantic & Q-SYS Binding | Unknown control members (`ctl.Valu`), missing `self`, invalid pin style |
+| **E0201–E0299** | Semantic & Q-SYS Binding   | Unknown control members (`ctl.Valu`), missing `self`, invalid pin style         |
 
 ---
 
@@ -220,7 +227,8 @@ We welcome issues, feedback, and pull requests!
 ## License
 
 Dual-licensed under either:
-* **Apache License, Version 2.0** ([LICENSE-APACHE](LICENSE-APACHE))
-* **MIT License** ([LICENSE-MIT](LICENSE-MIT))
+
+- **Apache License, Version 2.0** ([LICENSE-APACHE](LICENSE-APACHE))
+- **MIT License** ([LICENSE-MIT](LICENSE-MIT))
 
 at your option.

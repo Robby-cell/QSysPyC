@@ -1,67 +1,402 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
-
-<head>
-    <meta charset="UTF-8">
-    <title>QSysPy Studio - Python to Q-SYS Lua Transpiler</title>
-    <link rel="stylesheet" href="styles.css">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>QSysPy Studio - Python to Q-SYS Lua IDE</title>
+    <link rel="stylesheet" href="styles.css" />
     <!-- Load Monaco Editor via CDN -->
-    <link rel="stylesheet" data-name="vs/editor/editor.main"
-        href="https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.45.0/min/vs/editor/editor.main.css">
-</head>
+    <link
+      rel="stylesheet"
+      data-name="vs/editor/editor.main"
+      href="https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.45.0/min/vs/editor/editor.main.css"
+    />
+  </head>
 
-<body>
-    <header>
+  <body>
+    <header class="topbar">
+      <div class="topbar-left">
+        <button
+          type="button"
+          id="btn-toggle-sidebar"
+          class="icon-btn"
+          aria-label="Toggle file explorer sidebar"
+          title="Toggle Explorer (Ctrl+B)"
+        >
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+            <path d="M2 3h12v1H2V3zm0 4h12v1H2V7zm0 4h8v1H2v-1z" />
+          </svg>
+        </button>
         <div class="brand">
-            <span>QSysPy Studio</span>
-            <span class="brand-badge">WASM</span>
+          <h1>QSysPy Studio</h1>
+          <span class="brand-badge">WASM IDE</span>
         </div>
 
-        <div class="controls">
-            <label for="example-select" style="font-size: 12px; color: #888;">Example:</label>
-            <select id="example-select">
-                <option value="mixer">Matrix Mixer (Plugin)</option>
-                <option value="wol">Wake-on-LAN (UDP Network Plugin)</option>
-                <option value="controller">Room Controller (TextController)</option>
-                <option value="script">Procedural DSP Script</option>
-            </select>
+        <div class="topbar-divider" aria-hidden="true"></div>
 
-            <div id="status-pill" class="status-badge">
-                <div class="status-indicator"></div>
-                <span id="status-text">Loading WASM...</span>
-            </div>
-
-            <button id="btn-copy">Copy Lua</button>
-            <button id="btn-download" class="primary">Download .qplug</button>
+        <div class="project-switcher">
+          <label for="project-select" class="sr-only">Active Project</label>
+          <select id="project-select" aria-label="Active Project"></select>
+          <button
+            type="button"
+            id="btn-new-project"
+            class="toolbar-btn"
+            title="Create or manage projects"
+          >
+            + Project
+          </button>
+          <button
+            type="button"
+            id="btn-open-folder"
+            class="toolbar-btn"
+            title="Open a local project directory from disk"
+          >
+            Local Folder
+          </button>
+          <button
+            type="button"
+            id="btn-import"
+            class="toolbar-btn"
+            title="Import .py files, .zip archives, or .qsysproj.json snapshots"
+          >
+            Import
+          </button>
+          <button
+            type="button"
+            id="btn-export"
+            class="toolbar-btn"
+            title="Export project to .zip, local folder, or .qsysproj.json"
+          >
+            Export
+          </button>
         </div>
+      </div>
+
+      <div class="controls">
+        <div id="storage-pill" class="storage-badge" title="Workspace persistence status">
+          <span class="storage-dot" aria-hidden="true"></span>
+          <span id="storage-text">Saved</span>
+        </div>
+
+        <button
+          type="button"
+          id="btn-sync-disk"
+          class="toolbar-btn accent hidden"
+          title="Write changes &amp; compiled output to linked local folder (Ctrl+S)"
+        >
+          Sync Disk
+        </button>
+
+        <div id="status-pill" class="status-badge">
+          <div class="status-indicator" aria-hidden="true"></div>
+          <span id="status-text">Loading WASM...</span>
+        </div>
+
+        <button type="button" id="btn-copy" class="toolbar-btn">Copy Lua</button>
+        <button type="button" id="btn-download" class="toolbar-btn primary">Download .qplug</button>
+      </div>
     </header>
 
-    <main>
-        <!-- Left Pane: Python Source -->
-        <div class="pane">
-            <div class="pane-header">
-                <span>PYTHON SOURCE (QSysPy)</span>
-                <span style="font-size: 11px;">Autocompletion & Diagnostics Active</span>
-            </div>
-            <div id="python-editor" class="editor-container"></div>
+    <div class="workspace-body">
+      <!-- File Explorer Sidebar -->
+      <aside id="sidebar" class="sidebar" aria-label="Project Explorer">
+        <div class="sidebar-header">
+          <div class="sidebar-title-group">
+            <h2 id="sidebar-project-name">EXPLORER</h2>
+            <span
+              id="local-link-badge"
+              class="local-badge hidden"
+              title="Linked to a local directory on your computer"
+              >LOCAL</span
+            >
+          </div>
+          <div class="sidebar-actions">
+            <button
+              type="button"
+              id="btn-new-file"
+              class="icon-btn"
+              aria-label="New file"
+              title="New File"
+            >
+              +File
+            </button>
+            <button
+              type="button"
+              id="btn-new-folder"
+              class="icon-btn"
+              aria-label="New folder"
+              title="New Folder"
+            >
+              +Dir
+            </button>
+            <button
+              type="button"
+              id="btn-reload-disk"
+              class="icon-btn hidden"
+              aria-label="Reload project from local disk"
+              title="Reload from Local Disk"
+            >
+              ↻
+            </button>
+          </div>
         </div>
 
-        <!-- Right Pane: Lua Output -->
-        <div class="pane">
-            <div class="pane-header">
-                <span>EMITTED Q-SYS LUA (5.3)</span>
-                <span id="output-ext" style="font-size: 11px;">.qplug</span>
-            </div>
-            <div id="lua-editor" class="editor-container"></div>
+        <search class="sidebar-search">
+          <label for="file-filter-input" class="sr-only">Filter project files</label>
+          <input
+            type="search"
+            id="file-filter-input"
+            placeholder="Filter files..."
+            autocomplete="off"
+          />
+        </search>
+
+        <div
+          id="file-tree-container"
+          class="file-tree-container"
+          tabindex="0"
+          aria-label="Project files (drag and drop files here to import)"
+        >
+          <ul id="file-tree" class="file-tree" role="tree" aria-label="File tree"></ul>
         </div>
+
+        <div class="sidebar-footer">
+          <div class="sidebar-section-header">
+            <h3>BUILD ARTIFACT</h3>
+            <button
+              type="button"
+              id="btn-save-artifact-to-fs"
+              class="mini-btn"
+              title="Save compiled .qplug/.lua output into project build/ folder"
+            >
+              Save to build/
+            </button>
+          </div>
+          <div id="artifact-summary" class="artifact-summary">
+            <span id="artifact-filename">matrix_mixer.qplug</span>
+            <span id="artifact-imports" class="artifact-meta"></span>
+          </div>
+        </div>
+      </aside>
+
+      <!-- Split Editor Area -->
+      <main class="editor-workspace">
+        <!-- Left Pane: Source Editor + Open Tabs -->
+        <section class="pane" aria-label="Source Code Editor">
+          <div class="pane-header tab-bar-header">
+            <div
+              id="editor-tabs"
+              class="editor-tabs"
+              role="tablist"
+              aria-label="Open file tabs"
+            ></div>
+            <div class="pane-meta">
+              <span id="active-file-path" class="active-file-label">src/matrix_mixer.py</span>
+            </div>
+          </div>
+          <div id="python-editor" class="editor-container"></div>
+        </section>
+
+        <!-- Right Pane: Emitted Q-SYS Lua Output -->
+        <section class="pane" aria-label="Emitted Q-SYS Lua Output">
+          <div class="pane-header">
+            <div class="pane-title-wrap">
+              <span>EMITTED Q-SYS LUA (5.3)</span>
+              <span id="bundled-badge" class="bundled-badge hidden"></span>
+            </div>
+            <span id="output-ext" class="output-ext-badge">.qplug</span>
+          </div>
+          <div id="lua-editor" class="editor-container"></div>
+        </section>
 
         <!-- Error/Diagnostics Drawer -->
-        <div id="error-drawer"></div>
-    </main>
+        <div id="error-drawer" role="region" aria-label="Compiler Diagnostics"></div>
+      </main>
+    </div>
+
+    <!-- Hidden File Inputs for Fallbacks -->
+    <input
+      type="file"
+      id="input-import-files"
+      class="hidden"
+      multiple
+      accept=".py,.pyi,.json,.md,.txt,.lua,.qplug,.zip"
+    />
+    <input type="file" id="input-import-folder" class="hidden" webkitdirectory multiple />
+
+    <!-- Toast Notification -->
+    <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
+
+    <!-- Modal 1: New / Manage Project Dialog -->
+    <dialog id="dialog-project" closedby="any" aria-labelledby="dialog-project-title">
+      <form method="dialog" id="form-project" class="modal-form">
+        <div class="modal-header">
+          <h2 id="dialog-project-title">Projects &amp; Templates</h2>
+          <button type="submit" value="cancel" class="icon-btn" aria-label="Close dialog">✕</button>
+        </div>
+
+        <div class="modal-body">
+          <div class="form-group">
+            <label for="new-project-name">New Project Name</label>
+            <input type="text" id="new-project-name" placeholder="MyRoomPlugin" required />
+          </div>
+
+          <div class="form-group">
+            <label for="new-project-template">Starter Template</label>
+            <select id="new-project-template">
+              <option value="plugin">Q-SYS Plugin (.qplug) + Helper Module</option>
+              <option value="controller">Text Controller Script (.lua)</option>
+              <option value="starter">Full Q-SYS Starter Examples Suite</option>
+              <option value="empty">Empty Project (with qsys.pyi stubs)</option>
+            </select>
+          </div>
+
+          <div class="modal-divider"></div>
+
+          <div class="current-project-box">
+            <h3>Current Project Actions</h3>
+            <div class="inline-actions">
+              <button type="button" id="btn-rename-project" class="toolbar-btn">
+                Rename Active Project
+              </button>
+              <button type="button" id="btn-delete-project" class="toolbar-btn danger">
+                Delete Active Project
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <div class="modal-footer">
+          <button type="submit" value="cancel" formnovalidate class="toolbar-btn">Cancel</button>
+          <button type="submit" value="create" class="toolbar-btn primary">Create Project</button>
+        </div>
+      </form>
+    </dialog>
+
+    <!-- Modal 2: File / Folder Name Prompt Dialog -->
+    <dialog id="dialog-path-prompt" closedby="any" aria-labelledby="dialog-path-title">
+      <form method="dialog" id="form-path-prompt" class="modal-form">
+        <div class="modal-header">
+          <h2 id="dialog-path-title">New File</h2>
+          <button
+            type="submit"
+            value="cancel"
+            formnovalidate
+            class="icon-btn"
+            aria-label="Close dialog"
+          >
+            ✕
+          </button>
+        </div>
+
+        <div class="modal-body">
+          <div class="form-group">
+            <label for="path-prompt-input" id="dialog-path-label"
+              >File path (e.g. src/my_plugin.py)</label
+            >
+            <input type="text" id="path-prompt-input" placeholder="src/module.py" required />
+            <p id="dialog-path-error" class="form-error hidden"></p>
+          </div>
+        </div>
+
+        <div class="modal-footer">
+          <button type="submit" value="cancel" formnovalidate class="toolbar-btn">Cancel</button>
+          <button type="submit" value="confirm" id="dialog-path-submit" class="toolbar-btn primary">
+            Create
+          </button>
+        </div>
+      </form>
+    </dialog>
+
+    <!-- Modal 3: Export & Local Sync Dialog -->
+    <dialog id="dialog-export" closedby="any" aria-labelledby="dialog-export-title">
+      <form method="dialog" class="modal-form">
+        <div class="modal-header">
+          <h2 id="dialog-export-title">Export &amp; Local Storage Sync</h2>
+          <button type="submit" value="close" class="icon-btn" aria-label="Close dialog">✕</button>
+        </div>
+
+        <div class="modal-body">
+          <div class="export-options-group">
+            <label class="checkbox-row">
+              <input type="checkbox" id="export-include-compiled" checked />
+              <span
+                >Include compiled <code>build/*.qplug</code> &amp;
+                <code>build/*.lua</code> outputs</span
+              >
+            </label>
+            <label class="checkbox-row">
+              <input type="checkbox" id="export-include-stubs" checked />
+              <span
+                >Include <code>typings/qsys.pyi</code> &amp; <code>pyrightconfig.json</code> for VS
+                Code / PyCharm</span
+              >
+            </label>
+          </div>
+
+          <div class="export-cards">
+            <div class="export-card">
+              <div class="export-card-info">
+                <h3>Sync / Export to Local Folder</h3>
+                <p>
+                  Write all project files and compiled Q-SYS artifacts directly into a directory on
+                  your computer.
+                </p>
+              </div>
+              <button type="button" id="btn-export-local-dir" class="toolbar-btn primary">
+                Write to Folder...
+              </button>
+            </div>
+
+            <div class="export-card">
+              <div class="export-card-info">
+                <h3>Download Project Archive (<code>.zip</code>)</h3>
+                <p>
+                  Bundle all Python sources, compiled <code>.qplug</code>/<code>.lua</code> files,
+                  and IDE stubs into a standard ZIP file.
+                </p>
+              </div>
+              <button type="button" id="btn-export-zip" class="toolbar-btn primary">
+                Download .zip
+              </button>
+            </div>
+
+            <div class="export-card">
+              <div class="export-card-info">
+                <h3>Export Workspace Snapshot (<code>.qsysproj.json</code>)</h3>
+                <p>
+                  Save a portable JSON project file that can be re-imported into QSysPy Studio at
+                  any time.
+                </p>
+              </div>
+              <button type="button" id="btn-export-json" class="toolbar-btn">
+                Download .qsysproj.json
+              </button>
+            </div>
+
+            <div class="export-card">
+              <div class="export-card-info">
+                <h3>Download <code>qsys.pyi</code> Stubs Only</h3>
+                <p>
+                  Download the standalone PEP 561 Python type stub file for offline IDE
+                  autocompletion.
+                </p>
+              </div>
+              <button type="button" id="btn-export-pyi" class="toolbar-btn">
+                Download qsys.pyi
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <div class="modal-footer">
+          <button type="submit" value="close" class="toolbar-btn">Close</button>
+        </div>
+      </form>
+    </dialog>
 
     <!-- Monaco loader script -->
     <script src="https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.45.0/min/vs/loader.js"></script>
     <script type="module" src="app.js"></script>
-</body>
-
+  </body>
 </html>
