@@ -417,11 +417,15 @@ class MatrixMixer(QSysPlugin):
     );
     // Multi-channel control ChGain (count=3) referenced bare in UI.Control(ChGain) expands to Ch 1, Ch 2, Ch 3 with PrettyNames
     assert!(
-        lua.contains("layout[\"Ch 2\"] = {\n        PrettyName = \"Ch 2\",\n        Style = \"Knob\""),
+        lua.contains(
+            "layout[\"Ch 2\"] = {\n        PrettyName = \"Ch 2\",\n        Style = \"Knob\""
+        ),
         "Multi-channel control must expand to 'Ch 1', 'Ch 2', 'Ch 3' with PrettyName:\n{lua}"
     );
     assert!(
-        lua.contains("layout[\"Ch 3\"] = {\n        PrettyName = \"Ch 3\",\n        Style = \"Knob\""),
+        lua.contains(
+            "layout[\"Ch 3\"] = {\n        PrettyName = \"Ch 3\",\n        Style = \"Knob\""
+        ),
         "Multi-channel control must expand to 'Ch 3' with PrettyName:\n{lua}"
     );
 }
@@ -621,5 +625,3 @@ class StereoPlugin(QSysPlugin):
         "self.Gain[0].Value must lower to 1-based Controls['Gain'][1].Value:\n{lua}"
     );
 }
-
-

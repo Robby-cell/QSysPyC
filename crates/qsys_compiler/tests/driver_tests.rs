@@ -294,7 +294,8 @@ class Mixer(QSysPlugin):
         ),
     )
 "#;
-    let ok_artifact = Compiler::compile(ok_src, &CompilerOptions::default()).expect("Should compile");
+    let ok_artifact =
+        Compiler::compile(ok_src, &CompilerOptions::default()).expect("Should compile");
     let preview_json = ok_artifact.to_ui_preview_json();
     assert!(preview_json.contains("\"has_explicit_layout\":true"));
     assert!(preview_json.contains("\"MasterGain\""));
@@ -306,4 +307,3 @@ class Mixer(QSysPlugin):
     assert!(ui_completions.iter().any(|c| c.label == "GroupBox"));
     assert!(ui_completions.iter().any(|c| c.label == "Field"));
 }
-

@@ -848,8 +848,7 @@ function renderActiveUiPage() {
     }
     const empty = document.createElement("div");
     empty.className = "ui-empty-notice";
-    empty.textContent =
-      "Control Panel UI preview is available for Q-SYS Plugin targets (.qplug).";
+    empty.textContent = "Control Panel UI preview is available for Q-SYS Plugin targets (.qplug).";
     canvasEl.appendChild(empty);
     canvasEl.style.setProperty("--canvas-w", "460px");
     canvasEl.style.setProperty("--canvas-h", "140px");
@@ -955,11 +954,7 @@ function renderActiveUiPage() {
       el.style.setProperty("--font-size", `${font_size}px`);
       if (accent) el.style.setProperty("--item-color", accent);
       const alignCss =
-        h_align === "Center"
-          ? "center"
-          : h_align === "Right"
-            ? "flex-end"
-            : "flex-start";
+        h_align === "Center" ? "center" : h_align === "Right" ? "flex-end" : "flex-start";
       el.style.setProperty("--text-align", alignCss);
       el.textContent = text;
       bindHoverInspector(el, `Graphic[Label] "${text}"`, geom);
@@ -985,9 +980,7 @@ function renderActiveUiPage() {
     }
 
     const styleName =
-      typeof c.style === "string"
-        ? c.style
-        : c.style?.Custom || meta?.kind || "Text";
+      typeof c.style === "string" ? c.style : c.style?.Custom || meta?.kind || "Text";
     const prettyName = c.pretty_name || c.name;
 
     if (styleName === "Fader" || styleName === "Knob") {
@@ -1009,8 +1002,7 @@ function renderActiveUiPage() {
 
       const readout = document.createElement("span");
       readout.className = "qsys-fader-readout";
-      const formatVal = (v) =>
-        `${Number.isInteger(v) ? v : v.toFixed(1)}${unit ? ` ${unit}` : ""}`;
+      const formatVal = (v) => `${Number.isInteger(v) ? v : v.toFixed(1)}${unit ? ` ${unit}` : ""}`;
       readout.textContent = formatVal(Number(initVal));
 
       rangeInput.addEventListener("input", () => {

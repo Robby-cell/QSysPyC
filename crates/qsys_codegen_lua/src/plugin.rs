@@ -318,7 +318,10 @@ fn emit_get_controls(emitter: &mut LuaEmitter<'_>, controls: &[IRControlBinding]
 
 fn emit_get_pages(emitter: &mut LuaEmitter<'_>, pages: &[PageLayout]) {
     let page_names: Vec<String> = pages.iter().map(|p| escape_lua_string(&p.name)).collect();
-    emitter.write_line(&format!("local PageNames = {{ {} }}", page_names.join(", ")));
+    emitter.write_line(&format!(
+        "local PageNames = {{ {} }}",
+        page_names.join(", ")
+    ));
     emitter.write_line("function GetPages(props)");
     emitter.indent();
     emitter.write_line("local pages = {}");

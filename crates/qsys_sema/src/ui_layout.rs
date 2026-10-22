@@ -85,15 +85,11 @@ pub fn substitute_ui_vars(expr: &ast::Expr, vars: &FxHashMap<String, ast::Expr>)
             span: expr.span,
         },
         ast::ExprKind::List(items) => ast::Expr {
-            kind: ast::ExprKind::List(
-                items.iter().map(|i| substitute_ui_vars(i, vars)).collect(),
-            ),
+            kind: ast::ExprKind::List(items.iter().map(|i| substitute_ui_vars(i, vars)).collect()),
             span: expr.span,
         },
         ast::ExprKind::Tuple(items) => ast::Expr {
-            kind: ast::ExprKind::Tuple(
-                items.iter().map(|i| substitute_ui_vars(i, vars)).collect(),
-            ),
+            kind: ast::ExprKind::Tuple(items.iter().map(|i| substitute_ui_vars(i, vars)).collect()),
             span: expr.span,
         },
         _ => expr.clone(),
@@ -120,10 +116,9 @@ pub fn extract_declarative_layout_from_method(body: &[ast::Stmt]) -> Option<ast:
                 let sub = substitute_ui_vars(e, &local_ui_vars);
                 if is_ui_layout_expr(&sub) {
                     top_ui_exprs.push(sub);
-                } else if let Some(appended) = extract_graphics_append(&sub) {
-                    top_ui_exprs.push(appended);
                 } else {
-                    return None;
+                    let appended = extract_graphics_append(&sub)?;
+                    top_ui_exprs.push(appended);
                 }
             }
             ast::StmtKind::Assign { target, value } => {
@@ -665,12 +660,9 @@ impl<'a> UiParserCtx<'a> {
             .and_then(|c| c.as_str().map(String::from))
             .or_else(|| get_kwarg_str(kwargs, "label"));
 
-        let ctl_expr = args.get(1).or_else(|| {
-            kwargs
-                .iter()
-                .find(|(k, _)| k == "control")
-                .map(|(_, v)| v)
-        });
+        let ctl_expr = args
+            .get(1)
+            .or_else(|| kwargs.iter().find(|(k, _)| k == "control").map(|(_, v)| v));
 
         let Some(ctl_expr) = ctl_expr else {
             self.diagnostics.report(
@@ -698,12 +690,9 @@ impl<'a> UiParserCtx<'a> {
         kwargs: &[(String, ast::Expr)],
         span: Span,
     ) -> Vec<UiNode> {
-        let ctl_expr = args.first().or_else(|| {
-            kwargs
-                .iter()
-                .find(|(k, _)| k == "control")
-                .map(|(_, v)| v)
-        });
+        let ctl_expr = args
+            .first()
+            .or_else(|| kwargs.iter().find(|(k, _)| k == "control").map(|(_, v)| v));
 
         let Some(ctl_expr) = ctl_expr else {
             self.diagnostics.report(
@@ -738,8 +727,7 @@ impl<'a> UiParserCtx<'a> {
             .map(|s| ControlStyle::from_name(&s))
             .unwrap_or_else(|| ControlStyle::default_for_kind(&ctl.def.kind));
 
-        let label_pos_str =
-            get_kwarg_str(kwargs, "label_pos").unwrap_or_else(|| "top".to_string());
+        let label_pos_str = get_kwarg_str(kwargs, "label_pos").unwrap_or_else(|| "top".to_string());
         let label_width = get_kwarg_f64(kwargs, "label_width").unwrap_or(88.0);
         let label_placement = match label_pos_str.to_ascii_lowercase().as_str() {
             "left" | "inline" | "side" => LabelPlacement::Left { width: label_width },
@@ -848,11 +836,7 @@ impl<'a> UiParserCtx<'a> {
             let ch_pretty = explicit_pretty_names
                 .as_ref()
                 .and_then(|list| list.get(ch - 1).cloned())
-                .or_else(|| {
-                    pretty_name
-                        .as_ref()
-                        .map(|p| format_channel_surface(p, ch))
-                })
+                .or_else(|| pretty_name.as_ref().map(|p| format_channel_surface(p, ch)))
                 .or_else(|| ch_label.clone())
                 .or_else(|| Some(qsys_key.clone()));
             let ch_legend = legend.as_ref().map(|l| format_channel_surface(l, ch));
@@ -943,8 +927,9 @@ impl<'a> UiParserCtx<'a> {
                 self.diagnostics.report(
                     DiagnosticKind::InvalidDeclarationArgument {
                         name: "UI.Control".to_string(),
-                        message: "Expected a declared control reference (e.g. 'self.Gain' or 'Gain')"
-                            .to_string(),
+                        message:
+                            "Expected a declared control reference (e.g. 'self.Gain' or 'Gain')"
+                                .to_string(),
                     },
                     expr.span,
                 );
@@ -957,8 +942,9 @@ impl<'a> UiParserCtx<'a> {
                     self.diagnostics.report(
                         DiagnosticKind::InvalidDeclarationArgument {
                             name: ctl.ident.clone(),
-                            message: "Control subscript index in UI layout must be an integer literal"
-                                .to_string(),
+                            message:
+                                "Control subscript index in UI layout must be an integer literal"
+                                    .to_string(),
                         },
                         index.span,
                     );
@@ -1077,9 +1063,15 @@ fn get_kwarg_color(kwargs: &[(String, ast::Expr)], key: &str) -> Option<Color> {
     if let ast::ExprKind::Tuple(elts) | ast::ExprKind::List(elts) = &expr.kind
         && elts.len() == 3
     {
-        let r = eval_constant(&elts[0]).and_then(|c| c.as_i64())?.clamp(0, 255) as u8;
-        let g = eval_constant(&elts[1]).and_then(|c| c.as_i64())?.clamp(0, 255) as u8;
-        let b = eval_constant(&elts[2]).and_then(|c| c.as_i64())?.clamp(0, 255) as u8;
+        let r = eval_constant(&elts[0])
+            .and_then(|c| c.as_i64())?
+            .clamp(0, 255) as u8;
+        let g = eval_constant(&elts[1])
+            .and_then(|c| c.as_i64())?
+            .clamp(0, 255) as u8;
+        let b = eval_constant(&elts[2])
+            .and_then(|c| c.as_i64())?
+            .clamp(0, 255) as u8;
         return Some(Color::rgb(r, g, b));
     }
     None

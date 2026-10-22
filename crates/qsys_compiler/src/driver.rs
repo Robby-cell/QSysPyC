@@ -193,9 +193,14 @@ fn build_ui_preview(
                 ControlKind::Text { default, .. } => {
                     (None, None, None, None, Some(default.clone()), None)
                 }
-                ControlKind::Indicator { unit } => {
-                    (Some(unit.as_str().to_string()), None, None, None, None, None)
-                }
+                ControlKind::Indicator { unit } => (
+                    Some(unit.as_str().to_string()),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
             };
             UiControlMetadata {
                 ident: c.ident.clone(),

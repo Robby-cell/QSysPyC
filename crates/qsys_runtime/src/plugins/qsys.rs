@@ -304,10 +304,9 @@ fn install_ui(env: &mut EnvBuilder) {
     let ui_node = || TypeRef::object("UINode");
     let ctl_handle = || TypeRef::object("ControlHandle");
 
-    env.add_type(
-        ObjectType::library("UINode")
-            .doc("Declarative Q-SYS UI layout node expanded into `GetControlLayout` and `GetPages` tables."),
-    );
+    env.add_type(ObjectType::library("UINode").doc(
+        "Declarative Q-SYS UI layout node expanded into `GetControlLayout` and `GetPages` tables.",
+    ));
 
     env.add_type(
         ObjectType::library("UI")

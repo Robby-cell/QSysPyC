@@ -16,13 +16,8 @@ use crate::{SemanticModel, TargetKind, TruthinessStrategy, TypeMap};
 pub fn lower_to_ir(model: &SemanticModel) -> IRProgram {
     match &model.target {
         TargetKind::Plugin(p) => {
-            let mut lowerer = StmtLowerer::new(
-                model,
-                true,
-                &p.class_name,
-                &p.controls,
-                &p.helper_classes,
-            );
+            let mut lowerer =
+                StmtLowerer::new(model, true, &p.class_name, &p.controls, &p.helper_classes);
 
             let classes = p
                 .helper_classes
@@ -91,13 +86,8 @@ pub fn lower_to_ir(model: &SemanticModel) -> IRProgram {
         }
 
         TargetKind::TextController(c) => {
-            let mut lowerer = StmtLowerer::new(
-                model,
-                false,
-                &c.class_name,
-                &c.controls,
-                &c.helper_classes,
-            );
+            let mut lowerer =
+                StmtLowerer::new(model, false, &c.class_name, &c.controls, &c.helper_classes);
 
             let classes = c
                 .helper_classes
@@ -216,7 +206,11 @@ impl<'a> StmtLowerer<'a> {
         }
     }
 
-    fn lower_ui_expr_to_stmt(&self, expr: &ast::Expr, span: qsys_diagnostics::Span) -> Option<IRStmt> {
+    fn lower_ui_expr_to_stmt(
+        &self,
+        expr: &ast::Expr,
+        span: qsys_diagnostics::Span,
+    ) -> Option<IRStmt> {
         let mut dummy_diags = Diagnostics::new();
         let mut dummy_res = Vec::new();
         let mut pages = parse_ui_layout_expr(
@@ -226,7 +220,9 @@ impl<'a> StmtLowerer<'a> {
             &mut dummy_diags,
             &mut dummy_res,
         );
-        pages.pop().map(|page| IRStmt::EmitPageLayout { page, span })
+        pages
+            .pop()
+            .map(|page| IRStmt::EmitPageLayout { page, span })
     }
 
     fn lower_function(
