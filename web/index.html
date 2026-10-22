@@ -197,16 +197,72 @@
           <div id="python-editor" class="editor-container"></div>
         </section>
 
-        <!-- Right Pane: Emitted Q-SYS Lua Output -->
-        <section class="pane" aria-label="Emitted Q-SYS Lua Output">
+        <!-- Right Pane: Q-SYS UI Preview & Emitted Lua Output -->
+        <section id="output-pane" class="pane output-pane mode-split" aria-label="Q-SYS UI Preview and Emitted Lua Output">
           <div class="pane-header">
             <div class="pane-title-wrap">
-              <span>EMITTED Q-SYS LUA (5.3)</span>
+              <div class="view-mode-group" role="group" aria-label="Output view mode">
+                <button
+                  type="button"
+                  id="btn-view-split"
+                  class="view-mode-btn active"
+                  title="Show both Q-SYS UI Preview and Emitted Lua"
+                >
+                  Split
+                </button>
+                <button
+                  type="button"
+                  id="btn-view-ui"
+                  class="view-mode-btn"
+                  title="Show Q-SYS Control Panel UI Preview"
+                >
+                  UI Preview
+                </button>
+                <button
+                  type="button"
+                  id="btn-view-lua"
+                  class="view-mode-btn"
+                  title="Show Emitted Q-SYS Lua 5.3 Code"
+                >
+                  Lua 5.3
+                </button>
+              </div>
               <span id="bundled-badge" class="bundled-badge hidden"></span>
             </div>
-            <span id="output-ext" class="output-ext-badge">.qplug</span>
+            <div class="pane-title-wrap">
+              <button
+                type="button"
+                id="btn-scaffold-ui"
+                class="mini-btn hidden"
+                title="Insert a declarative UI.Page(...) layout into this plugin"
+              >
+                + Scaffold UI.Page
+              </button>
+              <span id="output-ext" class="output-ext-badge">.qplug</span>
+            </div>
           </div>
-          <div id="lua-editor" class="editor-container"></div>
+
+          <!-- Q-SYS Control Panel Live Preview -->
+          <div id="ui-preview-panel" class="ui-preview-panel" aria-label="Q-SYS Control Panel Preview">
+            <div class="ui-preview-toolbar">
+              <div id="ui-page-tabs" class="ui-page-tabs" role="tablist" aria-label="Q-SYS Plugin Pages"></div>
+              <span id="ui-layout-badge" class="ui-layout-badge">UI.Page</span>
+            </div>
+            <div class="ui-canvas-viewport">
+              <div id="ui-canvas" class="ui-canvas"></div>
+            </div>
+            <div id="ui-inspector-bar" class="ui-inspector-bar">
+              Hover any control or graphic to inspect its Q-SYS layout coordinates
+            </div>
+          </div>
+
+          <!-- Emitted Lua 5.3 Editor -->
+          <div id="lua-editor-wrap" class="lua-editor-wrap">
+            <div class="lua-sub-header">
+              <span>EMITTED Q-SYS LUA (5.3)</span>
+            </div>
+            <div id="lua-editor" class="editor-container"></div>
+          </div>
         </section>
 
         <!-- Error/Diagnostics Drawer -->

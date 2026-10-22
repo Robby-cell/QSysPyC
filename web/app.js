@@ -14,6 +14,8 @@ let workspace = null;
 let lastCompiledLua = "";
 let lastProgramKind = "Plugin";
 let lastArtifactFilename = "output.qplug";
+let lastUiPreview = null;
+let activeUiPageIndex = 0;
 
 // Monaco per-file models and view states (cursor, scroll, undo history)
 const fileModels = new Map(); // key: `${projectId}::${path}` -> ITextModel
@@ -679,6 +681,9 @@ function triggerCompile() {
             : "Standalone module";
       }
       if (errorDrawer) errorDrawer.classList.remove("open");
+      if (res.ui_preview) {
+        renderUiPreview(res.ui_preview);
+      }
     } else {
       if (statusPill) statusPill.className = "status-badge error";
       if (statusText) statusText.textContent = `${markers.length} Diagnostic(s)`;
@@ -759,6 +764,362 @@ function triggerCompile() {
       res.free();
     }
   }
+}
+
+/**
+ * Parses and renders the live Q-SYS Control Panel UI preview from `res.ui_preview`.
+ */
+function renderUiPreview(previewJson) {
+  try {
+    const data = JSON.parse(previewJson);
+    lastUiPreview = data;
+    const pages = Array.isArray(data.pages) ? data.pages : [];
+    if (activeUiPageIndex >= pages.length) {
+      activeUiPageIndex = 0;
+    }
+    renderActiveUiPage();
+  } catch (err) {
+    console.warn("Could not parse UI preview JSON:", err);
+  }
+}
+
+function resolveColorCss(colorSpec) {
+  if (!colorSpec) return null;
+  if (typeof colorSpec === "string") {
+    return colorSpec;
+  }
+  if (Array.isArray(colorSpec.Rgb) && colorSpec.Rgb.length === 3) {
+    const [r, g, b] = colorSpec.Rgb;
+    return `rgb(${r}, ${g}, ${b})`;
+  }
+  if (typeof colorSpec.Hex === "string") {
+    return colorSpec.Hex;
+  }
+  if (typeof colorSpec.Named === "string") {
+    const map = {
+      red: "#d9534f",
+      danger: "#d9534f",
+      error: "#d9534f",
+      green: "#4ec9b0",
+      ok: "#4ec9b0",
+      success: "#4ec9b0",
+      blue: "#0e639c",
+      primary: "#0e639c",
+      accent: "#0e639c",
+      yellow: "#cca700",
+      warning: "#cca700",
+      amber: "#cca700",
+      orange: "#e07a2e",
+      purple: "#8957e5",
+      violet: "#8957e5",
+      cyan: "#2aa198",
+      teal: "#2aa198",
+      white: "#ffffff",
+      black: "#141414",
+      gray: "#78787c",
+      grey: "#78787c",
+      muted: "#78787c",
+    };
+    return map[colorSpec.Named.toLowerCase()] || "#0e639c";
+  }
+  return null;
+}
+
+function renderActiveUiPage() {
+  const tabsEl = document.getElementById("ui-page-tabs");
+  const canvasEl = document.getElementById("ui-canvas");
+  const modePillEl = document.getElementById("ui-layout-badge");
+  const inspectorBarEl = document.getElementById("ui-inspector-bar");
+  const btnScaffoldUi = document.getElementById("btn-scaffold-ui");
+  if (!canvasEl || !tabsEl) return;
+
+  canvasEl.innerHTML = "";
+  tabsEl.innerHTML = "";
+
+  const isPlugin = (lastUiPreview?.program_kind || lastProgramKind) === "Plugin";
+  if (btnScaffoldUi) {
+    btnScaffoldUi.classList.toggle("hidden", !isPlugin);
+  }
+
+  if (!lastUiPreview || !isPlugin) {
+    if (modePillEl) {
+      modePillEl.textContent = "Script Mode";
+      modePillEl.classList.add("auto");
+    }
+    const empty = document.createElement("div");
+    empty.className = "ui-empty-notice";
+    empty.textContent =
+      "Control Panel UI preview is available for Q-SYS Plugin targets (.qplug).";
+    canvasEl.appendChild(empty);
+    canvasEl.style.setProperty("--canvas-w", "460px");
+    canvasEl.style.setProperty("--canvas-h", "140px");
+    return;
+  }
+
+  const pages = Array.isArray(lastUiPreview.pages) ? lastUiPreview.pages : [];
+  if (modePillEl) {
+    modePillEl.textContent = lastUiPreview.has_explicit_layout
+      ? `UI.Page (${pages.length} page${pages.length === 1 ? "" : "s"})`
+      : "Auto-Grid Preview";
+    modePillEl.classList.toggle("auto", !lastUiPreview.has_explicit_layout);
+  }
+
+  pages.forEach((page, idx) => {
+    const tabBtn = document.createElement("button");
+    tabBtn.type = "button";
+    tabBtn.className = `ui-page-tab${idx === activeUiPageIndex ? " active" : ""}`;
+    tabBtn.textContent = page.name || `Page ${idx + 1}`;
+    tabBtn.addEventListener("click", () => {
+      activeUiPageIndex = idx;
+      renderActiveUiPage();
+    });
+    tabsEl.appendChild(tabBtn);
+  });
+
+  const activePage = pages[activeUiPageIndex];
+  if (!activePage) {
+    const empty = document.createElement("div");
+    empty.className = "ui-empty-notice";
+    empty.textContent = "No UI controls or graphics declared on this page.";
+    canvasEl.appendChild(empty);
+    return;
+  }
+
+  const controlMetaByName = new Map();
+  if (Array.isArray(lastUiPreview.controls)) {
+    for (const c of lastUiPreview.controls) {
+      controlMetaByName.set(c.name, c);
+      if (c.count > 1) {
+        for (let i = 1; i <= c.count; i++) {
+          controlMetaByName.set(`${c.name} ${i}`, c);
+        }
+      }
+    }
+  }
+
+  let maxRight = Math.max(460, Math.round((activePage.size?.width ?? 440) + 24));
+  let maxBottom = Math.max(220, Math.round((activePage.size?.height ?? 180) + 24));
+
+  const setGeom = (el, pos, size) => {
+    const x = Math.round(pos?.x ?? 0);
+    const y = Math.round(pos?.y ?? 0);
+    const w = Math.round(size?.width ?? 120);
+    const h = Math.round(size?.height ?? 28);
+    el.style.setProperty("--x", `${x}px`);
+    el.style.setProperty("--y", `${y}px`);
+    el.style.setProperty("--w", `${w}px`);
+    el.style.setProperty("--h", `${h}px`);
+    if (x + w + 24 > maxRight) maxRight = x + w + 24;
+    if (y + h + 24 > maxBottom) maxBottom = y + h + 24;
+    return { x, y, w, h };
+  };
+
+  const bindHoverInspector = (el, summary, geom) => {
+    el.addEventListener("mouseenter", () => {
+      if (inspectorBarEl) {
+        inspectorBarEl.textContent = `${summary}   |   Position={ ${geom.x}, ${geom.y} }   Size={ ${geom.w}, ${geom.h} }`;
+      }
+    });
+  };
+
+  // 1. Render Graphics (Header, GroupBox, Label, Separator)
+  const graphics = Array.isArray(activePage.graphics) ? activePage.graphics : [];
+  for (const g of graphics) {
+    const kindObj = g.kind || {};
+    const el = document.createElement("div");
+    const geom = setGeom(el, g.position, g.size);
+    const accent = resolveColorCss(g.color);
+
+    if (kindObj.Header) {
+      const { text = "", font_size = 14 } = kindObj.Header;
+      el.className = "qsys-graphic qsys-header";
+      el.style.setProperty("--font-size", `${font_size}px`);
+      if (accent) el.style.setProperty("--item-color", accent);
+      el.textContent = text;
+      bindHoverInspector(el, `Graphic[Header] "${text}"`, geom);
+    } else if (kindObj.GroupBox) {
+      const { text = "", stroke = 1 } = kindObj.GroupBox;
+      el.className = "qsys-graphic qsys-groupbox";
+      el.style.setProperty("--stroke-w", `${stroke}px`);
+      if (accent) el.style.setProperty("--item-fill", accent);
+      if (text) {
+        const title = document.createElement("div");
+        title.className = "qsys-groupbox-title";
+        title.textContent = text;
+        el.appendChild(title);
+      }
+      bindHoverInspector(el, `Graphic[GroupBox] "${text}"`, geom);
+    } else if (kindObj.Label) {
+      const { text = "", font_size = 12, h_align = "Left" } = kindObj.Label;
+      el.className = "qsys-graphic qsys-label";
+      el.style.setProperty("--font-size", `${font_size}px`);
+      if (accent) el.style.setProperty("--item-color", accent);
+      const alignCss =
+        h_align === "Center"
+          ? "center"
+          : h_align === "Right"
+            ? "flex-end"
+            : "flex-start";
+      el.style.setProperty("--text-align", alignCss);
+      el.textContent = text;
+      bindHoverInspector(el, `Graphic[Label] "${text}"`, geom);
+    } else {
+      el.className = "qsys-graphic qsys-header";
+      bindHoverInspector(el, "Graphic[Separator]", geom);
+    }
+
+    canvasEl.appendChild(el);
+  }
+
+  // 2. Render Controls (Fader, Knob, Button, Text, Led, Meter)
+  const controls = Array.isArray(activePage.controls) ? activePage.controls : [];
+  for (const c of controls) {
+    if (c.is_invisible) continue;
+    const el = document.createElement("div");
+    el.className = "qsys-control";
+    const geom = setGeom(el, c.position, c.size);
+    const meta = controlMetaByName.get(c.name);
+    const accent = resolveColorCss(c.color);
+    if (accent) {
+      el.style.setProperty("--ctl-color", accent);
+    }
+
+    const styleName =
+      typeof c.style === "string"
+        ? c.style
+        : c.style?.Custom || meta?.kind || "Text";
+    const prettyName = c.pretty_name || c.name;
+
+    if (styleName === "Fader" || styleName === "Knob") {
+      const faderWrap = document.createElement("div");
+      faderWrap.className = "qsys-fader-widget";
+      const min = meta?.min ?? -100;
+      const max = meta?.max ?? 20;
+      const unit = meta?.unit && meta.unit !== "Float" ? meta.unit : "";
+      const initVal = meta?.default_num ?? 0;
+
+      const rangeInput = document.createElement("input");
+      rangeInput.type = "range";
+      rangeInput.className = "qsys-fader-input";
+      rangeInput.min = String(min);
+      rangeInput.max = String(max);
+      rangeInput.step = max - min <= 20 ? "0.1" : "0.5";
+      rangeInput.value = String(initVal);
+      rangeInput.setAttribute("aria-label", prettyName);
+
+      const readout = document.createElement("span");
+      readout.className = "qsys-fader-readout";
+      const formatVal = (v) =>
+        `${Number.isInteger(v) ? v : v.toFixed(1)}${unit ? ` ${unit}` : ""}`;
+      readout.textContent = formatVal(Number(initVal));
+
+      rangeInput.addEventListener("input", () => {
+        readout.textContent = formatVal(Number(rangeInput.value));
+      });
+
+      faderWrap.appendChild(rangeInput);
+      faderWrap.appendChild(readout);
+      el.appendChild(faderWrap);
+    } else if (styleName === "Button") {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "qsys-btn-widget";
+      const isTrigger = meta?.button_type === "Trigger";
+      btn.textContent = c.legend || (isTrigger ? "Trigger" : prettyName);
+      btn.addEventListener("click", () => {
+        if (isTrigger) {
+          btn.classList.add("active");
+          setTimeout(() => btn.classList.remove("active"), 180);
+        } else {
+          btn.classList.toggle("active");
+        }
+      });
+      el.appendChild(btn);
+    } else if (styleName === "Led" || styleName === "Meter") {
+      const led = document.createElement("div");
+      led.className = "qsys-led-widget";
+      led.title = `${prettyName} (click to toggle indicator)`;
+      led.addEventListener("click", () => {
+        led.classList.toggle("off");
+      });
+      el.appendChild(led);
+    } else {
+      const input = document.createElement("input");
+      input.type = "text";
+      input.className = "qsys-text-widget";
+      if (c.is_disabled || meta?.kind === "Indicator") {
+        input.readOnly = true;
+      }
+      input.value =
+        meta?.default_str ||
+        (meta?.default_num !== undefined && meta?.default_num !== null
+          ? String(meta.default_num)
+          : "");
+      input.placeholder = prettyName;
+      input.setAttribute("aria-label", prettyName);
+      el.appendChild(input);
+    }
+
+    bindHoverInspector(
+      el,
+      `layout["${c.name}"]  PrettyName="${prettyName}"  Style="${styleName}"`,
+      geom,
+    );
+    canvasEl.appendChild(el);
+  }
+
+  canvasEl.style.setProperty("--canvas-w", `${maxRight}px`);
+  canvasEl.style.setProperty("--canvas-h", `${maxBottom}px`);
+}
+
+/**
+ * Scaffolds or inserts a declarative `UI.Page(...)` layout inside `get_control_layout`
+ * referencing the plugin's declared controls directly.
+ */
+function scaffoldUiLayout() {
+  if (!pyEditor) return;
+  const src = pyEditor.getValue();
+  const controls = Array.isArray(lastUiPreview?.controls) ? lastUiPreview.controls : [];
+  const pluginName = lastUiPreview?.plugin_name || "Plugin";
+
+  const fieldLines =
+    controls.length > 0
+      ? controls.slice(0, 6).map((c) => {
+          if (c.count > 1) {
+            return `                UI.Field("${c.ident}", self.${c.ident}, direction="row"),`;
+          }
+          return `                UI.Field("${c.ident}", self.${c.ident}),`;
+        })
+      : [`                # Pass your Control attributes directly (no magic strings!)`];
+
+  const methodSnippet = [
+    `    def get_control_layout(self, props):`,
+    `        layout = UI.Page(`,
+    `            "Main",`,
+    `            UI.Header("${pluginName}"),`,
+    `            UI.GroupBox(`,
+    `                "Controls",`,
+    ...fieldLines,
+    `            ),`,
+    `        )`,
+    `        return layout`,
+  ].join("\n");
+
+  if (/def\s+get_control_layout\s*\(/.test(src)) {
+    showToast("get_control_layout is already defined in this file");
+    const match = src.match(/def\s+get_control_layout\s*\(/);
+    if (match && match.index !== undefined) {
+      const line = src.slice(0, match.index).split("\n").length;
+      pyEditor.revealLineInCenter(line);
+      pyEditor.setPosition({ lineNumber: line, column: 5 });
+      pyEditor.focus();
+    }
+    return;
+  }
+
+  const nextSrc = `${src.trimEnd()}\n\n${methodSnippet}\n`;
+  pyEditor.setValue(nextSrc);
+  showToast("Inserted declarative UI.Page(...) get_control_layout()");
 }
 
 /**
@@ -846,6 +1207,38 @@ function openPathPrompt(mode, initialValue = "") {
 }
 
 function setupUIEventListeners() {
+  // Output Pane View Switcher (Split / UI Preview / Lua)
+  const outputPane = document.getElementById("output-pane");
+  const btnViewSplit = document.getElementById("btn-view-split");
+  const btnViewUi = document.getElementById("btn-view-ui");
+  const btnViewLua = document.getElementById("btn-view-lua");
+  const viewButtons = [
+    { btn: btnViewSplit, mode: "split" },
+    { btn: btnViewUi, mode: "ui" },
+    { btn: btnViewLua, mode: "lua" },
+  ];
+
+  for (const { btn, mode } of viewButtons) {
+    if (!btn) continue;
+    btn.addEventListener("click", () => {
+      if (!outputPane) return;
+      outputPane.classList.remove("mode-split", "mode-ui", "mode-lua");
+      outputPane.classList.add(`mode-${mode}`);
+      outputPane.dataset.view = mode;
+      for (const item of viewButtons) {
+        item.btn?.classList.toggle("active", item.mode === mode);
+      }
+      renderActiveUiPage();
+      if (luaEditor) {
+        requestAnimationFrame(() => luaEditor.layout());
+      }
+    });
+  }
+
+  document.getElementById("btn-scaffold-ui")?.addEventListener("click", () => {
+    scaffoldUiLayout();
+  });
+
   // Sidebar Toggle
   const btnToggleSidebar = document.getElementById("btn-toggle-sidebar");
   const sidebar = document.getElementById("sidebar");

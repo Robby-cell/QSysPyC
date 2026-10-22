@@ -1,14 +1,28 @@
+use rustc_hash::FxHashMap;
+
+use qsys_diagnostics::Diagnostics;
 use qsys_ir::*;
 use qsys_parser::ast;
 use qsys_runtime::{CallStyle, Lowering, RuntimeEnv};
 
+use crate::declarations::DeclaredControl;
 use crate::types::{ResolvedTarget, Type};
+use crate::ui_layout::{
+    extract_graphics_append, is_layout_target, is_ui_layout_expr, parse_ui_layout_expr,
+    substitute_ui_vars,
+};
 use crate::{SemanticModel, TargetKind, TruthinessStrategy, TypeMap};
 
 pub fn lower_to_ir(model: &SemanticModel) -> IRProgram {
     match &model.target {
         TargetKind::Plugin(p) => {
-            let mut lowerer = StmtLowerer::new(model, true, &p.helper_classes);
+            let mut lowerer = StmtLowerer::new(
+                model,
+                true,
+                &p.class_name,
+                &p.controls,
+                &p.helper_classes,
+            );
 
             let classes = p
                 .helper_classes
@@ -30,6 +44,7 @@ pub fn lower_to_ir(model: &SemanticModel) -> IRProgram {
                 .map(|b| IREventBinding {
                     control_id: b.control_id,
                     control_name: b.control_name.clone(),
+                    channel_index: b.channel_index,
                     member: b.member,
                     handler_id: b.handler_id,
                     handler_name: b.handler_name.clone(),
@@ -63,6 +78,7 @@ pub fn lower_to_ir(model: &SemanticModel) -> IRProgram {
                 info: p.info.clone(),
                 properties,
                 controls,
+                pages: p.pages.clone(),
                 class_name: p.class_name.clone(),
                 classes,
                 methods,
@@ -75,7 +91,13 @@ pub fn lower_to_ir(model: &SemanticModel) -> IRProgram {
         }
 
         TargetKind::TextController(c) => {
-            let mut lowerer = StmtLowerer::new(model, false, &c.helper_classes);
+            let mut lowerer = StmtLowerer::new(
+                model,
+                false,
+                &c.class_name,
+                &c.controls,
+                &c.helper_classes,
+            );
 
             let classes = c
                 .helper_classes
@@ -98,6 +120,7 @@ pub fn lower_to_ir(model: &SemanticModel) -> IRProgram {
                 .map(|b| IREventBinding {
                     control_id: b.control_id,
                     control_name: b.control_name.clone(),
+                    channel_index: b.channel_index,
                     member: b.member,
                     handler_id: b.handler_id,
                     handler_name: b.handler_name.clone(),
@@ -131,7 +154,7 @@ pub fn lower_to_ir(model: &SemanticModel) -> IRProgram {
         }
 
         TargetKind::ProceduralScript(s) => {
-            let mut lowerer = StmtLowerer::new(model, false, &s.classes);
+            let mut lowerer = StmtLowerer::new(model, false, "Script", &[], &s.classes);
 
             let classes = s
                 .classes
@@ -166,19 +189,44 @@ struct StmtLowerer<'a> {
     type_map: &'a TypeMap,
     env: &'a RuntimeEnv,
     is_plugin: bool,
+    plugin_class_name: &'a str,
+    controls: &'a [DeclaredControl],
     custom_classes: &'a [ast::ClassDef],
     current_class_base: Option<String>,
+    local_ui_vars: FxHashMap<String, ast::Expr>,
 }
 
 impl<'a> StmtLowerer<'a> {
-    fn new(model: &'a SemanticModel, is_plugin: bool, custom_classes: &'a [ast::ClassDef]) -> Self {
+    fn new(
+        model: &'a SemanticModel,
+        is_plugin: bool,
+        plugin_class_name: &'a str,
+        controls: &'a [DeclaredControl],
+        custom_classes: &'a [ast::ClassDef],
+    ) -> Self {
         Self {
             type_map: &model.type_map,
             env: &model.env,
             is_plugin,
+            plugin_class_name,
+            controls,
             custom_classes,
             current_class_base: None,
+            local_ui_vars: FxHashMap::default(),
         }
+    }
+
+    fn lower_ui_expr_to_stmt(&self, expr: &ast::Expr, span: qsys_diagnostics::Span) -> Option<IRStmt> {
+        let mut dummy_diags = Diagnostics::new();
+        let mut dummy_res = Vec::new();
+        let mut pages = parse_ui_layout_expr(
+            self.plugin_class_name,
+            expr,
+            self.controls,
+            &mut dummy_diags,
+            &mut dummy_res,
+        );
+        pages.pop().map(|page| IRStmt::EmitPageLayout { page, span })
     }
 
     fn lower_function(
@@ -219,13 +267,25 @@ impl<'a> StmtLowerer<'a> {
 
         match &stmt.kind {
             ast::StmtKind::Assign { target, value } => {
+                let sub_val = substitute_ui_vars(value, &self.local_ui_vars);
+                if is_ui_layout_expr(&sub_val) {
+                    if is_layout_target(target) {
+                        return self.lower_ui_expr_to_stmt(&sub_val, span);
+                    }
+                    if let ast::ExprKind::Ident(var_name) = &target.kind {
+                        self.local_ui_vars.insert(var_name.clone(), sub_val);
+                        return None;
+                    }
+                }
+
                 let target_ir = match &target.kind {
                     ast::ExprKind::Subscript {
                         value: sub_val,
                         index: sub_idx,
                     } => {
                         let val_ty = self.type_map.get_type(sub_val.span);
-                        let is_zero_based = matches!(val_ty, Some(Type::List(_)));
+                        let is_zero_based =
+                            matches!(val_ty, Some(Type::List(_) | Type::ControlHandle));
                         IRExpr::Index {
                             base: Box::new(self.lower_expr(sub_val)),
                             index: Box::new(self.lower_expr(sub_idx)),
@@ -329,6 +389,12 @@ impl<'a> StmtLowerer<'a> {
             }
 
             ast::StmtKind::Return(val) => {
+                if let Some(v) = val {
+                    let sub_v = substitute_ui_vars(v, &self.local_ui_vars);
+                    if is_ui_layout_expr(&sub_v) {
+                        return self.lower_ui_expr_to_stmt(&sub_v, span);
+                    }
+                }
                 let val_ir = val.as_ref().map(|v| self.lower_expr(v));
                 Some(IRStmt::Return {
                     value: val_ir,
@@ -339,6 +405,13 @@ impl<'a> StmtLowerer<'a> {
             ast::StmtKind::Break => Some(IRStmt::Break { span }),
 
             ast::StmtKind::Expr(expr) => {
+                let sub_expr = substitute_ui_vars(expr, &self.local_ui_vars);
+                if is_ui_layout_expr(&sub_expr) {
+                    return self.lower_ui_expr_to_stmt(&sub_expr, span);
+                }
+                if let Some(appended) = extract_graphics_append(&sub_expr) {
+                    return self.lower_ui_expr_to_stmt(&appended, span);
+                }
                 if let Some(raw_code) = extract_raw_lua(expr) {
                     Some(IRStmt::RawLua {
                         code: raw_code,
@@ -744,7 +817,7 @@ impl<'a> StmtLowerer<'a> {
                 let is_zero_based = match (val_ty, idx_ty) {
                     (Some(Type::Dict(_, _)), _) => false,
                     (_, Some(Type::String)) => false,
-                    (Some(Type::List(_)), _) => true,
+                    (Some(Type::List(_) | Type::ControlHandle), _) => true,
                     (Some(Type::UserInstance { .. }), _) => false,
                     _ => false,
                 };

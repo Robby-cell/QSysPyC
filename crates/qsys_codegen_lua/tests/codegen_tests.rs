@@ -360,3 +360,266 @@ n = len(items)
         "User len() is called as written:\n{lua}"
     );
 }
+
+#[test]
+fn test_declarative_ui_layout_direct_control_refs_and_multichannel() {
+    let src = r##"
+class MatrixMixer(QSysPlugin):
+    Gain = Control.Float(name="MasterGain", min=-100.0, max=20.0, default=0.0)
+    Mute = Control.Button(name="MuteAll", type="Toggle")
+    ChGain = Control.Float(name="Ch", count=3, min=-60.0, max=12.0, default=0.0)
+    Status = Control.Text(name="Status", default="Ready", type="ReadOnly")
+
+    layout = UI.Page(
+        "Mixer",
+        UI.Header("8x8 Matrix Gain Processor"),
+        UI.GroupBox("Master Section",
+            UI.Row(
+                UI.Field("Master Gain", Gain, style="Fader", size=(50, 120)),
+                UI.Field("Mute All", self.Mute, color="#ef4444"),
+                UI.Field("Status", Status, width=140),
+            ),
+        ),
+        UI.GroupBox("Channel Strips",
+            UI.Row(
+                UI.Control(ChGain, style="Knob"),
+                UI.Field("Ch 1 Direct", ChGain[0], style="Text"),
+            ),
+        ),
+    )
+"##;
+    let lua = compile_to_lua(src);
+
+    assert!(
+        lua.contains("function GetControlLayout(props)"),
+        "Must emit GetControlLayout:\n{lua}"
+    );
+    assert!(
+        lua.contains("Type = \"Header\"") && lua.contains("Text = \"8x8 Matrix Gain Processor\""),
+        "Must emit Header graphic:\n{lua}"
+    );
+    assert!(
+        lua.contains("Type = \"GroupBox\"") && lua.contains("Text = \"Master Section\""),
+        "Must emit GroupBox graphic:\n{lua}"
+    );
+    assert!(
+        lua.contains("layout[\"MasterGain\"] = {\n        PrettyName = \"Master Gain\",\n        Style = \"Fader\"")
+            && lua.contains("Size = { 50, 120 }"),
+        "Direct control reference Gain must resolve to its Q-SYS control name 'MasterGain' with custom size:\n{lua}"
+    );
+    assert!(
+        lua.contains("layout[\"MuteAll\"] = {\n        PrettyName = \"Mute All\",\n        Style = \"Button\""),
+        "self.Mute must resolve to 'MuteAll' with Button style:\n{lua}"
+    );
+    assert!(
+        lua.contains("Color = { 239, 68, 68 }"),
+        "Hex color #ef4444 must convert to RGB tuple:\n{lua}"
+    );
+    // Multi-channel control ChGain (count=3) referenced bare in UI.Control(ChGain) expands to Ch 1, Ch 2, Ch 3 with PrettyNames
+    assert!(
+        lua.contains("layout[\"Ch 2\"] = {\n        PrettyName = \"Ch 2\",\n        Style = \"Knob\""),
+        "Multi-channel control must expand to 'Ch 1', 'Ch 2', 'Ch 3' with PrettyName:\n{lua}"
+    );
+    assert!(
+        lua.contains("layout[\"Ch 3\"] = {\n        PrettyName = \"Ch 3\",\n        Style = \"Knob\""),
+        "Multi-channel control must expand to 'Ch 3' with PrettyName:\n{lua}"
+    );
+}
+
+#[test]
+fn test_declarative_multi_page_ui_layout() {
+    let src = r#"
+class MultiPagePlugin(QSysPlugin):
+    IPAddress = Control.IPAddress(name="IP", default="192.168.1.100")
+    Gain = Control.Float(name="Gain", min=-100.0, max=20.0, default=0.0)
+
+    pages = [
+        UI.Page("Setup",
+            UI.GroupBox("Connection",
+                UI.Field("Host IP", IPAddress),
+            ),
+        ),
+        UI.Page("Audio",
+            UI.GroupBox("Levels",
+                UI.Field("Output Gain", Gain, style="Fader"),
+            ),
+        ),
+    ]
+"#;
+    let lua = compile_to_lua(src);
+
+    assert!(
+        lua.contains("local PageNames = { \"Setup\", \"Audio\" }"),
+        "Must emit PageNames table:\n{lua}"
+    );
+    assert!(
+        lua.contains("function GetPages(props)"),
+        "Must emit GetPages(props):\n{lua}"
+    );
+    assert!(
+        lua.contains("if CurrentPage == \"Setup\" then"),
+        "Must emit Setup page branch:\n{lua}"
+    );
+    assert!(
+        lua.contains("elseif CurrentPage == \"Audio\" then"),
+        "Must emit Audio page branch:\n{lua}"
+    );
+    assert!(
+        lua.contains("layout[\"IP\"] = {\n            PrettyName = \"Host IP\",\n            Style = \"Text\""),
+        "Setup page must emit IP control:\n{lua}"
+    );
+    assert!(
+        lua.contains("layout[\"Gain\"] = {\n            PrettyName = \"Output Gain\",\n            Style = \"Fader\""),
+        "Audio page must emit Gain control:\n{lua}"
+    );
+}
+
+#[test]
+fn test_declarative_get_control_layout_method_return() {
+    let src = r#"
+class MethodLayoutPlugin(QSysPlugin):
+    Power = Control.Button(name="SystemPower", type="Toggle")
+
+    def get_control_layout(self):
+        return UI.Page(
+            "Main",
+            UI.Field("System Power", Power),
+        )
+"#;
+    let lua = compile_to_lua(src);
+
+    assert!(
+        lua.contains("layout[\"SystemPower\"] = {\n        PrettyName = \"System Power\",\n        Style = \"Button\""),
+        "Declarative return from get_control_layout(self) must solve layout:\n{lua}"
+    );
+}
+
+#[test]
+fn test_get_control_layout_with_layout_assignment_and_return_tuple() {
+    let src = r#"
+class MyPlugin(QSysPlugin):
+    Gain = Control.Float(name="MasterGain", min=-100.0, max=20.0, default=0.0)
+
+    def get_control_layout(self, props):
+        layout = {}
+        graphics = []
+        layout = UI.Page(
+            "Main",
+            UI.Header("Plugin Title"),
+            UI.GroupBox(
+                "Controls",
+                UI.Field("Master Gain", self.Gain, style="Fader"),
+            ),
+        )
+        return layout, graphics
+"#;
+    let lua = compile_to_lua(src);
+
+    assert!(
+        !lua.contains("UI.Page"),
+        "UI.Page must never be emitted raw into Lua:\n{lua}"
+    );
+    assert!(
+        lua.contains("Type = \"Header\"") && lua.contains("Text = \"Plugin Title\""),
+        "Must expand UI.Header into graphics table:\n{lua}"
+    );
+    assert!(
+        lua.contains("Type = \"GroupBox\"") && lua.contains("Text = \"Controls\""),
+        "Must expand UI.GroupBox into graphics table:\n{lua}"
+    );
+    assert!(
+        lua.contains("layout[\"MasterGain\"] = {"),
+        "Must expand UI.Field into layout table:\n{lua}"
+    );
+}
+
+#[test]
+fn test_hybrid_get_control_layout_with_if_branches() {
+    let src = r#"
+class HybridPlugin(QSysPlugin):
+    Gain = Control.Float(name="MasterGain", min=-100.0, max=20.0, default=0.0)
+
+    def get_control_layout(self, props):
+        layout = {}
+        graphics = []
+        if props["Simple"].Value:
+            layout = UI.Page("Main", UI.Field("Gain", self.Gain))
+        else:
+            layout = UI.Page("Main", UI.Header("Full Mode"), UI.Field("Gain", self.Gain))
+        return layout, graphics
+"#;
+    let lua = compile_to_lua(src);
+
+    assert!(
+        !lua.contains("UI.Page"),
+        "UI.Page inside if/else in get_control_layout must expand into Q-SYS tables:\n{lua}"
+    );
+    assert!(
+        lua.contains("Text = \"Full Mode\""),
+        "Else branch UI.Header must expand into graphics table:\n{lua}"
+    );
+}
+
+#[test]
+fn test_multichannel_count2_pretty_names_comprehensions_and_runtime_events() {
+    let src = r#"
+class StereoPlugin(QSysPlugin):
+    Gain = Control.Float(name="Gain", min=-100.0, max=20.0, default=0.0, count=2)
+    Mute = Control.Button(name="Mute", type="Toggle", count=2)
+
+    def get_control_layout(self, props):
+        layout = UI.Page(
+            "Main",
+            UI.Header("Stereo Channel Strip"),
+            UI.GroupBox(
+                "Gains",
+                UI.Field("Gain", self.Gain, labels=["Left Gain", "Right Gain"], direction="row"),
+            ),
+            UI.GroupBox(
+                "Mutes",
+                [UI.Field(f"Ch {i + 1} Mute", self.Mute[i]) for i in range(2)],
+            ),
+        )
+        return layout
+
+    @Gain.EventHandler
+    def on_gain(self, ctl, index):
+        self.Mute[index].Boolean = ctl.Value < -80.0
+
+    @Mute[0].EventHandler
+    def on_left_mute(self, ctl):
+        self.Gain[0].Value = -100.0
+"#;
+    let lua = compile_to_lua(src);
+
+    assert!(
+        lua.contains("layout[\"Gain 1\"] = {\n        PrettyName = \"Left Gain\""),
+        "Gain 1 must have PrettyName = 'Left Gain':\n{lua}"
+    );
+    assert!(
+        lua.contains("layout[\"Gain 2\"] = {\n        PrettyName = \"Right Gain\""),
+        "Gain 2 must have PrettyName = 'Right Gain':\n{lua}"
+    );
+    assert!(
+        lua.contains("layout[\"Mute 1\"] = {\n        PrettyName = \"Ch 1 Mute\""),
+        "Comprehension must expand Mute[0] to Mute 1 with PrettyName = 'Ch 1 Mute':\n{lua}"
+    );
+    assert!(
+        lua.contains("layout[\"Mute 2\"] = {\n        PrettyName = \"Ch 2 Mute\""),
+        "Comprehension must expand Mute[1] to Mute 2 with PrettyName = 'Ch 2 Mute':\n{lua}"
+    );
+    assert!(
+        lua.contains("for ix, ctl in ipairs(Controls[\"Gain\"]) do"),
+        "@Gain.EventHandler on count=2 control must iterate Controls['Gain']:\n{lua}"
+    );
+    assert!(
+        lua.contains("Controls[\"Mute\"][1].EventHandler = function(ctl)"),
+        "@Mute[0].EventHandler must bind 1-based Controls['Mute'][1]:\n{lua}"
+    );
+    assert!(
+        lua.contains("Controls[\"Gain\"][1].Value = (-100.0)"),
+        "self.Gain[0].Value must lower to 1-based Controls['Gain'][1].Value:\n{lua}"
+    );
+}
+
+

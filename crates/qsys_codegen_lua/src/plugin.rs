@@ -1,5 +1,8 @@
 use qsys_ir::*;
-use qsys_model::{ControlKind, PropertyKind, is_design_time_method};
+use qsys_model::{
+    ControlKind, ControlLayoutDef, GraphicItem, GraphicItemKind, PageLayout, PropertyKind,
+    is_design_time_method,
+};
 
 use crate::context::CodegenContext;
 use crate::emitter::{LuaEmitter, escape_lua_string, format_lua_float};
@@ -61,6 +64,8 @@ pub fn emit_plugin(plugin: &IRPlugin, ctx: &mut CodegenContext) -> String {
 
     if let Some(m) = plugin.methods.iter().find(|m| m.name == "get_pages") {
         emit_lifecycle_method(&mut emitter, "GetPages", m);
+    } else if !plugin.pages.is_empty() {
+        emit_get_pages(&mut emitter, &plugin.pages);
     }
 
     if let Some(m) = plugin.methods.iter().find(|m| m.name == "get_controls") {
@@ -76,7 +81,7 @@ pub fn emit_plugin(plugin: &IRPlugin, ctx: &mut CodegenContext) -> String {
     {
         emit_lifecycle_method(&mut emitter, "GetControlLayout", m);
     } else {
-        emit_get_control_layout(&mut emitter);
+        emit_get_control_layout(&mut emitter, &plugin.pages);
     }
 
     if let Some(m) = plugin.methods.iter().find(|m| m.name == "get_components") {
@@ -110,11 +115,39 @@ pub fn emit_plugin(plugin: &IRPlugin, ctx: &mut CodegenContext) -> String {
             crate::emitter::escape_lua_string(&binding.control_name)
         );
         let handler_fn = format!("{}_{}", plugin.class_name, binding.handler_name);
-        emitter.write_line(&format!("{ctl_ref}.EventHandler = function(ctl)"));
-        emitter.indent();
-        emitter.write_line(&format!("{handler_fn}(nil, ctl)"));
-        emitter.dedent();
-        emitter.write_line("end\n");
+        let ctl_count = plugin
+            .controls
+            .iter()
+            .find(|c| c.id == binding.control_id)
+            .map(|c| c.def.count)
+            .unwrap_or(1);
+
+        if let Some(ch_idx) = binding.channel_index {
+            emitter.write_line(&format!(
+                "{ctl_ref}[{}].EventHandler = function(ctl)",
+                ch_idx + 1
+            ));
+            emitter.indent();
+            emitter.write_line(&format!("{handler_fn}(nil, ctl)"));
+            emitter.dedent();
+            emitter.write_line("end\n");
+        } else if ctl_count > 1 {
+            emitter.write_line(&format!("for ix, ctl in ipairs({ctl_ref}) do"));
+            emitter.indent();
+            emitter.write_line("ctl.EventHandler = function(c)");
+            emitter.indent();
+            emitter.write_line(&format!("{handler_fn}(nil, c, ix - 1)"));
+            emitter.dedent();
+            emitter.write_line("end");
+            emitter.dedent();
+            emitter.write_line("end\n");
+        } else {
+            emitter.write_line(&format!("{ctl_ref}.EventHandler = function(ctl)"));
+            emitter.indent();
+            emitter.write_line(&format!("{handler_fn}(nil, ctl)"));
+            emitter.dedent();
+            emitter.write_line("end\n");
+        }
     }
 
     // Emit plugin initialization statements
@@ -283,14 +316,150 @@ fn emit_get_controls(emitter: &mut LuaEmitter<'_>, controls: &[IRControlBinding]
     emitter.write_line("end\n");
 }
 
-fn emit_get_control_layout(emitter: &mut LuaEmitter<'_>) {
+fn emit_get_pages(emitter: &mut LuaEmitter<'_>, pages: &[PageLayout]) {
+    let page_names: Vec<String> = pages.iter().map(|p| escape_lua_string(&p.name)).collect();
+    emitter.write_line(&format!("local PageNames = {{ {} }}", page_names.join(", ")));
+    emitter.write_line("function GetPages(props)");
+    emitter.indent();
+    emitter.write_line("local pages = {}");
+    emitter.write_line("for ix, name in ipairs(PageNames) do");
+    emitter.indent();
+    emitter.write_line("table.insert(pages, { name = name })");
+    emitter.dedent();
+    emitter.write_line("end");
+    emitter.write_line("return pages");
+    emitter.dedent();
+    emitter.write_line("end\n");
+}
+
+fn emit_get_control_layout(emitter: &mut LuaEmitter<'_>, pages: &[PageLayout]) {
     emitter.write_line("function GetControlLayout(props)");
     emitter.indent();
     emitter.write_line("local layout = {}");
     emitter.write_line("local graphics = {}");
+
+    if pages.len() == 1 {
+        emit_page_layout_body(emitter, &pages[0]);
+    } else if pages.len() > 1 {
+        emitter.write_line("local CurrentPage = PageNames[props[\"page_index\"].Value]");
+        for (idx, page) in pages.iter().enumerate() {
+            let keyword = if idx == 0 { "if" } else { "elseif" };
+            emitter.write_line(&format!(
+                "{keyword} CurrentPage == {} then",
+                escape_lua_string(&page.name)
+            ));
+            emitter.indent();
+            emit_page_layout_body(emitter, page);
+            emitter.dedent();
+        }
+        emitter.write_line("end");
+    }
+
     emitter.write_line("return layout, graphics");
     emitter.dedent();
     emitter.write_line("end\n");
+}
+
+pub(crate) fn emit_page_layout_body(emitter: &mut LuaEmitter<'_>, page: &PageLayout) {
+    for g in &page.graphics {
+        emit_graphic_item(emitter, g);
+    }
+    for ctl in &page.controls {
+        emit_control_layout_item(emitter, ctl);
+    }
+}
+
+fn emit_graphic_item(emitter: &mut LuaEmitter<'_>, g: &GraphicItem) {
+    let x = g.position.x.round() as i64;
+    let y = g.position.y.round() as i64;
+    let w = g.size.width.round() as i64;
+    let h = g.size.height.round() as i64;
+
+    emitter.write_line("table.insert(graphics, {");
+    emitter.indent();
+    match &g.kind {
+        GraphicItemKind::Header { text, font_size } => {
+            emitter.write_line("Type = \"Header\",");
+            emitter.write_line(&format!("Text = {},", escape_lua_string(text)));
+            emitter.write_line(&format!("Position = {{ {x}, {y} }},"));
+            emitter.write_line(&format!("Size = {{ {w}, {h} }},"));
+            emitter.write_line(&format!("FontSize = {font_size},"));
+            emitter.write_line("HTextAlign = \"Left\",");
+            if let Some(ref color) = g.color {
+                let (r, gr, b) = color.to_rgb_tuple();
+                emitter.write_line(&format!("Color = {{ {r}, {gr}, {b} }},"));
+            }
+        }
+        GraphicItemKind::GroupBox { text, stroke } => {
+            emitter.write_line("Type = \"GroupBox\",");
+            emitter.write_line(&format!("Text = {},", escape_lua_string(text)));
+            emitter.write_line(&format!("Position = {{ {x}, {y} }},"));
+            emitter.write_line(&format!("Size = {{ {w}, {h} }},"));
+            emitter.write_line(&format!("StrokeWidth = {stroke},"));
+            emitter.write_line("CornerRadius = 4,");
+            emitter.write_line("HTextAlign = \"Left\",");
+            if let Some(ref fill) = g.color {
+                let (r, gr, b) = fill.to_rgb_tuple();
+                emitter.write_line(&format!("Fill = {{ {r}, {gr}, {b} }},"));
+            }
+        }
+        GraphicItemKind::Label {
+            text,
+            font_size,
+            h_align,
+        } => {
+            emitter.write_line("Type = \"Label\",");
+            emitter.write_line(&format!("Text = {},", escape_lua_string(text)));
+            emitter.write_line(&format!("Position = {{ {x}, {y} }},"));
+            emitter.write_line(&format!("Size = {{ {w}, {h} }},"));
+            emitter.write_line(&format!("FontSize = {font_size},"));
+            emitter.write_line(&format!("HTextAlign = {},", escape_lua_string(h_align)));
+            if let Some(ref color) = g.color {
+                let (r, gr, b) = color.to_rgb_tuple();
+                emitter.write_line(&format!("Color = {{ {r}, {gr}, {b} }},"));
+            }
+        }
+        GraphicItemKind::Separator => {
+            emitter.write_line("Type = \"Header\",");
+            emitter.write_line("Text = \"\",");
+            emitter.write_line(&format!("Position = {{ {x}, {y} }},"));
+            emitter.write_line(&format!("Size = {{ {w}, {h} }},"));
+        }
+    }
+    emitter.dedent();
+    emitter.write_line("})");
+}
+
+fn emit_control_layout_item(emitter: &mut LuaEmitter<'_>, ctl: &ControlLayoutDef) {
+    let x = ctl.position.x.round() as i64;
+    let y = ctl.position.y.round() as i64;
+    let w = ctl.size.width.round() as i64;
+    let h = ctl.size.height.round() as i64;
+
+    emitter.write_line(&format!("layout[{}] = {{", escape_lua_string(&ctl.name)));
+    emitter.indent();
+    let pretty = ctl.pretty_name.as_deref().unwrap_or(&ctl.name);
+    emitter.write_line(&format!("PrettyName = {},", escape_lua_string(pretty)));
+    if let Some(ref style) = ctl.style {
+        emitter.write_line(&format!("Style = {},", escape_lua_string(style.as_str())));
+    }
+    emitter.write_line(&format!("Position = {{ {x}, {y} }},"));
+    emitter.write_line(&format!("Size = {{ {w}, {h} }},"));
+    if let Some(ref color) = ctl.color {
+        let (r, g, b) = color.to_rgb_tuple();
+        emitter.write_line(&format!("Color = {{ {r}, {g}, {b} }},"));
+    }
+    if let Some(ref legend) = ctl.legend {
+        emitter.write_line(&format!("Legend = {},", escape_lua_string(legend)));
+    }
+    if let Some(margin) = ctl.margin {
+        emitter.write_line(&format!("Margin = {},", margin.round() as i64));
+    }
+    if ctl.is_disabled {
+        emitter.write_line("IsReadOnly = true,");
+    }
+    emitter.dedent();
+    emitter.write_line("}");
 }
 
 fn emit_lifecycle_method(emitter: &mut LuaEmitter<'_>, lua_fn_name: &str, method: &IRFunction) {

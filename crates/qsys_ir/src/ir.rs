@@ -2,7 +2,7 @@ use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
 use qsys_diagnostics::Span;
-use qsys_model::{ControlDef, ControlMember, PluginInfo, PropertyDef};
+use qsys_model::{ControlDef, ControlMember, PageLayout, PluginInfo, PropertyDef};
 
 pub use crate::id::{ControlId, FunctionId, PropertyId, SymbolId};
 
@@ -41,6 +41,7 @@ pub struct IRPlugin {
     pub info: PluginInfo,
     pub properties: Vec<IRPropertyBinding>,
     pub controls: Vec<IRControlBinding>,
+    pub pages: Vec<PageLayout>,
     pub class_name: String,
     pub classes: Vec<IRClass>,
     pub methods: Vec<IRFunction>,
@@ -69,6 +70,7 @@ pub struct IRScript {
 pub struct IREventBinding {
     pub control_id: ControlId,
     pub control_name: String,
+    pub channel_index: Option<usize>,
     pub member: ControlMember,
     pub handler_id: FunctionId,
     pub handler_name: String,
@@ -130,6 +132,11 @@ pub enum IRStmt {
     },
     RawLua {
         code: String,
+        span: Span,
+    },
+    /// Emits solved Q-SYS `graphics` and `layout` table entries for a `PageLayout`.
+    EmitPageLayout {
+        page: PageLayout,
         span: Span,
     },
 

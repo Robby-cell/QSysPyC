@@ -507,7 +507,7 @@ impl Analyzer {
                 return items;
             }
 
-            // B4. Runtime globals bound to object types (`Timer.`, `UdpSocket.`, `math.`, `qsys.`)
+            // B4. Runtime globals bound to object types (`Timer.`, `UdpSocket.`, `UI.`, `math.`, `qsys.`)
             if !is_local_symbol(&model, receiver)
                 && let Some(ty) = model.env.object_type_of_global(receiver)
             {
@@ -1475,6 +1475,22 @@ fn top_level_completions(
             is_snippet: false,
         },
         LspCompletion {
+            label: "UI".to_string(),
+            kind: "Class".to_string(),
+            detail: "Q-SYS Declarative UI Layout namespace".to_string(),
+            documentation: "Build Q-SYS `GetControlLayout` and `GetPages` declaratively (`UI.Page`, `UI.GroupBox`, `UI.Row`, `UI.Col`, `UI.Field`, `UI.Control`, `UI.Header`, `UI.Label`).".to_string(),
+            insert_text: "UI".to_string(),
+            is_snippet: false,
+        },
+        LspCompletion {
+            label: "layout = UI.Page(...)".to_string(),
+            kind: "Snippet".to_string(),
+            detail: "Declarative Q-SYS Control Layout".to_string(),
+            documentation: "Defines the visual control panel layout using QSysPy's HTML/Flexbox-like UI tree.".to_string(),
+            insert_text: "layout = UI.Page(\n    \"${1:Main}\",\n    UI.Header(\"${2:Plugin Title}\"),\n    UI.GroupBox(\n        \"${3:Controls}\",\n        ${0}\n    ),\n)".to_string(),
+            is_snippet: true,
+        },
+        LspCompletion {
             label: "self".to_string(),
             kind: "Variable".to_string(),
             detail: "Plugin / Controller instance".to_string(),
@@ -1501,6 +1517,17 @@ fn top_level_completions(
     ];
 
     for ctl in controls {
+        items.push(LspCompletion {
+            label: ctl.ident.clone(),
+            kind: "Field".to_string(),
+            detail: format!("(control) {} -> Controls[\"{}\"]", ctl.ident, ctl.def.name),
+            documentation: format!(
+                "Direct reference to declared control `{}` (`Controls[\"{}\"]`) for use in `UI.Control`, `UI.Field`, `UI.Row`, or `@EventHandler`.",
+                ctl.ident, ctl.def.name
+            ),
+            insert_text: ctl.ident.clone(),
+            is_snippet: false,
+        });
         items.push(LspCompletion {
             label: format!("self.{}", ctl.ident),
             kind: "Field".to_string(),
@@ -1778,7 +1805,6 @@ fn find_enclosing_call(src: &str, cursor_offset: usize) -> Option<(String, usize
                     return None;
                 }
             }
-            b'\n' if depth == 0 => break,
             _ => {}
         }
     }
