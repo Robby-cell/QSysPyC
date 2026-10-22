@@ -86,11 +86,29 @@ pub fn resolve_event_decorator(
         _ => return None,
     };
 
-    let (qsys_control_id, qsys_control_name, ctl_count) = match scope_stack.lookup(ctl_name) {
-        Some(sym) => {
-            if let SymbolKind::Control { id, def } = &sym.kind {
-                (*id, def.name.clone(), def.count)
-            } else {
+    let (qsys_control_id, qsys_control_name, ctl_count, has_prop_count) =
+        match scope_stack.lookup(ctl_name) {
+            Some(sym) => {
+                if let SymbolKind::Control { id, def } = &sym.kind {
+                    (
+                        *id,
+                        def.name.clone(),
+                        def.count,
+                        def.count_property.is_some(),
+                    )
+                } else {
+                    diagnostics.report(
+                        DiagnosticKind::UnknownControlMember {
+                            control_name: ctl_name.to_string(),
+                            member: member_name.to_string(),
+                            candidates: vec![],
+                        },
+                        decorator.span,
+                    );
+                    return None;
+                }
+            }
+            None => {
                 diagnostics.report(
                     DiagnosticKind::UnknownControlMember {
                         control_name: ctl_name.to_string(),
@@ -101,19 +119,7 @@ pub fn resolve_event_decorator(
                 );
                 return None;
             }
-        }
-        None => {
-            diagnostics.report(
-                DiagnosticKind::UnknownControlMember {
-                    control_name: ctl_name.to_string(),
-                    member: member_name.to_string(),
-                    candidates: vec![],
-                },
-                decorator.span,
-            );
-            return None;
-        }
-    };
+        };
 
     let channel_index = if let Some(idx_expr) = subscript_expr {
         let Some(idx_val) = eval_constant(idx_expr).and_then(|c| c.as_i64()) else {
@@ -126,7 +132,7 @@ pub fn resolve_event_decorator(
             );
             return None;
         };
-        if idx_val < 0 || (idx_val as usize) >= ctl_count {
+        if idx_val < 0 || (!has_prop_count && (idx_val as usize) >= ctl_count) {
             diagnostics.report(
                 DiagnosticKind::InvalidDeclarationArgument {
                     name: ctl_name.to_string(),

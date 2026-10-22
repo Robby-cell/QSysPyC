@@ -75,8 +75,10 @@ class Control:
         min: float = 0.0,
         max: float = 1.0,
         default: float = 0.0,
+        unit: ControlUnit = "Float",
         pins: PinStyle = "Both",
-        count: int = 1,
+        user_pin: bool = True,
+        count: int | PropertyHandle = 1,
     ) -> ControlHandle:
         """Continuous float control (Knob or continuous slider)."""
         ...
@@ -87,8 +89,10 @@ class Control:
         min: float = 0.0,
         max: float = 1.0,
         default: float = 0.0,
+        unit: ControlUnit = "Float",
         pins: PinStyle = "Both",
-        count: int = 1,
+        user_pin: bool = True,
+        count: int | PropertyHandle = 1,
     ) -> ControlHandle:
         """Rotary continuous knob control."""
         ...
@@ -99,8 +103,10 @@ class Control:
         min: float = 0.0,
         max: float = 1.0,
         default: float = 0.0,
+        unit: ControlUnit = "Float",
         pins: PinStyle = "Both",
-        count: int = 1,
+        user_pin: bool = True,
+        count: int | PropertyHandle = 1,
     ) -> ControlHandle:
         """Linear fader slider control."""
         ...
@@ -110,7 +116,8 @@ class Control:
         name: str | None = None,
         type: ButtonType = "Momentary",
         pins: PinStyle = "Both",
-        count: int = 1,
+        user_pin: bool = True,
+        count: int | PropertyHandle = 1,
     ) -> ControlHandle:
         """Push button control with configurable behavior (Momentary, Toggle, Trigger)."""
         ...
@@ -120,7 +127,8 @@ class Control:
         name: str | None = None,
         type: ButtonType = "Toggle",
         pins: PinStyle = "Both",
-        count: int = 1,
+        user_pin: bool = True,
+        count: int | PropertyHandle = 1,
     ) -> ControlHandle:
         """Binary toggle button control."""
         ...
@@ -129,8 +137,10 @@ class Control:
     def Text(
         name: str | None = None,
         default: str = "",
+        type: TextType = "Text",
         pins: PinStyle = "Both",
-        count: int = 1,
+        user_pin: bool = True,
+        count: int | PropertyHandle = 1,
     ) -> ControlHandle:
         """Text display or input box control."""
         ...
@@ -138,10 +148,34 @@ class Control:
     @staticmethod
     def Indicator(
         name: str | None = None,
+        unit: ControlUnit = "Float",
         pins: PinStyle = "Both",
-        count: int = 1,
+        user_pin: bool = True,
+        count: int | PropertyHandle = 1,
     ) -> ControlHandle:
         """Read-only LED or meter display indicator."""
+        ...
+
+    @staticmethod
+    def IPAddress(
+        name: str | None = None,
+        default: str = "255.255.255.255",
+        pins: PinStyle = "Both",
+        user_pin: bool = True,
+        count: int | PropertyHandle = 1,
+    ) -> ControlHandle:
+        """Q-SYS IP Address text control."""
+        ...
+
+    @staticmethod
+    def MACAddress(
+        name: str | None = None,
+        default: str = "00:00:00:00:00:00",
+        pins: PinStyle = "Both",
+        user_pin: bool = True,
+        count: int | PropertyHandle = 1,
+    ) -> ControlHandle:
+        """Q-SYS MAC Address text control."""
         ...
 
 class PropertyHandle:

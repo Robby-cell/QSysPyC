@@ -121,6 +121,7 @@ fn test_layout_and_graphic_definitions() {
         position: Position::new(0.0, 0.0),
         size: Size::new(300.0, 40.0),
         color: Some(Color::rgb(30, 30, 30)),
+        skip_lua_emit: false,
     };
 
     assert_eq!(header.position.x, 0.0);

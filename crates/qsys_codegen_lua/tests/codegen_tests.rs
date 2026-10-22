@@ -625,3 +625,100 @@ class StereoPlugin(QSysPlugin):
         "self.Gain[0].Value must lower to 1-based Controls['Gain'][1].Value:\n{lua}"
     );
 }
+
+#[test]
+fn test_property_driven_control_count_handles_1_vs_2_plus() {
+    let src = r#"
+class DynamicInputPlugin(QSysPlugin):
+    NumInputs = Property.Integer("number of inputs", default=4, min=1, max=16)
+
+    Inputs = Control.Fader(
+        name="inputs",
+        min=-100.0,
+        max=12.0,
+        default=0.0,
+        unit="dB",
+        count=NumInputs,
+    )
+    Mutes = Control.Boolean(
+        name="mutes",
+        type="Toggle",
+        count=props["number of inputs"].Value,
+    )
+
+    layout = UI.Page(
+        "Main",
+        UI.GroupBox(
+            "Input Strip",
+            UI.Field("Input {i}", Inputs, direction="row"),
+            UI.Field("Ch 1 Mute", Mutes[0]),
+            UI.Field("Ch 2 Mute", Mutes[1]),
+        ),
+    )
+
+    @Inputs.EventHandler
+    def on_input(self, ctl, index):
+        self.Mutes[index].Boolean = ctl.Value <= -100.0
+
+    @Mutes[0].EventHandler
+    def on_first_mute(self, ctl):
+        for inp in self.Inputs:
+            inp.Value = 0.0
+        total = len(self.Inputs)
+        print(total)
+"#;
+    let lua = compile_to_lua(src);
+
+    // 1. GetControls must emit `Count = props["number of inputs"].Value`
+    assert!(
+        lua.contains("Count = props[\"number of inputs\"].Value,"),
+        "GetControls must emit property-driven Count:\n{lua}"
+    );
+
+    // 2. GetControlLayout must emit dynamic `for i = 1, props["number of inputs"].Value do`
+    //    and branch on `== 1` ("inputs") vs `>= 2` ("inputs " .. tostring(i))
+    assert!(
+        lua.contains("for i = 1, props[\"number of inputs\"].Value do"),
+        "GetControlLayout must loop 1..props['number of inputs'].Value:\n{lua}"
+    );
+    assert!(
+        lua.contains("local ctl_key = (props[\"number of inputs\"].Value == 1) and \"inputs\" or (\"inputs \" .. tostring(i))"),
+        "GetControlLayout must use 'inputs' when count == 1 and 'inputs i' when count >= 2:\n{lua}"
+    );
+
+    // 3. Explicitly indexed channels in UI layout: ch 1 branches on `== 1`, ch 2 guards `>= 2`
+    assert!(
+        lua.contains(
+            "layout[(props[\"number of inputs\"].Value == 1) and \"mutes\" or \"mutes 1\"] = {"
+        ),
+        "Explicitly indexed channel 0 must branch on count == 1 vs >= 2:\n{lua}"
+    );
+    assert!(
+        lua.contains(
+            "if props[\"number of inputs\"].Value >= 2 then\n        layout[\"mutes 2\"] = {"
+        ),
+        "Explicitly indexed channel >= 1 must be guarded by count >= ch:\n{lua}"
+    );
+
+    // 4. Runtime @Inputs.EventHandler must respect `Properties["number of inputs"].Value == 1` vs `>= 2`
+    assert!(
+        lua.contains("if Properties[\"number of inputs\"].Value == 1 then\n        Controls[\"inputs\"].EventHandler = function(c)\n            DynamicInputPlugin_on_input(nil, c, 0)\n        end\n    else\n        for ix, ctl in ipairs(Controls[\"inputs\"]) do"),
+        "Runtime @Inputs.EventHandler must handle count == 1 vs >= 2:\n{lua}"
+    );
+
+    // 5. Runtime indexing `self.Mutes[index]` must respect `== 1` vs `>= 2`
+    assert!(
+        lua.contains("((Properties[\"number of inputs\"].Value == 1) and Controls[\"mutes\"] or Controls[\"mutes\"][(index) + 1]).Boolean"),
+        "Runtime indexing on property-counted control must handle count == 1 vs >= 2:\n{lua}"
+    );
+
+    // 6. Runtime `for inp in self.Inputs:` and `len(self.Inputs)` must respect `== 1` vs `>= 2`
+    assert!(
+        lua.contains("for _, inp in ipairs((Properties[\"number of inputs\"].Value == 1) and { Controls[\"inputs\"] } or Controls[\"inputs\"]) do"),
+        "Runtime iteration on property-counted control must handle count == 1 vs >= 2:\n{lua}"
+    );
+    assert!(
+        lua.contains("local total = Properties[\"number of inputs\"].Value"),
+        "len() on property-counted control must use Properties[...].Value:\n{lua}"
+    );
+}

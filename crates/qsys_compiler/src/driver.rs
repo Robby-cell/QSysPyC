@@ -255,6 +255,14 @@ fn build_ui_preview(
                 margin: None,
                 read_only: false,
                 invisible: false,
+                count_property: ctl.def.count_property.clone(),
+                base_control_name: None,
+                channel_index: None,
+                dynamic_label_template: None,
+                dynamic_pretty_template: None,
+                dynamic_legend_template: None,
+                is_dynamic_repeat_head: false,
+                skip_lua_emit: false,
             }));
         } else {
             let mut row_items = Vec::new();
@@ -272,6 +280,14 @@ fn build_ui_preview(
                     margin: None,
                     read_only: false,
                     invisible: false,
+                    count_property: ctl.def.count_property.clone(),
+                    base_control_name: Some(ctl.def.name.clone()),
+                    channel_index: Some(ch),
+                    dynamic_label_template: None,
+                    dynamic_pretty_template: None,
+                    dynamic_legend_template: None,
+                    is_dynamic_repeat_head: false,
+                    skip_lua_emit: false,
                 }));
             }
             group_children.push(UiNode::Row {

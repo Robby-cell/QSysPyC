@@ -751,7 +751,7 @@ impl<'a> UiParserCtx<'a> {
             .and_then(|c| c.as_i64());
 
         let effective_idx = if let Some(i) = kwarg_idx {
-            if i < 0 || (i as usize) >= ctl.def.count {
+            if i < 0 || (ctl.def.count_property.is_none() && (i as usize) >= ctl.def.count) {
                 self.diagnostics.report(
                     DiagnosticKind::InvalidDeclarationArgument {
                         name: ctl.ident.clone(),
@@ -772,8 +772,8 @@ impl<'a> UiParserCtx<'a> {
             subscript_idx
         };
 
-        // Single-channel control (`count == 1`)
-        if ctl.def.count == 1 {
+        // Static single-channel control (`count == 1` and not property-driven)
+        if ctl.def.count == 1 && ctl.def.count_property.is_none() {
             let resolved_pretty = pretty_name
                 .or_else(|| label_override.clone())
                 .or_else(|| Some(ctl.def.name.clone()));
@@ -790,10 +790,18 @@ impl<'a> UiParserCtx<'a> {
                 margin,
                 read_only,
                 invisible,
+                count_property: None,
+                base_control_name: None,
+                channel_index: None,
+                dynamic_label_template: None,
+                dynamic_pretty_template: None,
+                dynamic_legend_template: None,
+                is_dynamic_repeat_head: false,
+                skip_lua_emit: false,
             })];
         }
 
-        // Multi-channel control with a specific 0-based channel index (`ChGain[0]`)
+        // Multi-channel or property-counted control with a specific 0-based channel index (`ChGain[0]`)
         if let Some(idx) = effective_idx {
             let ch = idx + 1;
             let qsys_key = format!("{} {}", ctl.def.name, ch);
@@ -815,28 +823,62 @@ impl<'a> UiParserCtx<'a> {
                 margin,
                 read_only,
                 invisible,
+                count_property: ctl.def.count_property.clone(),
+                base_control_name: Some(ctl.def.name.clone()),
+                channel_index: Some(ch),
+                dynamic_label_template: None,
+                dynamic_pretty_template: None,
+                dynamic_legend_template: None,
+                is_dynamic_repeat_head: false,
+                skip_lua_emit: false,
             })];
         }
 
-        // Multi-channel control referenced as a group (`count > 1` and no index specified):
-        // Automatically expand all `1..=count` channels!
+        // Multi-channel or property-counted control referenced as a group (no index specified):
+        // Automatically expand `1..=count` channels for preview, and if `count_property` is set,
+        // mark channel 1 as a dynamic repeat head for `for i = 1, props["..."].Value do` in Lua!
         let explicit_labels = get_kwarg_str_list(kwargs, "labels");
         let explicit_pretty_names = get_kwarg_str_list(kwargs, "pretty_names");
-        let mut expanded = Vec::with_capacity(ctl.def.count);
-        for ch in 1..=ctl.def.count {
-            let qsys_key = format!("{} {}", ctl.def.name, ch);
+        let has_dynamic_repeat = ctl.def.count_property.is_some()
+            && explicit_labels.is_none()
+            && explicit_pretty_names.is_none();
+        let dyn_pretty_tmpl = pretty_name
+            .clone()
+            .or_else(|| label_override.clone())
+            .unwrap_or_else(|| ctl.def.name.clone());
+
+        let preview_count = ctl.def.count.max(1);
+        let mut expanded = Vec::with_capacity(preview_count);
+        for ch in 1..=preview_count {
+            let qsys_key = if preview_count == 1 {
+                ctl.def.name.clone()
+            } else {
+                format!("{} {}", ctl.def.name, ch)
+            };
             let ch_label = explicit_labels
                 .as_ref()
                 .and_then(|list| list.get(ch - 1).cloned())
                 .or_else(|| {
-                    label_override
-                        .as_ref()
-                        .map(|lbl| format_channel_surface(lbl, ch))
+                    label_override.as_ref().map(|lbl| {
+                        if preview_count == 1 && !lbl.contains("{i}") && !lbl.contains("{ch}") {
+                            lbl.clone()
+                        } else {
+                            format_channel_surface(lbl, ch)
+                        }
+                    })
                 });
             let ch_pretty = explicit_pretty_names
                 .as_ref()
                 .and_then(|list| list.get(ch - 1).cloned())
-                .or_else(|| pretty_name.as_ref().map(|p| format_channel_surface(p, ch)))
+                .or_else(|| {
+                    pretty_name.as_ref().map(|p| {
+                        if preview_count == 1 && !p.contains("{i}") && !p.contains("{ch}") {
+                            p.clone()
+                        } else {
+                            format_channel_surface(p, ch)
+                        }
+                    })
+                })
                 .or_else(|| ch_label.clone())
                 .or_else(|| Some(qsys_key.clone()));
             let ch_legend = legend.as_ref().map(|l| format_channel_surface(l, ch));
@@ -854,6 +896,26 @@ impl<'a> UiParserCtx<'a> {
                 margin,
                 read_only,
                 invisible,
+                count_property: ctl.def.count_property.clone(),
+                base_control_name: Some(ctl.def.name.clone()),
+                channel_index: Some(ch),
+                dynamic_label_template: if has_dynamic_repeat && ch == 1 {
+                    label_override.clone()
+                } else {
+                    None
+                },
+                dynamic_pretty_template: if has_dynamic_repeat && ch == 1 {
+                    Some(dyn_pretty_tmpl.clone())
+                } else {
+                    None
+                },
+                dynamic_legend_template: if has_dynamic_repeat && ch == 1 {
+                    legend.clone()
+                } else {
+                    None
+                },
+                is_dynamic_repeat_head: has_dynamic_repeat && ch == 1,
+                skip_lua_emit: has_dynamic_repeat && ch > 1,
             }));
         }
 
@@ -950,7 +1012,9 @@ impl<'a> UiParserCtx<'a> {
                     );
                     return None;
                 };
-                if idx_val < 0 || (idx_val as usize) >= ctl.def.count {
+                if idx_val < 0
+                    || (ctl.def.count_property.is_none() && (idx_val as usize) >= ctl.def.count)
+                {
                     self.diagnostics.report(
                         DiagnosticKind::InvalidDeclarationArgument {
                             name: ctl.ident.clone(),

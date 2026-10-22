@@ -130,6 +130,8 @@ pub struct ControlDef {
     pub name: String,
     pub kind: ControlKind,
     pub count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count_property: Option<String>,
     pub pin_style: PinStyle,
     pub user_pin: bool,
 }
@@ -140,6 +142,7 @@ impl ControlDef {
             name: name.into(),
             kind,
             count: 1,
+            count_property: None,
             pin_style: PinStyle::Both,
             user_pin: true,
         }
@@ -197,6 +200,11 @@ impl ControlDef {
 
     pub fn with_count(mut self, count: usize) -> Self {
         self.count = count;
+        self
+    }
+
+    pub fn with_count_property(mut self, count_property: Option<String>) -> Self {
+        self.count_property = count_property;
         self
     }
 

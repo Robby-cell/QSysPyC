@@ -170,6 +170,7 @@ pub struct ExtractedDeclarations {
     pub plugin_info: PluginInfo,
     pub pages: Vec<PageLayout>,
     pub ui_control_resolutions: Vec<(Span, ControlId)>,
+    pub control_property_resolutions: Vec<(Span, PropertyId)>,
     pub remaining_statements: Vec<ast::Stmt>,
 }
 
@@ -181,6 +182,7 @@ pub fn extract_class_declarations(
     let mut declarations = ExtractedDeclarations::default();
     let mut seen_controls = FxHashSet::default();
     let mut seen_properties = FxHashSet::default();
+    let mut pending_controls: Vec<(String, ast::Expr, Span)> = Vec::new();
     let mut pending_ui_exprs: Vec<ast::Expr> = Vec::new();
 
     declarations.plugin_info.name = class.name.clone();
@@ -201,24 +203,8 @@ pub fn extract_class_declarations(
                     continue;
                 }
 
-                if let Some(control_def) =
-                    try_parse_control(&var_name, value, stmt.span, diagnostics)
-                {
-                    if !seen_controls.insert(var_name.clone()) {
-                        diagnostics.report(
-                            DiagnosticKind::DuplicateControlDeclaration {
-                                name: var_name.clone(),
-                            },
-                            stmt.span,
-                        );
-                    } else {
-                        let id = scope_stack.alloc_control_id();
-                        declarations.controls.push(DeclaredControl {
-                            id,
-                            ident: var_name.clone(),
-                            def: control_def,
-                        });
-                    }
+                if is_control_decl_expr(value) {
+                    pending_controls.push((var_name, value.clone(), stmt.span));
                     continue;
                 }
 
@@ -262,6 +248,34 @@ pub fn extract_class_declarations(
         }
     }
 
+    // Parse Control.* declarations now that all Property.* declarations are available
+    for (var_name, value, span) in pending_controls {
+        if let Some(control_def) = try_parse_control(
+            &var_name,
+            &value,
+            span,
+            &declarations.properties,
+            &mut declarations.control_property_resolutions,
+            diagnostics,
+        ) {
+            if !seen_controls.insert(var_name.clone()) {
+                diagnostics.report(
+                    DiagnosticKind::DuplicateControlDeclaration {
+                        name: var_name.clone(),
+                    },
+                    span,
+                );
+            } else {
+                let id = scope_stack.alloc_control_id();
+                declarations.controls.push(DeclaredControl {
+                    id,
+                    ident: var_name,
+                    def: control_def,
+                });
+            }
+        }
+    }
+
     // Second pass: resolve declarative UI.* trees now that all controls are registered
     for ui_expr in &pending_ui_exprs {
         let solved_pages = parse_ui_layout_expr(
@@ -297,10 +311,127 @@ pub fn extract_class_declarations(
     declarations
 }
 
+fn is_control_decl_expr(expr: &ast::Expr) -> bool {
+    matches!(
+        &expr.kind,
+        ast::ExprKind::Call { callee, .. }
+            if matches!(
+                &callee.kind,
+                ast::ExprKind::Attribute { value, .. }
+                    if matches!(&value.kind, ast::ExprKind::Ident(obj) if obj == "Control")
+            )
+    )
+}
+
+fn resolve_count_arg(
+    val: &ast::Expr,
+    control_name: &str,
+    properties: &[DeclaredProperty],
+    prop_resolutions: &mut Vec<(Span, PropertyId)>,
+    diagnostics: &mut Diagnostics,
+) -> Option<(usize, Option<String>)> {
+    if let Some(c) = eval_constant(val).and_then(|c| c.as_i64()) {
+        if c > 0 {
+            return Some((c as usize, None));
+        }
+        diagnostics.report(
+            DiagnosticKind::InvalidDeclarationArgument {
+                name: control_name.to_string(),
+                message: "'count' must be a positive integer or a Property.Integer".to_string(),
+            },
+            val.span,
+        );
+        return None;
+    }
+
+    let mut prop_ident_opt: Option<&str> = None;
+    let mut prop_key_opt: Option<String> = None;
+
+    let mut target = val;
+    if let ast::ExprKind::Attribute { value, attr } = &target.kind
+        && attr == "Value"
+    {
+        target = value;
+    }
+
+    match &target.kind {
+        ast::ExprKind::Ident(id) => {
+            prop_ident_opt = Some(id.as_str());
+        }
+        ast::ExprKind::Attribute { value, attr } if matches!(&value.kind, ast::ExprKind::Ident(s) if s == "self") =>
+        {
+            prop_ident_opt = Some(attr.as_str());
+        }
+        ast::ExprKind::Subscript { value, index } if matches!(&value.kind, ast::ExprKind::Ident(s) if s == "props" || s == "Properties") => {
+            if let Some(s) = eval_constant(index).and_then(|c| c.as_str().map(String::from)) {
+                prop_key_opt = Some(s);
+            }
+        }
+        _ => {}
+    }
+
+    if let Some(prop_ident) = prop_ident_opt
+        && let Some(prop) = properties
+            .iter()
+            .find(|p| p.ident == prop_ident || p.def.name == prop_ident)
+    {
+        prop_resolutions.push((val.span, prop.id));
+        if let qsys_model::PropertyKind::Integer { default, .. } = &prop.def.kind {
+            return Some(((*default).max(1) as usize, Some(prop.def.name.clone())));
+        }
+        diagnostics.report(
+            DiagnosticKind::InvalidDeclarationArgument {
+                name: control_name.to_string(),
+                message: format!(
+                    "Property '{}' used for 'count' must be a Property.Integer",
+                    prop.ident
+                ),
+            },
+            val.span,
+        );
+        return None;
+    }
+
+    if let Some(prop_key) = prop_key_opt {
+        if let Some(prop) = properties
+            .iter()
+            .find(|p| p.def.name == prop_key || p.ident == prop_key)
+        {
+            prop_resolutions.push((val.span, prop.id));
+            if let qsys_model::PropertyKind::Integer { default, .. } = &prop.def.kind {
+                return Some(((*default).max(1) as usize, Some(prop.def.name.clone())));
+            }
+            diagnostics.report(
+                DiagnosticKind::InvalidDeclarationArgument {
+                    name: control_name.to_string(),
+                    message: format!(
+                        "Property '{}' used for 'count' must be a Property.Integer",
+                        prop.def.name
+                    ),
+                },
+                val.span,
+            );
+            return None;
+        }
+        return Some((1, Some(prop_key)));
+    }
+
+    diagnostics.report(
+        DiagnosticKind::InvalidDeclarationArgument {
+            name: control_name.to_string(),
+            message: "'count' must be a positive integer or a Property.Integer".to_string(),
+        },
+        val.span,
+    );
+    None
+}
+
 fn try_parse_control(
     var_name: &str,
     expr: &ast::Expr,
     span: Span,
+    properties: &[DeclaredProperty],
+    prop_resolutions: &mut Vec<(Span, PropertyId)>,
     diagnostics: &mut Diagnostics,
 ) -> Option<ControlDef> {
     let (kind_str, args, kwargs) = match &expr.kind {
@@ -358,21 +489,15 @@ fn try_parse_control(
         },
     };
 
-    let count = match kwargs.iter().find(|(k, _)| k == "count") {
-        Some((_, val)) => match eval_constant(val).and_then(|c| c.as_i64()) {
-            Some(c) if c > 0 => c as usize,
-            _ => {
-                diagnostics.report(
-                    DiagnosticKind::InvalidDeclarationArgument {
-                        name: control_name.clone(),
-                        message: "'count' must be a positive integer".to_string(),
-                    },
-                    val.span,
-                );
-                return None;
-            }
-        },
-        None => 1,
+    let (count, count_property) = match kwargs.iter().find(|(k, _)| k == "count") {
+        Some((_, val)) => resolve_count_arg(
+            val,
+            &control_name,
+            properties,
+            prop_resolutions,
+            diagnostics,
+        )?,
+        None => (1, None),
     };
 
     let pin_style = match kwargs.iter().find(|(k, _)| k == "pins") {
@@ -652,7 +777,8 @@ fn try_parse_control(
 
     let mut def = ControlDef::new(control_name, kind)
         .with_pin_style(pin_style)
-        .with_user_pin(user_pin);
+        .with_user_pin(user_pin)
+        .with_count_property(count_property);
     if count > 1 {
         def = def.with_count(count);
     }

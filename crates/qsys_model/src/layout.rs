@@ -154,6 +154,24 @@ impl ControlStyle {
     }
 }
 
+/// Specification for emitting a dynamic `for i = 1, props["..."].Value do` loop
+/// in `GetControlLayout(props)` when a control's `count` is driven by a `Property`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DynamicRepeatSpec {
+    pub count_property: String,
+    pub base_control_name: String,
+    pub label_template: Option<String>,
+    pub pretty_name_template: String,
+    pub legend_template: Option<String>,
+    pub step_x: f64,
+    pub step_y: f64,
+    pub label_offset_x: f64,
+    pub label_offset_y: f64,
+    pub label_width: f64,
+    pub label_height: f64,
+    pub label_font_size: u32,
+}
+
 /// Per-control graphical layout parameters.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ControlLayoutDef {
@@ -167,6 +185,16 @@ pub struct ControlLayoutDef {
     pub legend: Option<String>,
     pub is_disabled: bool,
     pub is_invisible: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count_property: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_control_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_index: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dynamic_repeat: Option<DynamicRepeatSpec>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub skip_lua_emit: bool,
 }
 
 impl ControlLayoutDef {
@@ -182,6 +210,11 @@ impl ControlLayoutDef {
             legend: None,
             is_disabled: false,
             is_invisible: false,
+            count_property: None,
+            base_control_name: None,
+            channel_index: None,
+            dynamic_repeat: None,
+            skip_lua_emit: false,
         }
     }
 }
@@ -211,6 +244,8 @@ pub struct GraphicItem {
     pub position: Position,
     pub size: Size,
     pub color: Option<Color>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub skip_lua_emit: bool,
 }
 
 /// A solved Q-SYS page containing positioned control layouts and static graphic elements.
@@ -251,10 +286,27 @@ pub struct UiControlSpec {
     pub margin: Option<f64>,
     pub read_only: bool,
     pub invisible: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count_property: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_control_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_index: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dynamic_label_template: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dynamic_pretty_template: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dynamic_legend_template: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_dynamic_repeat_head: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub skip_lua_emit: bool,
 }
 
 /// Declarative HTML/Flexbox-like UI node authored in Python via `UI.*`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[allow(clippy::large_enum_variant)]
 pub enum UiNode {
     Row {
         children: Vec<UiNode>,
@@ -331,6 +383,8 @@ impl UiPageSpec {
             0.0,
             0.0,
             total_width,
+            FlexDirection::Column,
+            self.gap,
             &mut controls,
             &mut graphics,
         );
@@ -443,11 +497,14 @@ fn measure_node(node: &UiNode) -> Size {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn arrange_node(
     node: &UiNode,
     x: f64,
     y: f64,
     available_w: f64,
+    parent_dir: FlexDirection,
+    parent_gap: f64,
     controls: &mut Vec<ControlLayoutDef>,
     graphics: &mut Vec<GraphicItem>,
 ) -> Size {
@@ -470,6 +527,7 @@ fn arrange_node(
                 position: Position::new(x, y),
                 size: Size::new(w, *height),
                 color: color.clone(),
+                skip_lua_emit: false,
             });
             Size::new(w, *height)
         }
@@ -493,6 +551,7 @@ fn arrange_node(
                 position: Position::new(x, y),
                 size: Size::new(w, *height),
                 color: color.clone(),
+                skip_lua_emit: false,
             });
             Size::new(w, *height)
         }
@@ -501,8 +560,9 @@ fn arrange_node(
             let def_size = spec.style.default_size();
             let ctl_w = spec.width.unwrap_or(def_size.width);
             let ctl_h = spec.height.unwrap_or(def_size.height);
+            let skip_lbl_lua = spec.skip_lua_emit || spec.is_dynamic_repeat_head;
 
-            let (ctl_x, ctl_y, total_w, total_h) = if let Some(ref lbl) = spec.label {
+            let (ctl_x, ctl_y, total_w, total_h, lbl_info) = if let Some(ref lbl) = spec.label {
                 match spec.label_placement {
                     LabelPlacement::Top => {
                         let box_w = ctl_w.max(64.0);
@@ -515,8 +575,15 @@ fn arrange_node(
                             position: Position::new(x, y),
                             size: Size::new(box_w, 18.0),
                             color: None,
+                            skip_lua_emit: skip_lbl_lua,
                         });
-                        (x, y + 20.0, box_w, ctl_h + 20.0)
+                        (
+                            x,
+                            y + 20.0,
+                            box_w,
+                            ctl_h + 20.0,
+                            Some((x, y, box_w, 18.0, 11u32)),
+                        )
                     }
                     LabelPlacement::Left { width: lbl_w } => {
                         let row_h = ctl_h.max(22.0);
@@ -530,12 +597,63 @@ fn arrange_node(
                             position: Position::new(x, lbl_y),
                             size: Size::new(lbl_w, 18.0),
                             color: None,
+                            skip_lua_emit: skip_lbl_lua,
                         });
-                        (x + lbl_w + 8.0, y, lbl_w + 8.0 + ctl_w, row_h)
+                        (
+                            x + lbl_w + 8.0,
+                            y,
+                            lbl_w + 8.0 + ctl_w,
+                            row_h,
+                            Some((x, lbl_y, lbl_w, 18.0, 12u32)),
+                        )
                     }
                 }
             } else {
-                (x, y, ctl_w, ctl_h)
+                (x, y, ctl_w, ctl_h, None)
+            };
+
+            let dynamic_repeat = if spec.is_dynamic_repeat_head
+                && let (Some(prop_name), Some(base_name)) =
+                    (&spec.count_property, &spec.base_control_name)
+            {
+                let step_x = if parent_dir == FlexDirection::Row {
+                    total_w + parent_gap
+                } else {
+                    0.0
+                };
+                let step_y = if parent_dir == FlexDirection::Column {
+                    total_h + parent_gap
+                } else {
+                    0.0
+                };
+                let (lbl_ox, lbl_oy, lbl_w, lbl_h, lbl_fs) =
+                    if let Some((lx, ly, lw, lh, lfs)) = lbl_info {
+                        (lx - ctl_x, ly - ctl_y, lw, lh, lfs)
+                    } else {
+                        (0.0, 0.0, 0.0, 0.0, 11)
+                    };
+                let pretty_tmpl = spec
+                    .dynamic_pretty_template
+                    .clone()
+                    .or_else(|| spec.pretty_name.clone())
+                    .or_else(|| spec.dynamic_label_template.clone())
+                    .unwrap_or_else(|| base_name.clone());
+                Some(DynamicRepeatSpec {
+                    count_property: prop_name.clone(),
+                    base_control_name: base_name.clone(),
+                    label_template: spec.dynamic_label_template.clone(),
+                    pretty_name_template: pretty_tmpl,
+                    legend_template: spec.dynamic_legend_template.clone(),
+                    step_x,
+                    step_y,
+                    label_offset_x: lbl_ox,
+                    label_offset_y: lbl_oy,
+                    label_width: lbl_w,
+                    label_height: lbl_h,
+                    label_font_size: lbl_fs,
+                })
+            } else {
+                None
             };
 
             controls.push(ControlLayoutDef {
@@ -549,6 +667,11 @@ fn arrange_node(
                 legend: spec.legend.clone(),
                 is_disabled: spec.read_only,
                 is_invisible: spec.invisible,
+                count_property: spec.count_property.clone(),
+                base_control_name: spec.base_control_name.clone(),
+                channel_index: spec.channel_index,
+                dynamic_repeat,
+                skip_lua_emit: spec.skip_lua_emit,
             });
 
             Size::new(total_w, total_h)
@@ -570,6 +693,8 @@ fn arrange_node(
                     cur_x,
                     y + padding,
                     child_sz.width,
+                    FlexDirection::Row,
+                    *gap,
                     controls,
                     graphics,
                 );
@@ -591,7 +716,16 @@ fn arrange_node(
             let inner_w = (box_w - 2.0 * padding).max(0.0);
             let mut cur_y = y + padding;
             for child in children {
-                let arranged = arrange_node(child, x + padding, cur_y, inner_w, controls, graphics);
+                let arranged = arrange_node(
+                    child,
+                    x + padding,
+                    cur_y,
+                    inner_w,
+                    FlexDirection::Column,
+                    *gap,
+                    controls,
+                    graphics,
+                );
                 cur_y += arranged.height + gap;
             }
             let total_h = if children.is_empty() {
@@ -627,6 +761,7 @@ fn arrange_node(
                 position: Position::new(x, y),
                 size: Size::new(box_w, box_h),
                 color: color.clone(),
+                skip_lua_emit: false,
             });
 
             let inner_w = (box_w - 2.0 * padding).max(0.0);
@@ -640,7 +775,16 @@ fn arrange_node(
                         gap: *gap,
                         padding: 0.0,
                     };
-                    arrange_node(&row, inner_x, inner_y, inner_w, controls, graphics);
+                    arrange_node(
+                        &row,
+                        inner_x,
+                        inner_y,
+                        inner_w,
+                        FlexDirection::Row,
+                        *gap,
+                        controls,
+                        graphics,
+                    );
                 }
                 FlexDirection::Column => {
                     let col = UiNode::Col {
@@ -648,7 +792,16 @@ fn arrange_node(
                         gap: *gap,
                         padding: 0.0,
                     };
-                    arrange_node(&col, inner_x, inner_y, inner_w, controls, graphics);
+                    arrange_node(
+                        &col,
+                        inner_x,
+                        inner_y,
+                        inner_w,
+                        FlexDirection::Column,
+                        *gap,
+                        controls,
+                        graphics,
+                    );
                 }
             }
 

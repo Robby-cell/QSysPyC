@@ -205,6 +205,10 @@ pub fn analyze_lossy_with_env(
                 type_map.insert_resolution(*span, ResolvedTarget::Control(*ctl_id));
                 type_map.insert_type(*span, Type::ControlHandle);
             }
+            for (span, prop_id) in &decls.control_property_resolutions {
+                type_map.insert_resolution(*span, ResolvedTarget::Property(*prop_id));
+                type_map.insert_type(*span, Type::Int);
+            }
 
             scope_stack.push_scope(ScopeKind::Class {
                 name: class.name.clone(),

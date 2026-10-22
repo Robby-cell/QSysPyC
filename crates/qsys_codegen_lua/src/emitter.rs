@@ -140,6 +140,15 @@ impl<'a> LuaEmitter<'a> {
                             self.write_line(&format!("for _, {var_name} in ipairs({iter_str}) do"));
                         }
                     }
+                } else if let IRExpr::Control(ctl_id) = iterable
+                    && let Some(def) = self.ctx.controls.get(ctl_id)
+                    && let Some(ref prop_name) = def.count_property
+                {
+                    let ctl_str = format!("Controls[{}]", escape_lua_string(&def.name));
+                    let prop_str = format!("Properties[{}].Value", escape_lua_string(prop_name));
+                    self.write_line(&format!(
+                        "for _, {var_name} in ipairs(({prop_str} == 1) and {{ {ctl_str} }} or {ctl_str}) do"
+                    ));
                 } else {
                     let iter_str = self.emit_expr(iterable);
                     self.write_line(&format!("for _, {var_name} in ipairs({iter_str}) do"));
@@ -423,7 +432,16 @@ impl<'a> LuaEmitter<'a> {
                 IRUnaryOp::Neg => format!("(-{})", self.emit_expr(operand)),
                 IRUnaryOp::Pos => format!("(+{})", self.emit_expr(operand)),
                 IRUnaryOp::BitNot => format!("(~{})", self.emit_expr(operand)),
-                IRUnaryOp::Len => format!("(#{})", self.emit_expr(operand)),
+                IRUnaryOp::Len => {
+                    if let IRExpr::Control(ctl_id) = operand.as_ref()
+                        && let Some(def) = self.ctx.controls.get(ctl_id)
+                        && let Some(ref prop_name) = def.count_property
+                    {
+                        format!("Properties[{}].Value", escape_lua_string(prop_name))
+                    } else {
+                        format!("(#{})", self.emit_expr(operand))
+                    }
+                }
             },
 
             IRExpr::Call {
@@ -481,6 +499,22 @@ impl<'a> LuaEmitter<'a> {
                 index,
                 is_zero_based,
             } => {
+                if *is_zero_based
+                    && let IRExpr::Control(ctl_id) = base.as_ref()
+                    && let Some(def) = self.ctx.controls.get(ctl_id).cloned()
+                    && let Some(ref prop_name) = def.count_property
+                {
+                    let ctl_str = format!("Controls[{}]", escape_lua_string(&def.name));
+                    let prop_str = format!("Properties[{}].Value", escape_lua_string(prop_name));
+                    let idx_1 = if let IRExpr::Int(n) = index.as_ref() {
+                        (n + 1).to_string()
+                    } else {
+                        let idx_str = self.emit_expr(index);
+                        format!("({idx_str}) + 1")
+                    };
+                    return format!("(({prop_str} == 1) and {ctl_str} or {ctl_str}[{idx_1}])");
+                }
+
                 let base_str = self.emit_expr(base);
                 if *is_zero_based {
                     if let IRExpr::Int(n) = index.as_ref() {

@@ -115,14 +115,74 @@ pub fn emit_plugin(plugin: &IRPlugin, ctx: &mut CodegenContext) -> String {
             crate::emitter::escape_lua_string(&binding.control_name)
         );
         let handler_fn = format!("{}_{}", plugin.class_name, binding.handler_name);
-        let ctl_count = plugin
+        let ctl_def = plugin
             .controls
             .iter()
             .find(|c| c.id == binding.control_id)
-            .map(|c| c.def.count)
-            .unwrap_or(1);
+            .map(|c| &c.def);
+        let ctl_count = ctl_def.map(|d| d.count).unwrap_or(1);
+        let ctl_count_prop = ctl_def.and_then(|d| d.count_property.as_deref());
 
-        if let Some(ch_idx) = binding.channel_index {
+        if let Some(prop_name) = ctl_count_prop {
+            let prop_ref = format!(
+                "Properties[{}].Value",
+                crate::emitter::escape_lua_string(prop_name)
+            );
+            if let Some(ch_idx) = binding.channel_index {
+                if ch_idx == 0 {
+                    emitter.write_line(&format!("if {prop_ref} == 1 then"));
+                    emitter.indent();
+                    emitter.write_line(&format!("{ctl_ref}.EventHandler = function(ctl)"));
+                    emitter.indent();
+                    emitter.write_line(&format!("{handler_fn}(nil, ctl)"));
+                    emitter.dedent();
+                    emitter.write_line("end");
+                    emitter.dedent();
+                    emitter.write_line(&format!("elseif {prop_ref} >= 1 then"));
+                    emitter.indent();
+                    emitter.write_line(&format!("{ctl_ref}[1].EventHandler = function(ctl)"));
+                    emitter.indent();
+                    emitter.write_line(&format!("{handler_fn}(nil, ctl)"));
+                    emitter.dedent();
+                    emitter.write_line("end");
+                    emitter.dedent();
+                    emitter.write_line("end\n");
+                } else {
+                    let ch_1 = ch_idx + 1;
+                    emitter.write_line(&format!("if {prop_ref} >= {ch_1} then"));
+                    emitter.indent();
+                    emitter.write_line(&format!("{ctl_ref}[{ch_1}].EventHandler = function(ctl)"));
+                    emitter.indent();
+                    emitter.write_line(&format!("{handler_fn}(nil, ctl)"));
+                    emitter.dedent();
+                    emitter.write_line("end");
+                    emitter.dedent();
+                    emitter.write_line("end\n");
+                }
+            } else {
+                emitter.write_line(&format!("if {prop_ref} == 1 then"));
+                emitter.indent();
+                emitter.write_line(&format!("{ctl_ref}.EventHandler = function(c)"));
+                emitter.indent();
+                emitter.write_line(&format!("{handler_fn}(nil, c, 0)"));
+                emitter.dedent();
+                emitter.write_line("end");
+                emitter.dedent();
+                emitter.write_line("else");
+                emitter.indent();
+                emitter.write_line(&format!("for ix, ctl in ipairs({ctl_ref}) do"));
+                emitter.indent();
+                emitter.write_line("ctl.EventHandler = function(c)");
+                emitter.indent();
+                emitter.write_line(&format!("{handler_fn}(nil, c, ix - 1)"));
+                emitter.dedent();
+                emitter.write_line("end");
+                emitter.dedent();
+                emitter.write_line("end");
+                emitter.dedent();
+                emitter.write_line("end\n");
+            }
+        } else if let Some(ch_idx) = binding.channel_index {
             emitter.write_line(&format!(
                 "{ctl_ref}[{}].EventHandler = function(ctl)",
                 ch_idx + 1
@@ -305,7 +365,14 @@ fn emit_get_controls(emitter: &mut LuaEmitter<'_>, controls: &[IRControlBinding]
             escape_lua_string(c.def.pin_style.as_str())
         ));
         emitter.write_line(&format!("UserPin = {},", c.def.user_pin));
-        emitter.write_line(&format!("Count = {},", c.def.count));
+        if let Some(ref prop_name) = c.def.count_property {
+            emitter.write_line(&format!(
+                "Count = props[{}].Value,",
+                escape_lua_string(prop_name)
+            ));
+        } else {
+            emitter.write_line(&format!("Count = {},", c.def.count));
+        }
 
         emitter.dedent();
         emitter.write_line("})");
@@ -365,10 +432,14 @@ fn emit_get_control_layout(emitter: &mut LuaEmitter<'_>, pages: &[PageLayout]) {
 
 pub(crate) fn emit_page_layout_body(emitter: &mut LuaEmitter<'_>, page: &PageLayout) {
     for g in &page.graphics {
-        emit_graphic_item(emitter, g);
+        if !g.skip_lua_emit {
+            emit_graphic_item(emitter, g);
+        }
     }
     for ctl in &page.controls {
-        emit_control_layout_item(emitter, ctl);
+        if !ctl.skip_lua_emit {
+            emit_control_layout_item(emitter, ctl);
+        }
     }
 }
 
@@ -433,20 +504,39 @@ fn emit_graphic_item(emitter: &mut LuaEmitter<'_>, g: &GraphicItem) {
     emitter.write_line("})");
 }
 
-fn emit_control_layout_item(emitter: &mut LuaEmitter<'_>, ctl: &ControlLayoutDef) {
-    let x = ctl.position.x.round() as i64;
-    let y = ctl.position.y.round() as i64;
-    let w = ctl.size.width.round() as i64;
-    let h = ctl.size.height.round() as i64;
+fn format_dynamic_channel_lua_expr(template: &str, prop_expr: &str) -> String {
+    let normalized = template.replace("{ch}", "{i}");
+    if let Some((prefix, suffix)) = normalized.split_once("{i}") {
+        let mut parts = Vec::new();
+        if !prefix.is_empty() {
+            parts.push(escape_lua_string(prefix));
+        }
+        parts.push("tostring(i)".to_string());
+        if !suffix.is_empty() {
+            parts.push(escape_lua_string(suffix));
+        }
+        parts.join(" .. ")
+    } else {
+        let single = escape_lua_string(template);
+        let multi_prefix = escape_lua_string(&format!("{template} "));
+        format!("({prop_expr} == 1) and {single} or ({multi_prefix} .. tostring(i))")
+    }
+}
 
-    emitter.write_line(&format!("layout[{}] = {{", escape_lua_string(&ctl.name)));
-    emitter.indent();
-    let pretty = ctl.pretty_name.as_deref().unwrap_or(&ctl.name);
-    emitter.write_line(&format!("PrettyName = {},", escape_lua_string(pretty)));
+fn emit_control_layout_fields(
+    emitter: &mut LuaEmitter<'_>,
+    ctl: &ControlLayoutDef,
+    pretty_expr: &str,
+    pos_x_expr: &str,
+    pos_y_expr: &str,
+    w: i64,
+    h: i64,
+) {
+    emitter.write_line(&format!("PrettyName = {pretty_expr},"));
     if let Some(ref style) = ctl.style {
         emitter.write_line(&format!("Style = {},", escape_lua_string(style.as_str())));
     }
-    emitter.write_line(&format!("Position = {{ {x}, {y} }},"));
+    emitter.write_line(&format!("Position = {{ {pos_x_expr}, {pos_y_expr} }},"));
     emitter.write_line(&format!("Size = {{ {w}, {h} }},"));
     if let Some(ref color) = ctl.color {
         let (r, g, b) = color.to_rgb_tuple();
@@ -461,6 +551,117 @@ fn emit_control_layout_item(emitter: &mut LuaEmitter<'_>, ctl: &ControlLayoutDef
     if ctl.is_disabled {
         emitter.write_line("IsReadOnly = true,");
     }
+}
+
+fn emit_control_layout_item(emitter: &mut LuaEmitter<'_>, ctl: &ControlLayoutDef) {
+    let x = ctl.position.x.round() as i64;
+    let y = ctl.position.y.round() as i64;
+    let w = ctl.size.width.round() as i64;
+    let h = ctl.size.height.round() as i64;
+
+    if let Some(ref rep) = ctl.dynamic_repeat {
+        let prop_expr = format!("props[{}].Value", escape_lua_string(&rep.count_property));
+        let base_str = escape_lua_string(&rep.base_control_name);
+        let base_prefix = escape_lua_string(&format!("{} ", rep.base_control_name));
+        let dx = rep.step_x.round() as i64;
+        let dy = rep.step_y.round() as i64;
+
+        emitter.write_line(&format!("for i = 1, {prop_expr} do"));
+        emitter.indent();
+
+        if let Some(ref lbl_tmpl) = rep.label_template {
+            let lx = (ctl.position.x + rep.label_offset_x).round() as i64;
+            let ly = (ctl.position.y + rep.label_offset_y).round() as i64;
+            let lw = rep.label_width.round() as i64;
+            let lh = rep.label_height.round() as i64;
+            let l_pos_x = if dx == 0 {
+                lx.to_string()
+            } else {
+                format!("{lx} + (i - 1) * {dx}")
+            };
+            let l_pos_y = if dy == 0 {
+                ly.to_string()
+            } else {
+                format!("{ly} + (i - 1) * {dy}")
+            };
+            let lbl_text_expr = format_dynamic_channel_lua_expr(lbl_tmpl, &prop_expr);
+
+            emitter.write_line("table.insert(graphics, {");
+            emitter.indent();
+            emitter.write_line("Type = \"Label\",");
+            emitter.write_line(&format!("Text = {lbl_text_expr},"));
+            emitter.write_line(&format!("Position = {{ {l_pos_x}, {l_pos_y} }},"));
+            emitter.write_line(&format!("Size = {{ {lw}, {lh} }},"));
+            emitter.write_line(&format!("FontSize = {},", rep.label_font_size));
+            emitter.write_line("HTextAlign = \"Left\",");
+            emitter.dedent();
+            emitter.write_line("})");
+        }
+
+        let pos_x = if dx == 0 {
+            x.to_string()
+        } else {
+            format!("{x} + (i - 1) * {dx}")
+        };
+        let pos_y = if dy == 0 {
+            y.to_string()
+        } else {
+            format!("{y} + (i - 1) * {dy}")
+        };
+        let pretty_expr = format_dynamic_channel_lua_expr(&rep.pretty_name_template, &prop_expr);
+
+        emitter.write_line(&format!(
+            "local ctl_key = ({prop_expr} == 1) and {base_str} or ({base_prefix} .. tostring(i))"
+        ));
+        emitter.write_line("layout[ctl_key] = {");
+        emitter.indent();
+        emit_control_layout_fields(emitter, ctl, &pretty_expr, &pos_x, &pos_y, w, h);
+        emitter.dedent();
+        emitter.write_line("}");
+
+        emitter.dedent();
+        emitter.write_line("end");
+        return;
+    }
+
+    let pretty = escape_lua_string(ctl.pretty_name.as_deref().unwrap_or(&ctl.name));
+    let x_str = x.to_string();
+    let y_str = y.to_string();
+
+    if let (Some(prop_name), Some(base_name), Some(ch)) = (
+        &ctl.count_property,
+        &ctl.base_control_name,
+        ctl.channel_index,
+    ) {
+        let prop_expr = format!("props[{}].Value", escape_lua_string(prop_name));
+        if ch == 1 {
+            let key_expr = format!(
+                "({prop_expr} == 1) and {} or {}",
+                escape_lua_string(base_name),
+                escape_lua_string(&ctl.name)
+            );
+            emitter.write_line(&format!("layout[{key_expr}] = {{"));
+            emitter.indent();
+            emit_control_layout_fields(emitter, ctl, &pretty, &x_str, &y_str, w, h);
+            emitter.dedent();
+            emitter.write_line("}");
+        } else {
+            emitter.write_line(&format!("if {prop_expr} >= {ch} then"));
+            emitter.indent();
+            emitter.write_line(&format!("layout[{}] = {{", escape_lua_string(&ctl.name)));
+            emitter.indent();
+            emit_control_layout_fields(emitter, ctl, &pretty, &x_str, &y_str, w, h);
+            emitter.dedent();
+            emitter.write_line("}");
+            emitter.dedent();
+            emitter.write_line("end");
+        }
+        return;
+    }
+
+    emitter.write_line(&format!("layout[{}] = {{", escape_lua_string(&ctl.name)));
+    emitter.indent();
+    emit_control_layout_fields(emitter, ctl, &pretty, &x_str, &y_str, w, h);
     emitter.dedent();
     emitter.write_line("}");
 }
