@@ -124,7 +124,7 @@ Every `Control.*` factory accepts the following arguments:
 | `name` | 1st positional or `name=` | `str` | Python attribute name | Any string | The Q-SYS control name in `GetControls` and `Controls["<name>"]`. If omitted, defaults to the Python variable name (except `IPAddress`/`MACAddress` which default to `"IPAddress"`/`"MACAddress"`). |
 | `pins` | `pins=` | `str` | `"Both"` | `"None"`, `"Input"`, `"Output"`, `"Both"` | Maps to Q-SYS `PinStyle`. Controls whether input/output wiring pins can be exposed on the schematic block. |
 | `user_pin` | `user_pin=` | `bool` | `True` | `True`, `False` | Maps to Q-SYS `UserPin`. Allows users to toggle pin visibility in the Q-SYS Inspector. *(Note: Q-SYS also requires the control to appear in `GetControlLayout` with a `PrettyName`—which QSysPy's `UI.*` builder does automatically).* |
-| `count` | `count=` | `int` | `1` | Integer $\ge 1$ | Number of control instances/channels (`Count` in Q-SYS). When `count > 1`, `Controls["<name>"]` is a 1-based Lua array of `ControlHandle` objects (indexed 0-based in Python via `self.Gain[0]`). |
+| `count` | `count=` | `int \| PropertyHandle` | `1` | Integer $\ge 1$, `Property.Integer` reference (`count=NumInputs`), or `props["..."].Value` | Number of control instances/channels (`Count` in Q-SYS). When bound to an integer `Property`, QSysPy automatically handles `Count == 1` vs `Count >= 2` across `GetControls`, `GetControlLayout`, and runtime `Controls`. |
 
 ---
 
@@ -631,14 +631,27 @@ Q-SYS uses `Count = N` in `GetControls` for multi-channel controls (e.g. an 8-ch
 
 QSysPy makes multi-channel controls seamless across declarations, UI layouts, and runtime code:
 
-### 6.1 Declaring Multi-Channel Controls
+### 6.1 Declaring Multi-Channel Controls (Static or Property-Driven)
+
+You can pass either a static integer (`count=4`) **or** an integer `Property` (`count=NumInputs` or `count=props["number of inputs"].Value`):
 
 ```python
 class MixerPlugin(QSysPlugin):
-    Gain = Control.Fader(min=-100.0, max=12.0, default=0.0, unit="dB", count=4)
-    Mute = Control.Boolean(type="Toggle", count=4)
-    Signal = Control.Indicator( count=4, pins="Output")
+    # Dynamic channel count configured in Q-SYS Designer Inspector
+    NumInputs = Property.Integer("number of inputs", default=4, min=1, max=16)
+
+    # Bound to the Property (or static integer `count=4`)
+    Gain = Control.Fader(min=-100.0, max=12.0, default=0.0, unit="dB", count=NumInputs)
+    Mute = Control.Boolean(type="Toggle", count=props["number of inputs"].Value)
+    Signal = Control.Indicator(count=NumInputs, pins="Output")
 ```
+
+> **Automatic `1` vs `2+` Handling**: In Q-SYS Lua, when a property-driven `Count` is set to `1`, Q-SYS names the layout key `"Gain"` (without `" 1"`) and makes `Controls["Gain"]` a single `ControlHandle` object instead of a 1-element table. When `Count >= 2`, Q-SYS uses `"Gain 1" .. "Gain N"` and makes `Controls["Gain"]` a 1-based array table.
+>
+> When you use `count=NumInputs` in QSysPy, the compiler **automatically emits `== 1` vs `>= 2` guards** in:
+> - `GetControls(props)` (`Count = props["number of inputs"].Value`)
+> - `GetControlLayout(props)` (`for i = 1, props["number of inputs"].Value do` with `"Gain"` when `1` and `"Gain " .. tostring(i)` when `>= 2`)
+> - Runtime `@Gain.EventHandler`, `@Gain[0].EventHandler`, `self.Gain[i]`, `for ctl in self.Gain:`, and `len(self.Gain)`!
 
 ### 6.2 UI Layout Patterns for `count > 1`
 
