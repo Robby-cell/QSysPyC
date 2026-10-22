@@ -1,8 +1,33 @@
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
+
 use qsys_diagnostics::{Diagnostics, EditorMarker, SourceFile};
-use qsys_model::PluginInfo;
+use qsys_model::{PageLayout, PluginInfo};
 use qsys_runtime::RuntimeEnv;
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UiControlMetadata {
+    pub ident: String,
+    pub name: String,
+    pub kind: String,
+    pub unit: Option<String>,
+    pub min: Option<f64>,
+    pub max: Option<f64>,
+    pub default_num: Option<f64>,
+    pub default_str: Option<String>,
+    pub button_type: Option<String>,
+    pub count: usize,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UiPreviewPayload {
+    pub program_kind: String,
+    pub plugin_name: String,
+    pub has_explicit_layout: bool,
+    pub pages: Vec<PageLayout>,
+    pub controls: Vec<UiControlMetadata>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProgramKind {
@@ -53,6 +78,7 @@ pub struct CompiledArtifact {
     pub plugin_info: Option<PluginInfo>,
     pub control_count: usize,
     pub property_count: usize,
+    pub ui_preview: UiPreviewPayload,
 }
 
 impl CompiledArtifact {
@@ -62,6 +88,10 @@ impl CompiledArtifact {
 
     pub fn to_editor_markers_json(&self) -> String {
         serde_json::to_string(&self.to_editor_markers()).unwrap_or_else(|_| "[]".to_string())
+    }
+
+    pub fn to_ui_preview_json(&self) -> String {
+        serde_json::to_string(&self.ui_preview).unwrap_or_else(|_| "{}".to_string())
     }
 }
 

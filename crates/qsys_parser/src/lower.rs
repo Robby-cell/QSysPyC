@@ -409,12 +409,20 @@ impl<'a> Lowerer<'a> {
 
             ruff::Expr::Call(c) => {
                 let callee = Box::new(self.lower_expr(&c.func));
-                let args = c
-                    .arguments
-                    .args
-                    .iter()
-                    .map(|a| self.lower_expr(a))
-                    .collect();
+                let mut args = Vec::new();
+                for a in &c.arguments.args {
+                    if let ruff::Expr::Starred(s) = a {
+                        let unpacked = self.lower_expr(&s.value);
+                        match unpacked.kind {
+                            ExprKind::List(items) | ExprKind::Tuple(items) => {
+                                args.extend(items);
+                            }
+                            _ => args.push(unpacked),
+                        }
+                    } else {
+                        args.push(self.lower_expr(a));
+                    }
+                }
                 let kwargs = c
                     .arguments
                     .keywords
@@ -430,6 +438,36 @@ impl<'a> Lowerer<'a> {
                     callee,
                     args,
                     kwargs,
+                }
+            }
+
+            ruff::Expr::ListComp(comp) => {
+                if let Some(items) = self.try_unroll_comprehension(&comp.elt, &comp.generators) {
+                    ExprKind::List(items)
+                } else {
+                    self.diagnostics.report(
+                        DiagnosticKind::unsupported_expression(
+                            "List comprehensions must iterate over a constant range(...) or list/tuple literal",
+                        ),
+                        span,
+                    );
+                    ExprKind::Error
+                }
+            }
+
+            ruff::Expr::Generator(gen_expr) => {
+                if let Some(items) =
+                    self.try_unroll_comprehension(&gen_expr.elt, &gen_expr.generators)
+                {
+                    ExprKind::List(items)
+                } else {
+                    self.diagnostics.report(
+                        DiagnosticKind::unsupported_expression(
+                            "Generator expressions must iterate over a constant range(...) or list/tuple literal",
+                        ),
+                        span,
+                    );
+                    ExprKind::Error
                 }
             }
 
@@ -561,4 +599,159 @@ impl<'a> Lowerer<'a> {
 
         Expr::new(kind, span)
     }
+
+    fn try_unroll_comprehension(
+        &mut self,
+        elt: &ruff::Expr,
+        generators: &[ruff::Comprehension],
+    ) -> Option<Vec<Expr>> {
+        if generators.len() != 1 {
+            return None;
+        }
+        let gen_clause = &generators[0];
+        if gen_clause.is_async || !gen_clause.ifs.is_empty() {
+            return None;
+        }
+        let var_name = match &gen_clause.target {
+            ruff::Expr::Name(n) => n.id.to_string(),
+            _ => return None,
+        };
+        let iter_expr = self.lower_expr(&gen_clause.iter);
+        let values = extract_const_iter_values(&iter_expr)?;
+        let template_expr = self.lower_expr(elt);
+        let mut out = Vec::with_capacity(values.len());
+        for val in values {
+            out.push(substitute_expr_ident(&template_expr, &var_name, &val));
+        }
+        Some(out)
+    }
+}
+
+fn extract_const_iter_values(iter_expr: &Expr) -> Option<Vec<Expr>> {
+    match &iter_expr.kind {
+        ExprKind::List(items) | ExprKind::Tuple(items) => Some(items.clone()),
+        ExprKind::Call { callee, args, .. } => {
+            if let ExprKind::Ident(fn_name) = &callee.kind
+                && fn_name == "range"
+            {
+                let (start, stop, step) = match args.as_slice() {
+                    [stop_e] => (0, eval_int_literal(stop_e)?, 1),
+                    [start_e, stop_e] => (eval_int_literal(start_e)?, eval_int_literal(stop_e)?, 1),
+                    [start_e, stop_e, step_e] => (
+                        eval_int_literal(start_e)?,
+                        eval_int_literal(stop_e)?,
+                        eval_int_literal(step_e)?,
+                    ),
+                    _ => return None,
+                };
+                if step == 0 {
+                    return None;
+                }
+                let mut values = Vec::new();
+                let mut cur = start;
+                let max_iters = 256;
+                while (step > 0 && cur < stop) || (step < 0 && cur > stop) {
+                    if values.len() >= max_iters {
+                        return None;
+                    }
+                    values.push(Expr::new(ExprKind::Int(cur), iter_expr.span));
+                    cur += step;
+                }
+                return Some(values);
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn eval_int_literal(expr: &Expr) -> Option<i64> {
+    match &expr.kind {
+        ExprKind::Int(i) => Some(*i),
+        ExprKind::Unary {
+            op: UnaryOp::Neg,
+            operand,
+        } => eval_int_literal(operand).map(|v| -v),
+        ExprKind::Unary {
+            op: UnaryOp::Pos,
+            operand,
+        } => eval_int_literal(operand),
+        _ => None,
+    }
+}
+
+fn substitute_expr_ident(expr: &Expr, target: &str, replacement: &Expr) -> Expr {
+    let kind = match &expr.kind {
+        ExprKind::Ident(name) if name == target => {
+            return Expr::new(replacement.kind.clone(), expr.span);
+        }
+        ExprKind::Ident(_)
+        | ExprKind::Int(_)
+        | ExprKind::Float(_)
+        | ExprKind::String(_)
+        | ExprKind::Bool(_)
+        | ExprKind::None
+        | ExprKind::Error => expr.kind.clone(),
+        ExprKind::Tuple(items) => ExprKind::Tuple(
+            items
+                .iter()
+                .map(|i| substitute_expr_ident(i, target, replacement))
+                .collect(),
+        ),
+        ExprKind::List(items) => ExprKind::List(
+            items
+                .iter()
+                .map(|i| substitute_expr_ident(i, target, replacement))
+                .collect(),
+        ),
+        ExprKind::Dict(pairs) => ExprKind::Dict(
+            pairs
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        substitute_expr_ident(k, target, replacement),
+                        substitute_expr_ident(v, target, replacement),
+                    )
+                })
+                .collect(),
+        ),
+        ExprKind::Binary { left, op, right } => ExprKind::Binary {
+            left: Box::new(substitute_expr_ident(left, target, replacement)),
+            op: *op,
+            right: Box::new(substitute_expr_ident(right, target, replacement)),
+        },
+        ExprKind::BoolOp { op, left, right } => ExprKind::BoolOp {
+            op: *op,
+            left: Box::new(substitute_expr_ident(left, target, replacement)),
+            right: Box::new(substitute_expr_ident(right, target, replacement)),
+        },
+        ExprKind::Unary { op, operand } => ExprKind::Unary {
+            op: *op,
+            operand: Box::new(substitute_expr_ident(operand, target, replacement)),
+        },
+        ExprKind::Call {
+            callee,
+            args,
+            kwargs,
+        } => ExprKind::Call {
+            callee: Box::new(substitute_expr_ident(callee, target, replacement)),
+            args: args
+                .iter()
+                .map(|a| substitute_expr_ident(a, target, replacement))
+                .collect(),
+            kwargs: kwargs
+                .iter()
+                .map(|(k, v)| (k.clone(), substitute_expr_ident(v, target, replacement)))
+                .collect(),
+        },
+        ExprKind::Attribute { value, attr } => ExprKind::Attribute {
+            value: Box::new(substitute_expr_ident(value, target, replacement)),
+            attr: attr.clone(),
+        },
+        ExprKind::Subscript { value, index } => ExprKind::Subscript {
+            value: Box::new(substitute_expr_ident(value, target, replacement)),
+            index: Box::new(substitute_expr_ident(index, target, replacement)),
+        },
+    };
+    Expr::new(kind, expr.span)
 }

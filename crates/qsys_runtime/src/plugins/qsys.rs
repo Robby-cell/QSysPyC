@@ -45,6 +45,7 @@ impl RuntimePlugin for QSysRuntime {
         install_timer(env);
         install_udp(env);
         install_tcp(env);
+        install_ui(env);
 
         for (name, doc) in OPAQUE_LIBRARIES {
             env.add_type(ObjectType::library(*name).doc(*doc));
@@ -296,5 +297,227 @@ fn install_tcp(env: &mut EnvBuilder) {
     env.add_global(
         Global::object("TcpSocket")
             .doc("Q-SYS native TCP client networking class. Instantiate via `TcpSocket.New()`."),
+    );
+}
+
+fn install_ui(env: &mut EnvBuilder) {
+    let ui_node = || TypeRef::object("UINode");
+    let ctl_handle = || TypeRef::object("ControlHandle");
+
+    env.add_type(
+        ObjectType::library("UINode")
+            .doc("Declarative Q-SYS UI layout node expanded into `GetControlLayout` and `GetPages` tables."),
+    );
+
+    env.add_type(
+        ObjectType::library("UI")
+            .doc("Declarative Flexbox-style UI layout builder for Q-SYS `GetControlLayout(props)` and `GetPages(props)`.")
+            .static_method(
+                Function::new("Page")
+                    .arg(
+                        Param::new("title", TypeRef::Str)
+                            .optional()
+                            .doc("Tab title in Q-SYS `GetPages` (defaults to `\"Main\"`)."),
+                    )
+                    .variadic()
+                    .returns(ui_node())
+                    .doc("Declares a Q-SYS Plugin UI page (`GetPages` + `GetControlLayout`). Automatically solves child positions and sizes.")
+                    .snippet("Page(\n    \"${1:Main}\",\n    ${0}\n)"),
+            )
+            .static_method(
+                Function::new("Pages")
+                    .variadic()
+                    .returns(TypeRef::list(ui_node()))
+                    .doc("Groups multiple `UI.Page(...)` definitions into a multi-page Q-SYS plugin interface.")
+                    .snippet("Pages(\n    UI.Page(\"${1:Main}\", ${0}),\n)"),
+            )
+            .static_method(
+                Function::new("GroupBox")
+                    .arg(
+                        Param::new("title", TypeRef::Str)
+                            .optional()
+                            .doc("Header text displayed on the GroupBox border."),
+                    )
+                    .variadic()
+                    .returns(ui_node())
+                    .doc("Creates a Q-SYS `GroupBox` container that automatically sizes and positions its child controls and rows.")
+                    .snippet("GroupBox(\n    \"${1:Controls}\",\n    ${0}\n)"),
+            )
+            .static_method(
+                Function::new("Section")
+                    .arg(
+                        Param::new("title", TypeRef::Str)
+                            .optional()
+                            .doc("Header text displayed on the section border."),
+                    )
+                    .variadic()
+                    .returns(ui_node())
+                    .doc("Alias for `UI.GroupBox`: creates a framed Q-SYS section container.")
+                    .snippet("Section(\n    \"${1:Section}\",\n    ${0}\n)"),
+            )
+            .static_method(
+                Function::new("Row")
+                    .variadic()
+                    .returns(ui_node())
+                    .doc("Horizontal Flexbox-style row container (`UI.Row(UI.Field(...), UI.Field(...), gap=8)`).")
+                    .snippet("Row(\n    ${0}\n)"),
+            )
+            .static_method(
+                Function::new("Col")
+                    .variadic()
+                    .returns(ui_node())
+                    .doc("Vertical Flexbox-style column container (`UI.Col(UI.Field(...), UI.Field(...), gap=8)`).")
+                    .snippet("Col(\n    ${0}\n)"),
+            )
+            .static_method(
+                Function::new("Field")
+                    .arg(
+                        Param::new("label", TypeRef::Str)
+                            .doc("Text label graphic rendered above or beside the control."),
+                    )
+                    .arg(
+                        Param::new("control", ctl_handle())
+                            .doc("Declared control reference (`self.Gain`, `Gain`, or `ChGain[0]`)."),
+                    )
+                    .arg(
+                        Param::new("style", TypeRef::Str)
+                            .optional()
+                            .doc("Optional Q-SYS widget style override (`\"Knob\"`, `\"Fader\"`, `\"Button\"`, `\"Text\"`, `\"Led\"`, `\"Meter\"`, `\"ComboBox\"`)."),
+                    )
+                    .arg(
+                        Param::new("pretty_name", TypeRef::Str)
+                            .optional()
+                            .doc("Optional Q-SYS `PrettyName` override for pin exposure (`\"Group~Name\"` or `\"Ch {i} Gain\"`)."),
+                    )
+                    .arg(
+                        Param::new("labels", TypeRef::List(Box::new(TypeRef::Str)))
+                            .optional()
+                            .doc("Optional per-channel label list when `count > 1` (e.g. `[\"Left\", \"Right\"]`)."),
+                    )
+                    .arg(
+                        Param::new("direction", TypeRef::Str)
+                            .optional()
+                            .doc("Layout direction when expanding a `count > 1` control (`\"row\"` or `\"col\"`)."),
+                    )
+                    .arg(
+                        Param::new("width", TypeRef::Float)
+                            .optional()
+                            .doc("Optional explicit widget width in pixels."),
+                    )
+                    .arg(
+                        Param::new("height", TypeRef::Float)
+                            .optional()
+                            .doc("Optional explicit widget height in pixels."),
+                    )
+                    .arg(
+                        Param::new("color", TypeRef::Str)
+                            .optional()
+                            .doc("Optional hex color (`\"#007acc\"`) or named color."),
+                    )
+                    .returns(ui_node())
+                    .doc("Pairs a Q-SYS `Label` graphic with a declared `ControlHandle` (`self.Gain`, `Gain`, or `self.Gain[0]`) and sets `PrettyName` so pins can be exposed. For `count > 1`, auto-expands all channels (supports `{i}` in label, `labels=[...]`, and `direction=\"row\"`).")
+                    .snippet("Field(\"${1:Label}\", ${2:self.ControlName})"),
+            )
+            .static_method(
+                Function::new("Control")
+                    .arg(
+                        Param::new("control", ctl_handle())
+                            .doc("Declared control reference (`self.Gain`, `Gain`, or `ChGain[0]`). Multi-channel controls (`count > 1`) auto-expand when unindexed."),
+                    )
+                    .arg(
+                        Param::new("style", TypeRef::Str)
+                            .optional()
+                            .doc("Optional Q-SYS widget style override (`\"Knob\"`, `\"Fader\"`, `\"Button\"`, `\"Text\"`, `\"Led\"`, `\"Meter\"`)."),
+                    )
+                    .arg(
+                        Param::new("pretty_name", TypeRef::Str)
+                            .optional()
+                            .doc("Optional Q-SYS `PrettyName` override for pin exposure (`\"Group~Name\"` or `\"Ch {i}\"`)."),
+                    )
+                    .arg(
+                        Param::new("label", TypeRef::Str)
+                            .optional()
+                            .doc("Optional label graphic rendered above or beside the control."),
+                    )
+                    .arg(
+                        Param::new("direction", TypeRef::Str)
+                            .optional()
+                            .doc("Layout direction when expanding a `count > 1` control (`\"row\"` or `\"col\"`)."),
+                    )
+                    .arg(
+                        Param::new("width", TypeRef::Float)
+                            .optional()
+                            .doc("Optional explicit widget width in pixels."),
+                    )
+                    .arg(
+                        Param::new("height", TypeRef::Float)
+                            .optional()
+                            .doc("Optional explicit widget height in pixels."),
+                    )
+                    .arg(
+                        Param::new("color", TypeRef::Str)
+                            .optional()
+                            .doc("Optional hex color (`\"#007acc\"`) or named color."),
+                    )
+                    .returns(ui_node())
+                    .doc("Places a declared `ControlHandle` (`self.Gain`, `Gain`, or `ChGain[0]`) in the UI layout with an automatic `PrettyName` for pin exposure.")
+                    .snippet("Control(${1:self.ControlName})"),
+            )
+            .static_method(
+                Function::new("Header")
+                    .arg(Param::new("text", TypeRef::Str).doc("Header banner text."))
+                    .arg(
+                        Param::new("width", TypeRef::Float)
+                            .optional()
+                            .doc("Optional explicit width in pixels."),
+                    )
+                    .arg(
+                        Param::new("height", TypeRef::Float)
+                            .optional()
+                            .doc("Header height in pixels (defaults to 28)."),
+                    )
+                    .returns(ui_node())
+                    .doc("Emits a Q-SYS `Header` section bar graphic.")
+                    .snippet("Header(\"${1:Section Title}\")"),
+            )
+            .static_method(
+                Function::new("Label")
+                    .arg(Param::new("text", TypeRef::Str).doc("Static label text."))
+                    .arg(
+                        Param::new("width", TypeRef::Float)
+                            .optional()
+                            .doc("Optional explicit width in pixels."),
+                    )
+                    .arg(
+                        Param::new("height", TypeRef::Float)
+                            .optional()
+                            .doc("Label height in pixels (defaults to 22)."),
+                    )
+                    .returns(ui_node())
+                    .doc("Emits a static Q-SYS `Label` text graphic.")
+                    .snippet("Label(\"${1:Label Text}\")"),
+            )
+            .static_method(
+                Function::new("Spacer")
+                    .arg(
+                        Param::new("width", TypeRef::Float)
+                            .optional()
+                            .doc("Horizontal space in pixels (defaults to 12)."),
+                    )
+                    .arg(
+                        Param::new("height", TypeRef::Float)
+                            .optional()
+                            .doc("Vertical space in pixels (defaults to 12)."),
+                    )
+                    .returns(ui_node())
+                    .doc("Inserts empty layout spacing inside a `UI.Row` or `UI.Col`.")
+                    .snippet("Spacer(${1:12})"),
+            ),
+    );
+
+    env.add_global(
+        Global::object("UI")
+            .doc("Declarative Flexbox-style UI layout builder for Q-SYS `GetControlLayout` and `GetPages`.")
+            .design_time_only(),
     );
 }

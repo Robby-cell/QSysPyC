@@ -210,6 +210,10 @@ impl<'a> LuaEmitter<'a> {
                 }
             }
 
+            IRStmt::EmitPageLayout { page, .. } => {
+                crate::plugin::emit_page_layout_body(self, page);
+            }
+
             IRStmt::FunctionDef(f) => {
                 self.ctx.functions.insert(f.id, f.name.clone());
                 for param in &f.params {
@@ -478,10 +482,15 @@ impl<'a> LuaEmitter<'a> {
                 is_zero_based,
             } => {
                 let base_str = self.emit_expr(base);
-                let idx_str = self.emit_expr(index);
                 if *is_zero_based {
-                    format!("{base_str}[({idx_str}) + 1]")
+                    if let IRExpr::Int(n) = index.as_ref() {
+                        format!("{base_str}[{}]", n + 1)
+                    } else {
+                        let idx_str = self.emit_expr(index);
+                        format!("{base_str}[({idx_str}) + 1]")
+                    }
                 } else {
+                    let idx_str = self.emit_expr(index);
                     format!("{base_str}[{idx_str}]")
                 }
             }

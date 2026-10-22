@@ -50,6 +50,10 @@ class ControlHandle:
     RampTime: float
     """Time in seconds over which the control ramps to new values."""
 
+    def __getitem__(self, index: int) -> ControlHandle:
+        """Select a 0-based channel from a multi-channel (`count > 1`) control."""
+        ...
+
     @classmethod
     def EventHandler(cls, func: F) -> F:
         """

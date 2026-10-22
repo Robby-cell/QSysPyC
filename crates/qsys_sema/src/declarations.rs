@@ -1,13 +1,18 @@
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use qsys_diagnostics::{DiagnosticKind, Diagnostics, Span};
 use qsys_ir::{ControlId, PropertyId};
 use qsys_model::{
-    ButtonType, ControlDef, ControlKind, ControlUnit, PinStyle, PluginInfo, PropertyDef, TextType,
+    ButtonType, ControlDef, ControlKind, ControlUnit, PageLayout, PinStyle, PluginInfo,
+    PropertyDef, TextType,
 };
 use qsys_parser::ast;
 
 use crate::symbols::ScopeStack;
+use crate::ui_layout::{
+    collect_inline_ui_pages_from_stmts, extract_declarative_layout_from_method, is_ui_layout_expr,
+    parse_ui_layout_expr,
+};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConstValue {
@@ -77,7 +82,7 @@ pub fn eval_constant(expr: &ast::Expr) -> Option<ConstValue> {
         ast::ExprKind::Float(f) => Some(ConstValue::Float(*f)),
         ast::ExprKind::String(s) => Some(ConstValue::String(s.clone())),
         ast::ExprKind::Bool(b) => Some(ConstValue::Bool(*b)),
-        ast::ExprKind::List(items) => {
+        ast::ExprKind::List(items) | ast::ExprKind::Tuple(items) => {
             let mut list = Vec::new();
             for item in items {
                 list.push(eval_constant(item)?);
@@ -96,6 +101,50 @@ pub fn eval_constant(expr: &ast::Expr) -> Option<ConstValue> {
             op: ast::UnaryOp::Pos,
             operand,
         } => eval_constant(operand),
+        ast::ExprKind::Binary { left, op, right } => {
+            let l = eval_constant(left)?;
+            let r = eval_constant(right)?;
+            match (l, op, r) {
+                (ConstValue::Int(a), ast::BinaryOp::Add, ConstValue::Int(b)) => {
+                    Some(ConstValue::Int(a + b))
+                }
+                (ConstValue::Int(a), ast::BinaryOp::Sub, ConstValue::Int(b)) => {
+                    Some(ConstValue::Int(a - b))
+                }
+                (ConstValue::Int(a), ast::BinaryOp::Mul, ConstValue::Int(b)) => {
+                    Some(ConstValue::Int(a * b))
+                }
+                (ConstValue::Float(a), ast::BinaryOp::Add, ConstValue::Float(b)) => {
+                    Some(ConstValue::Float(a + b))
+                }
+                (ConstValue::Float(a), ast::BinaryOp::Sub, ConstValue::Float(b)) => {
+                    Some(ConstValue::Float(a - b))
+                }
+                (ConstValue::Float(a), ast::BinaryOp::Mul, ConstValue::Float(b)) => {
+                    Some(ConstValue::Float(a * b))
+                }
+                (ConstValue::String(a), ast::BinaryOp::Add, ConstValue::String(b)) => {
+                    Some(ConstValue::String(format!("{a}{b}")))
+                }
+                _ => None,
+            }
+        }
+        ast::ExprKind::Call { callee, args, .. } => {
+            if let ast::ExprKind::Ident(fn_name) = &callee.kind
+                && fn_name == "str"
+                && args.len() == 1
+            {
+                match eval_constant(&args[0])? {
+                    ConstValue::Int(i) => Some(ConstValue::String(i.to_string())),
+                    ConstValue::Float(f) => Some(ConstValue::String(f.to_string())),
+                    ConstValue::String(s) => Some(ConstValue::String(s)),
+                    ConstValue::Bool(b) => Some(ConstValue::String(b.to_string())),
+                    ConstValue::List(_) => None,
+                }
+            } else {
+                None
+            }
+        }
         _ => None,
     }
 }
@@ -119,6 +168,8 @@ pub struct ExtractedDeclarations {
     pub controls: Vec<DeclaredControl>,
     pub properties: Vec<DeclaredProperty>,
     pub plugin_info: PluginInfo,
+    pub pages: Vec<PageLayout>,
+    pub ui_control_resolutions: Vec<(Span, ControlId)>,
     pub remaining_statements: Vec<ast::Stmt>,
 }
 
@@ -130,6 +181,7 @@ pub fn extract_class_declarations(
     let mut declarations = ExtractedDeclarations::default();
     let mut seen_controls = FxHashSet::default();
     let mut seen_properties = FxHashSet::default();
+    let mut pending_ui_exprs: Vec<ast::Expr> = Vec::new();
 
     declarations.plugin_info.name = class.name.clone();
 
@@ -143,6 +195,11 @@ pub fn extract_class_declarations(
                         continue;
                     }
                 };
+
+                if var_name == "layout" || var_name == "pages" || is_ui_layout_expr(value) {
+                    pending_ui_exprs.push(value.clone());
+                    continue;
+                }
 
                 if let Some(control_def) =
                     try_parse_control(&var_name, value, stmt.span, diagnostics)
@@ -193,7 +250,47 @@ pub fn extract_class_declarations(
                 declarations.remaining_statements.push(stmt.clone());
             }
 
+            ast::StmtKind::FunctionDef(f) if f.name == "get_control_layout" => {
+                if let Some(ui_expr) = extract_declarative_layout_from_method(&f.body) {
+                    pending_ui_exprs.push(ui_expr);
+                } else {
+                    declarations.remaining_statements.push(stmt.clone());
+                }
+            }
+
             _ => declarations.remaining_statements.push(stmt.clone()),
+        }
+    }
+
+    // Second pass: resolve declarative UI.* trees now that all controls are registered
+    for ui_expr in &pending_ui_exprs {
+        let solved_pages = parse_ui_layout_expr(
+            &class.name,
+            ui_expr,
+            &declarations.controls,
+            diagnostics,
+            &mut declarations.ui_control_resolutions,
+        );
+        declarations.pages.extend(solved_pages);
+    }
+
+    // Also validate and collect any inline UI.* calls inside hybrid `get_control_layout` methods
+    for stmt in &declarations.remaining_statements {
+        if let ast::StmtKind::FunctionDef(f) = &stmt.kind
+            && f.name == "get_control_layout"
+        {
+            let mut local_ui_vars = FxHashMap::default();
+            let inline_pages = collect_inline_ui_pages_from_stmts(
+                &class.name,
+                &f.body,
+                &declarations.controls,
+                diagnostics,
+                &mut declarations.ui_control_resolutions,
+                &mut local_ui_vars,
+            );
+            if declarations.pages.is_empty() {
+                declarations.pages.extend(inline_pages);
+            }
         }
     }
 

@@ -853,3 +853,353 @@ dialog::backdrop {
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
   z-index: 100;
 }
+
+/* =========================================================================
+   Q-SYS Control Panel UI Preview & Split Output Modes
+   ========================================================================= */
+
+.view-mode-group {
+  display: inline-flex;
+  background: #1e1e1e;
+  border: 1px solid #3c3c3c;
+  border-radius: 4px;
+  padding: 1px;
+  gap: 1px;
+}
+
+.view-mode-btn {
+  padding: 2px 9px;
+  font-size: 11px;
+  font-weight: 600;
+  background: transparent;
+  border: none;
+  color: #969696;
+  border-radius: 3px;
+}
+
+.view-mode-btn:hover {
+  color: #ffffff;
+  background: #2d2d2d;
+}
+
+.view-mode-btn.active {
+  background: #0e639c;
+  color: #ffffff;
+}
+
+.output-pane.mode-split .ui-preview-panel {
+  height: 44%;
+  min-height: 200px;
+  border-bottom: 1px solid #333333;
+}
+
+.output-pane.mode-split .lua-editor-wrap {
+  flex: 1;
+  min-height: 0;
+}
+
+.output-pane.mode-ui .ui-preview-panel {
+  flex: 1;
+  height: 100%;
+}
+
+.output-pane.mode-ui .lua-editor-wrap {
+  display: none;
+}
+
+.output-pane.mode-lua .ui-preview-panel {
+  display: none;
+}
+
+.output-pane.mode-lua .lua-editor-wrap {
+  flex: 1;
+  height: 100%;
+}
+
+.output-pane.mode-lua .lua-sub-header {
+  display: none;
+}
+
+.lua-editor-wrap {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+}
+
+.lua-sub-header {
+  height: 24px;
+  background: #252526;
+  border-bottom: 1px solid #1e1e1e;
+  padding: 0 12px;
+  display: flex;
+  align-items: center;
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  color: #888888;
+  flex-shrink: 0;
+}
+
+.ui-preview-panel {
+  display: flex;
+  flex-direction: column;
+  background: #1b1c1f;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.ui-preview-toolbar {
+  height: 30px;
+  background: #232529;
+  border-bottom: 1px solid #2e3136;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 10px;
+  flex-shrink: 0;
+}
+
+.ui-page-tabs {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  overflow-x: auto;
+}
+
+.ui-page-tab {
+  padding: 3px 10px;
+  font-size: 11px;
+  font-weight: 600;
+  background: #2c2f35;
+  color: #aaaaaa;
+  border: 1px solid #3b3f47;
+  border-radius: 3px;
+}
+
+.ui-page-tab:hover {
+  background: #353941;
+  color: #ffffff;
+}
+
+.ui-page-tab.active {
+  background: #007acc;
+  border-color: #1c97ea;
+  color: #ffffff;
+}
+
+.ui-layout-badge {
+  font-size: 10px;
+  font-weight: 700;
+  padding: 2px 6px;
+  border-radius: 3px;
+  background: rgba(78, 201, 176, 0.18);
+  color: #4ec9b0;
+  font-family: Consolas, "Courier New", monospace;
+}
+
+.ui-layout-badge.auto {
+  background: rgba(204, 167, 0, 0.2);
+  color: #e2c08d;
+}
+
+.ui-canvas-viewport {
+  flex: 1;
+  overflow: auto;
+  padding: 14px;
+  background-color: #16171a;
+  background-image: radial-gradient(#2a2d34 1px, transparent 1px);
+  background-size: 16px 16px;
+}
+
+.ui-canvas {
+  position: relative;
+  width: var(--canvas-w, 460px);
+  height: var(--canvas-h, 240px);
+  background: #262930;
+  border: 1px solid #3c4049;
+  border-radius: 6px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+}
+
+.ui-empty-notice {
+  padding: 28px;
+  color: #888888;
+  font-size: 12.5px;
+  text-align: center;
+}
+
+.ui-inspector-bar {
+  height: 24px;
+  background: #202226;
+  border-top: 1px solid #2e3136;
+  padding: 0 10px;
+  display: flex;
+  align-items: center;
+  font-size: 11px;
+  color: #9cdcfe;
+  font-family: Consolas, "Courier New", monospace;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  flex-shrink: 0;
+}
+
+/* Positioned Q-SYS Graphic Items */
+.qsys-graphic,
+.qsys-control {
+  position: absolute;
+  left: var(--x, 0px);
+  top: var(--y, 0px);
+  width: var(--w, 100px);
+  height: var(--h, 28px);
+  box-sizing: border-box;
+}
+
+.qsys-header {
+  display: flex;
+  align-items: center;
+  padding: 0 10px;
+  background: linear-gradient(180deg, #383d47 0%, #2e323b 100%);
+  border-bottom: 2px solid var(--item-color, #007acc);
+  border-radius: 3px;
+  color: #ffffff;
+  font-size: var(--font-size, 13px);
+  font-weight: 700;
+  letter-spacing: 0.3px;
+  pointer-events: auto;
+}
+
+.qsys-groupbox {
+  background: var(--item-fill, rgba(25, 27, 32, 0.55));
+  border: var(--stroke-w, 1px) solid #494e5a;
+  border-radius: 5px;
+  pointer-events: auto;
+}
+
+.qsys-groupbox-title {
+  height: 22px;
+  padding: 0 8px;
+  display: flex;
+  align-items: center;
+  background: rgba(255, 255, 255, 0.05);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.07);
+  color: #d4d7dd;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.3px;
+}
+
+.qsys-label {
+  display: flex;
+  align-items: center;
+  justify-content: var(--text-align, flex-start);
+  color: var(--item-color, #bfc5d0);
+  font-size: var(--font-size, 11px);
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  pointer-events: auto;
+}
+
+/* Positioned Q-SYS Control Widgets */
+.qsys-control {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 4px;
+  transition: box-shadow 0.1s ease;
+  z-index: 2;
+}
+
+.qsys-control:hover {
+  box-shadow: 0 0 0 1.5px #3794ff;
+}
+
+.qsys-btn-widget {
+  width: 100%;
+  height: 100%;
+  background: linear-gradient(180deg, #3c414d 0%, #2d313a 100%);
+  border: 1px solid #555b69;
+  border-radius: 4px;
+  color: #e6e9ef;
+  font-size: 11.5px;
+  font-weight: 600;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 6px;
+}
+
+.qsys-btn-widget.active {
+  background: var(--ctl-color, #0e639c);
+  border-color: #3794ff;
+  color: #ffffff;
+  box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.35);
+}
+
+.qsys-fader-widget {
+  width: 100%;
+  height: 100%;
+  background: #1c1e24;
+  border: 1px solid #434854;
+  border-radius: 4px;
+  padding: 2px 8px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.qsys-fader-input {
+  flex: 1;
+  min-width: 0;
+  accent-color: var(--ctl-color, #007acc);
+  cursor: pointer;
+  padding: 0;
+  border: none;
+  background: transparent;
+}
+
+.qsys-fader-readout {
+  font-size: 10.5px;
+  font-family: Consolas, "Courier New", monospace;
+  color: #4ec9b0;
+  min-width: 44px;
+  text-align: right;
+}
+
+.qsys-text-widget {
+  width: 100%;
+  height: 100%;
+  background: #15171c;
+  border: 1px solid #454a57;
+  border-radius: 4px;
+  color: #e2e8f0;
+  font-family: Consolas, "Courier New", monospace;
+  font-size: 11.5px;
+  padding: 0 8px;
+}
+
+.qsys-text-widget[readonly] {
+  background: #1d2026;
+  color: #4ec9b0;
+  border-color: #383d47;
+}
+
+.qsys-led-widget {
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--ctl-color, #2ea043);
+  border: 2px solid #444c56;
+  box-shadow: 0 0 8px var(--ctl-color, rgba(46, 160, 67, 0.65));
+  cursor: pointer;
+}
+
+.qsys-led-widget.off {
+  background: #2b2f36;
+  box-shadow: none;
+}
+

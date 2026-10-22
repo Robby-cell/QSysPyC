@@ -5,6 +5,7 @@ pub mod declarations;
 pub mod lower;
 pub mod symbols;
 pub mod types;
+pub mod ui_layout;
 
 use std::sync::Arc;
 
@@ -12,7 +13,7 @@ use rustc_hash::FxHashMap;
 
 use qsys_diagnostics::{Diagnostics, SourceFile, Span};
 use qsys_ir::{FunctionId, SymbolId};
-use qsys_model::{PluginInfo, is_design_time_method};
+use qsys_model::{PageLayout, PluginInfo, is_design_time_method};
 use qsys_parser::{ParsedModule, ast};
 use qsys_runtime::{ExecutionContext, RuntimeEnv};
 
@@ -55,6 +56,7 @@ pub struct PluginSemantic {
     pub class_name: String,
     pub properties: Vec<DeclaredProperty>,
     pub controls: Vec<DeclaredControl>,
+    pub pages: Vec<PageLayout>,
     pub helper_classes: Vec<ast::ClassDef>,
     pub event_bindings: Vec<ResolvedBinding>,
     pub methods: Vec<ResolvedMethod>,
@@ -199,6 +201,11 @@ pub fn analyze_lossy_with_env(
         TargetClassification::Plugin { class } => {
             let decls = extract_class_declarations(class, &mut scope_stack, &mut diagnostics);
 
+            for (span, ctl_id) in &decls.ui_control_resolutions {
+                type_map.insert_resolution(*span, ResolvedTarget::Control(*ctl_id));
+                type_map.insert_type(*span, Type::ControlHandle);
+            }
+
             scope_stack.push_scope(ScopeKind::Class {
                 name: class.name.clone(),
             });
@@ -300,6 +307,11 @@ pub fn analyze_lossy_with_env(
                         for (idx, param) in f.params.iter().enumerate().skip(skip_count) {
                             let param_ty = if is_event_handler && idx == 1 {
                                 Type::ControlHandle
+                            } else if is_event_handler
+                                && idx == 2
+                                && param.type_annotation.is_none()
+                            {
+                                Type::Int
                             } else {
                                 type_from_annotation(param.type_annotation.as_deref(), &env)
                             };
@@ -381,6 +393,7 @@ pub fn analyze_lossy_with_env(
                 class_name: class.name.clone(),
                 properties: decls.properties,
                 controls: decls.controls,
+                pages: decls.pages,
                 helper_classes: custom_classes,
                 event_bindings,
                 methods,
@@ -477,6 +490,11 @@ pub fn analyze_lossy_with_env(
                         for (idx, param) in f.params.iter().enumerate().skip(skip_count) {
                             let param_ty = if is_event_handler && idx == 1 {
                                 Type::ControlHandle
+                            } else if is_event_handler
+                                && idx == 2
+                                && param.type_annotation.is_none()
+                            {
+                                Type::Int
                             } else {
                                 type_from_annotation(param.type_annotation.as_deref(), &env)
                             };

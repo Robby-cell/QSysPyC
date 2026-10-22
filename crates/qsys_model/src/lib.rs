@@ -8,7 +8,8 @@ pub use controls::{
     ButtonType, ControlDef, ControlKind, ControlMember, ControlUnit, PinStyle, TextType,
 };
 pub use layout::{
-    Color, ControlLayoutDef, ControlStyle, GraphicItem, GraphicItemKind, Position, Size,
+    Color, ControlLayoutDef, ControlStyle, FlexDirection, GraphicItem, GraphicItemKind,
+    LabelPlacement, PageLayout, Position, Size, UiControlSpec, UiNode, UiPageSpec,
 };
 pub use plugin_info::PluginInfo;
 pub use properties::{PropertyDef, PropertyKind};

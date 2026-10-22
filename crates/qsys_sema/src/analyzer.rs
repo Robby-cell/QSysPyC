@@ -179,6 +179,7 @@ impl<'a> ExprAnalyzer<'a> {
                 let iter_ty = self.infer_expr(iterable);
                 let elem_ty = match iter_ty {
                     Type::List(elem) => *elem,
+                    Type::ControlHandle => Type::ControlHandle,
                     _ => Type::Any,
                 };
 
@@ -595,6 +596,7 @@ impl<'a> ExprAnalyzer<'a> {
                 let val_ty = self.infer_expr(value);
                 let _ = self.infer_expr(index);
                 match val_ty {
+                    Type::ControlHandle => Type::ControlHandle,
                     Type::List(elem) => *elem,
                     Type::Dict(_, val) => *val,
                     Type::String => Type::String,

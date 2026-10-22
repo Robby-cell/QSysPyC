@@ -249,3 +249,61 @@ fn test_runtime_env_powers_ide_features() {
     let sig = Analyzer::signature_help("x = len(", 1, 9).expect("Signature for len");
     assert_eq!(sig.label, "len(obj: Any)");
 }
+
+#[test]
+fn test_declarative_ui_diagnostics_and_preview_payload() {
+    // 1. Typo in UI.Field control reference produces fuzzy UnknownClassMember suggestion
+    let bad_src = r#"
+class Mixer(QSysPlugin):
+    MasterGain = Control.Float(name="MasterGain", min=-100.0, max=20.0)
+    layout = UI.Page("Main", UI.Field("Gain", MasterGani))
+"#;
+    let bad_errs = Compiler::compile(bad_src, &CompilerOptions::default()).unwrap_err();
+    let msg = bad_errs.items[0].message();
+    assert!(
+        msg.contains("MasterGani") && msg.contains("did you mean 'MasterGain'?"),
+        "Should suggest MasterGain for typo in UI.Field: {msg}"
+    );
+
+    // 2. Out-of-bounds channel subscript in UI.Control produces error
+    let oob_src = r#"
+class Mixer(QSysPlugin):
+    Ch = Control.Float(name="Ch", count=4)
+    layout = UI.Page("Main", UI.Control(Ch[4]))
+"#;
+    let oob_errs = Compiler::compile(oob_src, &CompilerOptions::default()).unwrap_err();
+    assert!(
+        oob_errs.items[0].message().contains("out of bounds"),
+        "Should catch out-of-bounds channel index: {}",
+        oob_errs.items[0].message()
+    );
+
+    // 3. Valid plugin produces UI preview JSON payload with pages, controls, and graphics
+    let ok_src = r#"
+class Mixer(QSysPlugin):
+    Master = Control.Float(name="MasterGain", min=-100.0, max=20.0, default=0.0, unit="dB")
+    Mute = Control.Button(name="MuteAll", type="Toggle")
+
+    layout = UI.Page(
+        "Main",
+        UI.GroupBox("Master",
+            UI.Row(
+                UI.Field("Master", Master, style="Fader"),
+                UI.Field("Mute", Mute),
+            ),
+        ),
+    )
+"#;
+    let ok_artifact = Compiler::compile(ok_src, &CompilerOptions::default()).expect("Should compile");
+    let preview_json = ok_artifact.to_ui_preview_json();
+    assert!(preview_json.contains("\"has_explicit_layout\":true"));
+    assert!(preview_json.contains("\"MasterGain\""));
+    assert!(preview_json.contains("\"MuteAll\""));
+
+    // 4. Completions after `UI.` include Page, GroupBox, Row, Col, Field, Control
+    let ui_completions = Analyzer::completions("class M(QSysPlugin):\n    layout = UI.\n", 2, 17);
+    assert!(ui_completions.iter().any(|c| c.label == "Page"));
+    assert!(ui_completions.iter().any(|c| c.label == "GroupBox"));
+    assert!(ui_completions.iter().any(|c| c.label == "Field"));
+}
+

@@ -12,7 +12,7 @@ export const PYRIGHT_CONFIG = JSON.stringify(
 );
 
 export const STARTER_FILES = {
-  "src/matrix_mixer.py": `from qsys import Control, ControlHandle, Property, QSysPlugin
+  "src/matrix_mixer.py": `from qsys import Control, ControlHandle, Property, QSysPlugin, UI
 from dsp_math import GainScaler
 
 class MatrixMixer(QSysPlugin):
@@ -25,6 +25,20 @@ class MatrixMixer(QSysPlugin):
     Mute = Control.Button(name="MuteAll", type="Toggle")
     Status = Control.Text(name="Status", default="Ready", type="ReadOnly", pins="Output")
     Channels = Property.Integer(name="ChannelCount", default=8, min=1, max=64)
+
+    # Declarative Q-SYS Control Layout using direct control references (no magic strings!)
+    layout = UI.Page(
+        "Mixer",
+        UI.Header("8x8 Matrix Gain Processor"),
+        UI.GroupBox(
+            "Master Output",
+            UI.Row(
+                UI.Field("Master Gain (dB)", Gain, style="Fader", width=180),
+                UI.Field("Master Mute", Mute, color="#ef4444"),
+                UI.Field("DSP Status", Status, width=160),
+            ),
+        ),
+    )
 
     @Gain.EventHandler
     def on_gain(self, ctl: ControlHandle):
@@ -53,7 +67,7 @@ class GainScaler:
         return value
 `,
 
-  "src/wake_on_lan.py": `from qsys import Control, ControlHandle, QSysPlugin, UdpSocket
+  "src/wake_on_lan.py": `from qsys import Control, ControlHandle, QSysPlugin, UI, UdpSocket
 
 class WakeOnLan(QSysPlugin):
     version = "1.0.0"
@@ -65,6 +79,23 @@ class WakeOnLan(QSysPlugin):
     SendButton = Control.Button(name="Send", type="Trigger", pins="None")
     TriggerPin = Control.Button(name="Trigger", type="Trigger", pins="Input")
     Status = Control.Text(name="Status", default="Ready", pins="Output")
+
+    layout = UI.Page(
+        "Wake-on-LAN",
+        UI.Header("Wake-on-LAN Broadcast Transmitter"),
+        UI.GroupBox(
+            "Target Host",
+            UI.Row(
+                UI.Field("Broadcast IP", IPAddress, width=150),
+                UI.Field("Target MAC", MACAddress, width=150),
+            ),
+            UI.Row(
+                UI.Field("Wake Host", SendButton, legend="Send Packet", color="#0e639c"),
+                UI.Field("Trigger Pin", TriggerPin, legend="Pulse"),
+                UI.Field("Status", Status, width=140, read_only=True),
+            ),
+        ),
+    )
 
     def send_packet(self):
         sock = UdpSocket.New()
@@ -199,7 +230,7 @@ class ${safeClass}(TextController):
   return {
     files: {
       ...baseFiles,
-      "src/main.py": `from qsys import Control, ControlHandle, Property, QSysPlugin
+      "src/main.py": `from qsys import Control, ControlHandle, Property, QSysPlugin, UI
 from helpers import format_status
 
 class ${safeClass}(QSysPlugin):
@@ -209,6 +240,18 @@ class ${safeClass}(QSysPlugin):
 
     Enable = Control.Button(name="Enable", type="Toggle")
     Status = Control.Text(name="Status", default="Standby", type="ReadOnly", pins="Output")
+
+    layout = UI.Page(
+        "Main",
+        UI.Header("${projectName}"),
+        UI.GroupBox(
+            "Controls",
+            UI.Row(
+                UI.Field("Enable System", Enable),
+                UI.Field("System Status", Status, width=160),
+            ),
+        ),
+    )
 
     @Enable.EventHandler
     def on_enable(self, ctl: ControlHandle):

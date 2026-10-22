@@ -8,6 +8,7 @@ pub struct CompilationResult {
     lua: String,
     markers_json: String,
     target_kind: String,
+    ui_preview_json: String,
 }
 
 #[wasm_bindgen]
@@ -31,6 +32,11 @@ impl CompilationResult {
     pub fn target_kind(&self) -> String {
         self.target_kind.clone()
     }
+
+    #[wasm_bindgen(getter)]
+    pub fn ui_preview(&self) -> String {
+        self.ui_preview_json.clone()
+    }
 }
 
 #[wasm_bindgen]
@@ -44,11 +50,13 @@ pub fn compile_qsyspy(source: &str, filename: Option<String>) -> CompilationResu
     match Compiler::compile(source, &options) {
         Ok(artifact) => {
             let markers_json = artifact.to_editor_markers_json();
+            let ui_preview_json = artifact.to_ui_preview_json();
             CompilationResult {
                 success: true,
                 lua: artifact.lua,
                 markers_json,
                 target_kind: format!("{:?}", artifact.program_kind),
+                ui_preview_json,
             }
         }
         Err(diags) => {
@@ -59,6 +67,7 @@ pub fn compile_qsyspy(source: &str, filename: Option<String>) -> CompilationResu
                 lua: String::new(),
                 markers_json: serde_json::to_string(&markers).unwrap_or_else(|_| "[]".to_string()),
                 target_kind: "Unknown".to_string(),
+                ui_preview_json: "{}".to_string(),
             }
         }
     }

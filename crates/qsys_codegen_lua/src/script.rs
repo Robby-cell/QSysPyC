@@ -47,11 +47,39 @@ pub fn emit_script(script: &IRScript, ctx: &mut CodegenContext) -> String {
     // Emit event bindings
     for binding in &script.event_bindings {
         let ctl_ref = format!("Controls[{}]", escape_lua_string(&binding.control_name));
-        emitter.write_line(&format!("{ctl_ref}.EventHandler = function(ctl)"));
-        emitter.indent();
-        emitter.write_line(&format!("{}(ctl)", binding.handler_name));
-        emitter.dedent();
-        emitter.write_line("end\n");
+        let ctl_count = script
+            .controls
+            .iter()
+            .find(|c| c.id == binding.control_id)
+            .map(|c| c.def.count)
+            .unwrap_or(1);
+
+        if let Some(ch_idx) = binding.channel_index {
+            emitter.write_line(&format!(
+                "{ctl_ref}[{}].EventHandler = function(ctl)",
+                ch_idx + 1
+            ));
+            emitter.indent();
+            emitter.write_line(&format!("{}(ctl)", binding.handler_name));
+            emitter.dedent();
+            emitter.write_line("end\n");
+        } else if ctl_count > 1 {
+            emitter.write_line(&format!("for ix, ctl in ipairs({ctl_ref}) do"));
+            emitter.indent();
+            emitter.write_line("ctl.EventHandler = function(c)");
+            emitter.indent();
+            emitter.write_line(&format!("{}(c, ix - 1)", binding.handler_name));
+            emitter.dedent();
+            emitter.write_line("end");
+            emitter.dedent();
+            emitter.write_line("end\n");
+        } else {
+            emitter.write_line(&format!("{ctl_ref}.EventHandler = function(ctl)"));
+            emitter.indent();
+            emitter.write_line(&format!("{}(ctl)", binding.handler_name));
+            emitter.dedent();
+            emitter.write_line("end\n");
+        }
     }
 
     // Emit top-level body statements (including custom classes in declaration order)
