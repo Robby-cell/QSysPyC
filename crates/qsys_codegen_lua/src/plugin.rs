@@ -223,9 +223,15 @@ pub fn emit_plugin(plugin: &IRPlugin, ctx: &mut CodegenContext) -> String {
         emitter.write_line(&format!("{}_runtime(nil)", plugin.class_name));
     }
 
+    let mut runtime_helpers = String::new();
+    if emitter.ctx.needs_ctl_index_helper {
+        runtime_helpers.push_str(&format_ctl_index_helper());
+    }
     if emitter.ctx.needs_generic_data_helper {
-        let helper_code = format_generic_data_helpers();
-        emitter.buffer.insert_str(runtime_body_offset, &helper_code);
+        runtime_helpers.push_str(&format_generic_data_helpers());
+    }
+    if !runtime_helpers.is_empty() {
+        emitter.buffer.insert_str(runtime_body_offset, &runtime_helpers);
     }
 
     emitter.dedent();
@@ -807,6 +813,15 @@ fn emit_method(emitter: &mut LuaEmitter<'_>, class_name: &str, method: &IRFuncti
     emitter.write_line("end\n");
 
     emitter.ctx.active_handler_control = prev_handler_ctl;
+}
+
+fn format_ctl_index_helper() -> String {
+    let mut out = String::new();
+    out.push_str("    local function __qsys_ctl(ctl, idx, count)\n");
+    out.push_str("        if count == 1 or type(ctl) ~= \"table\" then return ctl end\n");
+    out.push_str("        return ctl[idx]\n");
+    out.push_str("    end\n\n");
+    out
 }
 
 fn format_generic_data_helpers() -> String {

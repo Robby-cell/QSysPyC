@@ -15,6 +15,7 @@ pub struct CodegenContext {
     pub local_controls: FxHashMap<SymbolId, ControlId>,
     pub needs_truthy_helper: bool,
     pub needs_generic_data_helper: bool,
+    pub needs_ctl_index_helper: bool,
 }
 
 impl CodegenContext {

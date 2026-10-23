@@ -574,25 +574,17 @@ impl<'a> LuaEmitter<'a> {
                     && let Some(def) = self.ctx.controls.get(ctl_id).cloned()
                     && let Some(ref prop_name) = def.count_property
                 {
+                    self.ctx.needs_ctl_index_helper = true;
                     let ctl_str = format!("Controls[{}]", escape_lua_string(&def.name));
                     let prop_str = format_count_lua_expr(prop_name, "Properties");
-                    let idx_1 = if let IRExpr::Int(n) = index.as_ref() {
-                        (n + 1).to_string()
-                    } else {
-                        let idx_str = self.emit_expr(index);
-                        format!("({idx_str}) + 1")
-                    };
-                    return format!("(({prop_str} == 1) and {ctl_str} or {ctl_str}[{idx_1}])");
+                    let idx_1 = self.format_one_based_index(index);
+                    return format!("__qsys_ctl({ctl_str}, {idx_1}, {prop_str})");
                 }
 
                 let base_str = self.emit_expr(base);
                 if *is_zero_based {
-                    if let IRExpr::Int(n) = index.as_ref() {
-                        format!("{base_str}[{}]", n + 1)
-                    } else {
-                        let idx_str = self.emit_expr(index);
-                        format!("{base_str}[({idx_str}) + 1]")
-                    }
+                    let idx_1 = self.format_one_based_index(index);
+                    format!("{base_str}[{idx_1}]")
                 } else {
                     let idx_str = self.emit_expr(index);
                     format!("{base_str}[{idx_str}]")
@@ -703,6 +695,56 @@ impl<'a> LuaEmitter<'a> {
             }
         }
         "nil".to_string()
+    }
+
+    pub fn format_one_based_index(&mut self, index: &IRExpr) -> String {
+        match index {
+            IRExpr::Int(n) => (n + 1).to_string(),
+            IRExpr::Binary {
+                left,
+                op: IRBinaryOp::Add,
+                right,
+            } => {
+                if let IRExpr::Int(n) = right.as_ref() {
+                    let l_str = self.emit_expr(left);
+                    if n + 1 == 0 {
+                        return l_str;
+                    } else if n + 1 > 0 {
+                        return format!("{l_str} + {}", n + 1);
+                    } else {
+                        return format!("{l_str} - {}", -(n + 1));
+                    }
+                }
+                let idx_str = self.emit_expr(index);
+                format!("{idx_str} + 1")
+            }
+            IRExpr::Binary {
+                left,
+                op: IRBinaryOp::Sub,
+                right,
+            } => {
+                if let IRExpr::Int(n) = right.as_ref() {
+                    let l_str = self.emit_expr(left);
+                    if *n == 1 {
+                        return l_str;
+                    } else if *n > 1 {
+                        return format!("{l_str} - {}", n - 1);
+                    } else {
+                        return format!("{l_str} + {}", 1 - n);
+                    }
+                }
+                let idx_str = self.emit_expr(index);
+                format!("{idx_str} + 1")
+            }
+            _ => {
+                let idx_str = self.emit_expr(index);
+                if idx_str.starts_with('(') && idx_str.ends_with(')') {
+                    format!("{idx_str} + 1")
+                } else {
+                    format!("({idx_str}) + 1")
+                }
+            }
+        }
     }
 }
 

@@ -706,9 +706,9 @@ class DynamicInputPlugin(QSysPlugin):
         "Runtime @Inputs.EventHandler must handle count == 1 vs >= 2:\n{lua}"
     );
 
-    // 5. Runtime indexing `self.Mutes[index]` must respect `== 1` vs `>= 2`
+    // 5. Runtime indexing `self.Mutes[index]` must respect `== 1` vs `>= 2` via `__qsys_ctl`
     assert!(
-        lua.contains("((Properties[\"number of inputs\"].Value == 1) and Controls[\"mutes\"] or Controls[\"mutes\"][(index) + 1]).Boolean"),
+        lua.contains("__qsys_ctl(Controls[\"mutes\"], (index) + 1, Properties[\"number of inputs\"].Value).Boolean"),
         "Runtime indexing on property-counted control must handle count == 1 vs >= 2:\n{lua}"
     );
 
@@ -829,6 +829,8 @@ class WakeOnLan(QSysPlugin):
     @Inputs.EventHandler
     def on_input(self, ctl, index):
         print(index, ctl.Data)
+        self.TrioInputs[index*2].Value = ctl.Value
+        self.TrioInputs[index*2+1].Value = ctl.Value
 "#;
     let lua = compile_to_lua(src);
 
@@ -847,5 +849,10 @@ class WakeOnLan(QSysPlugin):
     assert!(
         lua.contains("if Properties[\"Count\"].Value * Properties[\"Channels\"].Value == 1 then"),
         "Runtime EventHandler must guard == 1 vs >= 2 with compound property expression:\n{lua}"
+    );
+    assert!(
+        lua.contains("__qsys_ctl(Controls[\"TrioInputs\"], (index * 2) + 1, 3 * Properties[\"Channels\"].Value).Value = ctl.Value")
+            && lua.contains("__qsys_ctl(Controls[\"TrioInputs\"], (index * 2) + 2, 3 * Properties[\"Channels\"].Value).Value = ctl.Value"),
+        "Consecutive indexed assignments on property-counted controls must emit __qsys_ctl without leading '(':\n{lua}"
     );
 }
