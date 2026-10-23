@@ -278,7 +278,7 @@ class DynamicTypePlugin(QSysPlugin):
 | `default` | `float \| str` | `0.0` / `""` | Initial default numeric or string value |
 | `pins` | `str` | `"Both"` | `"None"`, `"Input"`, `"Output"`, `"Both"` |
 | `user_pin` | `bool` | `True` | `True`, `False` |
-| `count` | `int \| PropertyHandle` | `1` | Integer $\ge 1$ or `Property.Integer` reference |
+| `count` | `int \| PropertyHandle` | `1` | Integer $\ge 1$, a `Property.Integer` reference (`count=Channels`), or any arithmetic expression of `Property.Integer`s and integers (`count=(Count * Channels)`, `count=3 * Channels`) |
 
 ---
 

@@ -447,31 +447,91 @@ fn resolve_type_property_arg(
     None
 }
 
-fn resolve_count_arg(
-    val: &ast::Expr,
+fn eval_count_expr(
+    expr: &ast::Expr,
     control_name: &str,
     properties: &[DeclaredProperty],
     prop_resolutions: &mut Vec<(Span, PropertyId)>,
     diagnostics: &mut Diagnostics,
-) -> Option<(usize, Option<String>)> {
-    if let Some(c) = eval_constant(val).and_then(|c| c.as_i64()) {
-        if c > 0 {
-            return Some((c as usize, None));
+    reported_error: &mut bool,
+) -> Option<(i64, String, bool)> {
+    match &expr.kind {
+        ast::ExprKind::Int(i) => return Some((*i, i.to_string(), false)),
+        ast::ExprKind::Unary {
+            op: ast::UnaryOp::Pos,
+            operand,
+        } => {
+            return eval_count_expr(
+                operand,
+                control_name,
+                properties,
+                prop_resolutions,
+                diagnostics,
+                reported_error,
+            );
         }
-        diagnostics.report(
-            DiagnosticKind::InvalidDeclarationArgument {
-                name: control_name.to_string(),
-                message: "'count' must be a positive integer or a Property.Integer".to_string(),
-            },
-            val.span,
-        );
-        return None;
+        ast::ExprKind::Unary {
+            op: ast::UnaryOp::Neg,
+            operand,
+        } => {
+            let (v, s, has_p) = eval_count_expr(
+                operand,
+                control_name,
+                properties,
+                prop_resolutions,
+                diagnostics,
+                reported_error,
+            )?;
+            return Some((v.saturating_neg(), format!("(-{s})"), has_p));
+        }
+        ast::ExprKind::Binary { left, op, right } => {
+            let (lv, ls, lp) = eval_count_expr(
+                left,
+                control_name,
+                properties,
+                prop_resolutions,
+                diagnostics,
+                reported_error,
+            )?;
+            let (rv, rs, rp) = eval_count_expr(
+                right,
+                control_name,
+                properties,
+                prop_resolutions,
+                diagnostics,
+                reported_error,
+            )?;
+            let has_p = lp || rp;
+            return match op {
+                ast::BinaryOp::Add => {
+                    Some((lv.saturating_add(rv), format!("({ls} + {rs})"), has_p))
+                }
+                ast::BinaryOp::Sub => {
+                    Some((lv.saturating_sub(rv), format!("({ls} - {rs})"), has_p))
+                }
+                ast::BinaryOp::Mul => Some((lv.saturating_mul(rv), format!("{ls} * {rs}"), has_p)),
+                ast::BinaryOp::FloorDiv | ast::BinaryOp::Div => {
+                    let v = if rv != 0 { lv / rv } else { 1 };
+                    Some((v, format!("({ls} // {rs})"), has_p))
+                }
+                ast::BinaryOp::Mod => {
+                    let v = if rv != 0 { lv % rv } else { 0 };
+                    Some((v, format!("({ls} % {rs})"), has_p))
+                }
+                ast::BinaryOp::Pow => {
+                    let v = lv.saturating_pow(rv.max(0) as u32);
+                    Some((v, format!("({ls} ^ {rs})"), has_p))
+                }
+                _ => None,
+            };
+        }
+        _ => {}
     }
 
     let mut prop_ident_opt: Option<&str> = None;
     let mut prop_key_opt: Option<String> = None;
 
-    let mut target = val;
+    let mut target = expr;
     if let ast::ExprKind::Attribute { value, attr } = &target.kind
         && attr == "Value"
     {
@@ -499,10 +559,15 @@ fn resolve_count_arg(
             .iter()
             .find(|p| p.ident == prop_ident || p.def.name == prop_ident)
     {
-        prop_resolutions.push((val.span, prop.id));
+        prop_resolutions.push((expr.span, prop.id));
         if let qsys_model::PropertyKind::Integer { default, .. } = &prop.def.kind {
-            return Some(((*default).max(1) as usize, Some(prop.def.name.clone())));
+            return Some((
+                (*default).max(1),
+                format!("{{PROP:{}}}", prop.def.name),
+                true,
+            ));
         }
+        *reported_error = true;
         diagnostics.report(
             DiagnosticKind::InvalidDeclarationArgument {
                 name: control_name.to_string(),
@@ -511,7 +576,7 @@ fn resolve_count_arg(
                     prop.ident
                 ),
             },
-            val.span,
+            expr.span,
         );
         return None;
     }
@@ -521,10 +586,15 @@ fn resolve_count_arg(
             .iter()
             .find(|p| p.def.name == prop_key || p.ident == prop_key)
         {
-            prop_resolutions.push((val.span, prop.id));
+            prop_resolutions.push((expr.span, prop.id));
             if let qsys_model::PropertyKind::Integer { default, .. } = &prop.def.kind {
-                return Some(((*default).max(1) as usize, Some(prop.def.name.clone())));
+                return Some((
+                    (*default).max(1),
+                    format!("{{PROP:{}}}", prop.def.name),
+                    true,
+                ));
             }
+            *reported_error = true;
             diagnostics.report(
                 DiagnosticKind::InvalidDeclarationArgument {
                     name: control_name.to_string(),
@@ -533,20 +603,68 @@ fn resolve_count_arg(
                         prop.def.name
                     ),
                 },
+                expr.span,
+            );
+            return None;
+        }
+        return Some((1, format!("{{PROP:{prop_key}}}"), true));
+    }
+
+    None
+}
+
+fn resolve_count_arg(
+    val: &ast::Expr,
+    control_name: &str,
+    properties: &[DeclaredProperty],
+    prop_resolutions: &mut Vec<(Span, PropertyId)>,
+    diagnostics: &mut Diagnostics,
+) -> Option<(usize, Option<String>)> {
+    let mut reported_error = false;
+    if let Some((evaluated_val, template, has_prop)) = eval_count_expr(
+        val,
+        control_name,
+        properties,
+        prop_resolutions,
+        diagnostics,
+        &mut reported_error,
+    ) {
+        if !has_prop {
+            if evaluated_val > 0 {
+                return Some((evaluated_val as usize, None));
+            }
+            diagnostics.report(
+                DiagnosticKind::InvalidDeclarationArgument {
+                    name: control_name.to_string(),
+                    message: "'count' must be a positive integer or a Property.Integer".to_string(),
+                },
                 val.span,
             );
             return None;
         }
-        return Some((1, Some(prop_key)));
+
+        let preview_count = evaluated_val.clamp(1, 128) as usize;
+        let normalized_spec = if let Some(inner) = template
+            .strip_prefix("{PROP:")
+            .and_then(|s| s.strip_suffix('}'))
+            && !inner.contains("{PROP:")
+        {
+            inner.to_string()
+        } else {
+            template
+        };
+        return Some((preview_count, Some(normalized_spec)));
     }
 
-    diagnostics.report(
-        DiagnosticKind::InvalidDeclarationArgument {
-            name: control_name.to_string(),
-            message: "'count' must be a positive integer or a Property.Integer".to_string(),
-        },
-        val.span,
-    );
+    if !reported_error {
+        diagnostics.report(
+            DiagnosticKind::InvalidDeclarationArgument {
+                name: control_name.to_string(),
+                message: "'count' must be a positive integer or a Property.Integer".to_string(),
+            },
+            val.span,
+        );
+    }
     None
 }
 

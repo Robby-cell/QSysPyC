@@ -807,3 +807,45 @@ class GenericControlPlugin(QSysPlugin):
         "Standard .String and .Value fields must still emit direct field access:\n{lua}"
     );
 }
+
+#[test]
+fn test_compound_property_count_expressions_and_generic_controls() {
+    let src = r#"
+class WakeOnLan(QSysPlugin):
+    Channels = Property.Integer(name="Channels", default=9, min=1, max=65535)
+    Count = Property.Integer(name="Count", default=9, min=1, max=65535)
+    MyType = Property.Enum(name="MyType", choices=["string"], default="string")
+    Inputs = Control.Generic(MyType, name="Inputs", count=(Count*Channels))
+    TrioInputs = Control.[MyType](name="TrioInputs", count=3*Channels)
+
+    layout = UI.Page(
+        "Main",
+        UI.GroupBox(
+            "Matrix",
+            UI.Field("Input {i}", Inputs),
+        ),
+    )
+
+    @Inputs.EventHandler
+    def on_input(self, ctl, index):
+        print(index, ctl.Data)
+"#;
+    let lua = compile_to_lua(src);
+
+    assert!(
+        lua.contains("Count = props[\"Count\"].Value * props[\"Channels\"].Value,"),
+        "GetControls must emit compound Count = props['Count'].Value * props['Channels'].Value:\n{lua}"
+    );
+    assert!(
+        lua.contains("Count = 3 * props[\"Channels\"].Value,"),
+        "GetControls must emit scaled Count = 3 * props['Channels'].Value:\n{lua}"
+    );
+    assert!(
+        lua.contains("for i = 1, props[\"Count\"].Value * props[\"Channels\"].Value do"),
+        "GetControlLayout must loop 1..props['Count'].Value * props['Channels'].Value:\n{lua}"
+    );
+    assert!(
+        lua.contains("if Properties[\"Count\"].Value * Properties[\"Channels\"].Value == 1 then"),
+        "Runtime EventHandler must guard == 1 vs >= 2 with compound property expression:\n{lua}"
+    );
+}

@@ -184,8 +184,7 @@ impl<'a> LuaEmitter<'a> {
                         && let Some(ref prop_name) = def.count_property
                     {
                         let ctl_str = format!("Controls[{}]", escape_lua_string(&def.name));
-                        let prop_str =
-                            format!("Properties[{}].Value", escape_lua_string(prop_name));
+                        let prop_str = format_count_lua_expr(prop_name, "Properties");
                         self.write_line(&format!(
                             "for _, {var_name} in ipairs(({prop_str} == 1) and {{ {ctl_str} }} or {ctl_str}) do"
                         ));
@@ -481,7 +480,7 @@ impl<'a> LuaEmitter<'a> {
                         && let Some(def) = self.ctx.controls.get(ctl_id)
                         && let Some(ref prop_name) = def.count_property
                     {
-                        format!("Properties[{}].Value", escape_lua_string(prop_name))
+                        format_count_lua_expr(prop_name, "Properties")
                     } else {
                         format!("(#{})", self.emit_expr(operand))
                     }
@@ -576,7 +575,7 @@ impl<'a> LuaEmitter<'a> {
                     && let Some(ref prop_name) = def.count_property
                 {
                     let ctl_str = format!("Controls[{}]", escape_lua_string(&def.name));
-                    let prop_str = format!("Properties[{}].Value", escape_lua_string(prop_name));
+                    let prop_str = format_count_lua_expr(prop_name, "Properties");
                     let idx_1 = if let IRExpr::Int(n) = index.as_ref() {
                         (n + 1).to_string()
                     } else {
@@ -704,6 +703,32 @@ impl<'a> LuaEmitter<'a> {
             }
         }
         "nil".to_string()
+    }
+}
+
+pub fn format_count_lua_expr(spec: &str, table_var: &str) -> String {
+    if spec.contains("{PROP:") {
+        let mut out = String::new();
+        let mut rest = spec;
+        while let Some(start) = rest.find("{PROP:") {
+            out.push_str(&rest[..start]);
+            let after_prefix = &rest[start + 6..];
+            if let Some(end) = after_prefix.find('}') {
+                let prop_name = &after_prefix[..end];
+                out.push_str(&format!(
+                    "{table_var}[{}].Value",
+                    escape_lua_string(prop_name)
+                ));
+                rest = &after_prefix[end + 1..];
+            } else {
+                out.push_str(&rest[start..]);
+                rest = "";
+            }
+        }
+        out.push_str(rest);
+        out
+    } else {
+        format!("{table_var}[{}].Value", escape_lua_string(spec))
     }
 }
 

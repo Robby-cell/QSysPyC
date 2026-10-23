@@ -5,7 +5,7 @@ use qsys_model::{
 };
 
 use crate::context::CodegenContext;
-use crate::emitter::{LuaEmitter, escape_lua_string, format_lua_float};
+use crate::emitter::{LuaEmitter, escape_lua_string, format_count_lua_expr, format_lua_float};
 
 pub fn emit_plugin(plugin: &IRPlugin, ctx: &mut CodegenContext) -> String {
     // Register controls and properties
@@ -129,10 +129,7 @@ pub fn emit_plugin(plugin: &IRPlugin, ctx: &mut CodegenContext) -> String {
         let ctl_count_prop = ctl_def.and_then(|d| d.count_property.as_deref());
 
         if let Some(prop_name) = ctl_count_prop {
-            let prop_ref = format!(
-                "Properties[{}].Value",
-                crate::emitter::escape_lua_string(prop_name)
-            );
+            let prop_ref = format_count_lua_expr(prop_name, "Properties");
             if let Some(ch_idx) = binding.channel_index {
                 if ch_idx == 0 {
                     emitter.write_line(&format!("if {prop_ref} == 1 then"));
@@ -376,8 +373,8 @@ fn emit_control_table_insert(
     emitter.write_line(&format!("UserPin = {},", c.def.user_pin));
     if let Some(ref prop_name) = c.def.count_property {
         emitter.write_line(&format!(
-            "Count = props[{}].Value,",
-            escape_lua_string(prop_name)
+            "Count = {},",
+            format_count_lua_expr(prop_name, "props")
         ));
     } else {
         emitter.write_line(&format!("Count = {},", c.def.count));
@@ -645,7 +642,7 @@ fn emit_control_layout_item(emitter: &mut LuaEmitter<'_>, ctl: &ControlLayoutDef
     let h = ctl.size.height.round() as i64;
 
     if let Some(ref rep) = ctl.dynamic_repeat {
-        let prop_expr = format!("props[{}].Value", escape_lua_string(&rep.count_property));
+        let prop_expr = format_count_lua_expr(&rep.count_property, "props");
         let base_str = escape_lua_string(&rep.base_control_name);
         let base_prefix = escape_lua_string(&format!("{} ", rep.base_control_name));
         let dx = rep.step_x.round() as i64;
@@ -718,7 +715,7 @@ fn emit_control_layout_item(emitter: &mut LuaEmitter<'_>, ctl: &ControlLayoutDef
         &ctl.base_control_name,
         ctl.channel_index,
     ) {
-        let prop_expr = format!("props[{}].Value", escape_lua_string(prop_name));
+        let prop_expr = format_count_lua_expr(prop_name, "props");
         if ch == 1 {
             let key_expr = format!(
                 "({prop_expr} == 1) and {} or {}",
