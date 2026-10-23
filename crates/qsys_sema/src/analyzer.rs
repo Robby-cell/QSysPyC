@@ -475,7 +475,10 @@ impl<'a> ExprAnalyzer<'a> {
                         | Some(ControlMember::IsInvisible) => Type::Bool,
                         Some(ControlMember::Values) => Type::List(Box::new(Type::Float)),
                         Some(ControlMember::Strings) => Type::List(Box::new(Type::String)),
-                        Some(ControlMember::EventHandler) => Type::Any,
+                        Some(ControlMember::Data)
+                        | Some(ControlMember::Generic)
+                        | Some(ControlMember::Any)
+                        | Some(ControlMember::EventHandler) => Type::Any,
                         None => {
                             let control_name = extract_expr_name(value);
                             let candidates = find_closest_member(attr)

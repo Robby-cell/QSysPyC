@@ -244,12 +244,51 @@ MACAddress = Control.MACAddress(default="00:11:22:33:44:55")
 
 ---
 
+#### `Control[Type]` / `Control.[Type]` / `Control.Generic(Type, ...)` (Property-Typed Generic Controls)
+Declares a generic control whose Q-SYS `ControlType` (`"Text"`, `"Knob"`, `"Button"`, `"Indicator"`) and `GetControlLayout` `Style` dynamically depend on an enum or string `Property` (`props["<PropertyName>"].Value`):
+
+```python
+class DynamicTypePlugin(QSysPlugin):
+    Type = Property.Enum(name="Type", choices=["Integer", "String", "Boolean"], default="String")
+
+    # All three declaration forms are supported:
+    Field = Control.[Type](name="field", min=0, max=100, default=0)
+    SecondField = Control[Type](name="second", default="hello")
+    ThirdField = Control.Generic(Type, name="third")
+```
+
+- **In `GetControls(props)`**: Emits `if props["Type"].Value == "Integer" then ... elseif props["Type"].Value == "String" then ...` with the matching Q-SYS `ControlType`, `ControlUnit`, `TextType`, or `ButtonType`.
+- **In `GetControlLayout(props)`**: Automatically emits a property-driven `Style` expression (`"Knob"`, `"Text"`, `"Button"`, `"Led"`) unless overridden with an explicit `style=` argument.
+- **At Runtime (`if Controls then`)**:
+  - Standard fields (`.String`, `.Boolean`, `.Value`) continue to work directly as usual.
+  - The generic accessor **`.Data`** (or aliases **`.Generic`** / **`.Any`**) automatically reads and writes whichever underlying field corresponds to the active property choice (`.String` for `"String"`/`"Text"`, `.Boolean` for `"Boolean"`/`"Toggle"`/`"Button"`, `.Value` for `"Integer"`/`"Float"`/`"Knob"`/`"Fader"`):
+    ```python
+    @Field.EventHandler
+    def on_field(self, ctl):
+        val = ctl.Data          # Reads .String, .Boolean, or .Value based on Properties["Type"].Value
+        self.SecondField.Data = val
+    ```
+
+| Option | Type | Default | Valid Values |
+| :--- | :--- | :--- | :--- |
+| `type_prop` | `PropertyHandle \| str` | *(Required)* | Declared `Property.Enum` / `Property.String` identifier (or `props["..."].Value`) |
+| `name` | `str` | Python attribute name | Any string |
+| `min` | `float` | `0.0` | Minimum numeric value when numeric choice is active |
+| `max` | `float` | `100.0` | Maximum numeric value when numeric choice is active |
+| `default` | `float \| str` | `0.0` / `""` | Initial default numeric or string value |
+| `pins` | `str` | `"Both"` | `"None"`, `"Input"`, `"Output"`, `"Both"` |
+| `user_pin` | `bool` | `True` | `True`, `False` |
+| `count` | `int \| PropertyHandle` | `1` | Integer $\ge 1$ or `Property.Integer` reference |
+
+---
+
 ### 3.3 `ControlHandle` Runtime Properties & Indexing
 
 At runtime (inside `__init__`, event handlers, and helper methods), accessing `self.<ControlName>` returns a `ControlHandle` (or array of `ControlHandle`s when `count > 1`).
 
 | Property | Type | Description |
 | :--- | :--- | :--- |
+| `.Data` (or `.Generic`, `.Any`) | `float \| int \| str \| bool` | **Generic property-typed value accessor.** Reads or writes `.String`, `.Boolean`, or `.Value` dynamically based on the control's active property type (or statically for fixed-type controls). |
 | `.Value` | `float` | Numeric floating-point value of the control (`0.0` or `1.0` for buttons/booleans). |
 | `.String` | `str` | Formatted text representation of the control value (e.g., `"-6.0 dB"` or text input string). |
 | `.Boolean` | `bool` | Boolean state of the control (`True` when `.Value >= 0.5`). |

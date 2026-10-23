@@ -29,6 +29,15 @@ class ControlHandle:
     Boolean: bool
     """Current boolean/binary state of the control (True/False)."""
 
+    Data: float | int | str | bool
+    """Generic property-typed value accessor (dispatches to .String, .Boolean, or .Value based on the control's active property type)."""
+
+    Generic: float | int | str | bool
+    """Alias for .Data — accesses the active value matching the control's property-driven type."""
+
+    Any: float | int | str | bool
+    """Alias for .Data — accesses the active value matching the control's property-driven type."""
+
     Values: list[float]
     """Array of numeric values for multi-channel controls."""
 
@@ -68,6 +77,39 @@ class ControlHandle:
 
 class Control:
     """Factory declarations for Q-SYS controls."""
+
+    @classmethod
+    def __class_getitem__(cls, type_prop: PropertyHandle | str) -> Callable[..., ControlHandle]:
+        """Declare a generic control whose Q-SYS ControlType depends on an Enum/String Property (`Control[Type](...)` or `Control.[Type](...)`)."""
+        ...
+
+    @staticmethod
+    def Generic(
+        type_prop: PropertyHandle | str,
+        name: str | None = None,
+        min: float = 0.0,
+        max: float = 100.0,
+        default: float | str = 0.0,
+        pins: PinStyle = "Both",
+        user_pin: bool = True,
+        count: int | PropertyHandle = 1,
+    ) -> ControlHandle:
+        """Declare a generic control whose Q-SYS ControlType depends on an Enum/String Property."""
+        ...
+
+    @staticmethod
+    def Dynamic(
+        type_prop: PropertyHandle | str,
+        name: str | None = None,
+        min: float = 0.0,
+        max: float = 100.0,
+        default: float | str = 0.0,
+        pins: PinStyle = "Both",
+        user_pin: bool = True,
+        count: int | PropertyHandle = 1,
+    ) -> ControlHandle:
+        """Alias for Control.Generic — declare a property-typed dynamic control."""
+        ...
 
     @staticmethod
     def Float(

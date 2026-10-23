@@ -5,7 +5,8 @@ pub mod properties;
 
 // Public re-exports for clean downstream usage
 pub use controls::{
-    ButtonType, ControlDef, ControlKind, ControlMember, ControlUnit, PinStyle, TextType,
+    ButtonType, ControlDef, ControlKind, ControlMember, ControlUnit, GenericControlSpec, PinStyle,
+    TextType,
 };
 pub use layout::{
     Color, ControlLayoutDef, ControlStyle, DynamicRepeatSpec, FlexDirection, GraphicItem,

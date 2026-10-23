@@ -1029,6 +1029,16 @@ fn matches_prefix(candidate: &str, partial: &str) -> bool {
 fn control_factory_completions() -> Vec<LspCompletion> {
     vec![
         LspCompletion {
+            label: "Generic".to_string(),
+            kind: "Method".to_string(),
+            detail: "Control.Generic(type_prop, name, min, max, default, pins, count)".to_string(),
+            documentation: "Property-typed generic control (`Control[Type](...)`, `Control.[Type](...)`, or `Control.Generic(Type, ...)`).".to_string(),
+            insert_text:
+                "Generic(${1:Type}, name=\"${2:Field}\")"
+                    .to_string(),
+            is_snippet: true,
+        },
+        LspCompletion {
             label: "Float".to_string(),
             kind: "Method".to_string(),
             detail: "Control.Float(name, min, max, default, unit, pins, count)".to_string(),
@@ -1575,6 +1585,10 @@ fn control_member_doc(name: &str) -> (&'static str, &'static str) {
             "Formatted text string representation of the control value.",
         ),
         "Boolean" => ("bool", "Binary state of the control (True / False)."),
+        "Data" | "Generic" | "Any" => (
+            "float | int | str | bool",
+            "Generic property-typed value accessor (dispatches to .String, .Boolean, or .Value based on the control's active property type).",
+        ),
         "Values" => (
             "list[float]",
             "Array of numeric values for multi-channel controls.",

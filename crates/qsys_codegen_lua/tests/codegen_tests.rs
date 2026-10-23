@@ -722,3 +722,88 @@ class DynamicInputPlugin(QSysPlugin):
         "len() on property-counted control must use Properties[...].Value:\n{lua}"
     );
 }
+
+#[test]
+fn test_generic_property_typed_controls_and_data_accessor() {
+    let src = r#"
+class GenericControlPlugin(QSysPlugin):
+    Type = Property.Enum(name="Type", choices=["Integer", "String", "Boolean"], default="String")
+
+    Field = Control.[Type](name="field", min=0, max=100, default=0)
+    SecondField = Control[Type](name="second", default="hello")
+    ThirdField = Control.Generic(Type, name="third")
+
+    layout = UI.Page(
+        "Main",
+        UI.GroupBox(
+            "Dynamic Fields",
+            UI.Field("Field", Field),
+            UI.Field("Second", SecondField),
+            UI.Field("Third", ThirdField),
+        ),
+    )
+
+    @Field.EventHandler
+    def on_field(self, ctl):
+        current = ctl.Data
+        print(current)
+        print(ctl.String)
+        print(ctl.Value)
+        self.SecondField.Data = current
+        self.ThirdField.Generic = self.SecondField.Any
+
+    def runtime(self):
+        self.Field.Data = "initial"
+"#;
+    let lua = compile_to_lua(src);
+
+    // 1. GetControls(props) must branch on `props["Type"].Value` for each enum choice
+    assert!(
+        lua.contains("if props[\"Type\"].Value == \"Integer\" then")
+            && lua.contains("ControlType = \"Knob\",")
+            && lua.contains("ControlUnit = \"Integer\","),
+        "GetControls must emit Integer Knob branch for 'Integer' choice:\n{lua}"
+    );
+    assert!(
+        lua.contains("elseif props[\"Type\"].Value == \"String\" then")
+            && lua.contains("ControlType = \"Text\",")
+            && lua.contains("TextType = \"Text\","),
+        "GetControls must emit Text branch for 'String' choice:\n{lua}"
+    );
+    assert!(
+        lua.contains("elseif props[\"Type\"].Value == \"Boolean\" then")
+            && lua.contains("ControlType = \"Button\",")
+            && lua.contains("ButtonType = \"Toggle\","),
+        "GetControls must emit Toggle Button branch for 'Boolean' choice:\n{lua}"
+    );
+
+    // 2. GetControlLayout(props) must emit dynamic Style expression driven by `props["Type"].Value`
+    assert!(
+        lua.contains("Style = (props[\"Type\"].Value == \"Integer\") and \"Knob\" or ((props[\"Type\"].Value == \"String\") and \"Text\" or (\"Button\")),"),
+        "GetControlLayout must emit dynamic Style expression based on property choices:\n{lua}"
+    );
+
+    // 3. Runtime must emit `__qsys_get_data` and `__qsys_set_data` helpers and use them for `.Data`, `.Generic`, `.Any`
+    assert!(
+        lua.contains("local function __qsys_get_data(ctl, kind)")
+            && lua.contains("local function __qsys_set_data(ctl, val, kind)"),
+        "Runtime must emit __qsys_get_data and __qsys_set_data helpers:\n{lua}"
+    );
+    assert!(
+        lua.contains("local current = __qsys_get_data(ctl, Properties[\"Type\"].Value)"),
+        "Reading ctl.Data inside @Field.EventHandler must call __qsys_get_data with Properties['Type'].Value:\n{lua}"
+    );
+    assert!(
+        lua.contains("__qsys_set_data(Controls[\"second\"], current, Properties[\"Type\"].Value)"),
+        "Assigning self.SecondField.Data must call __qsys_set_data:\n{lua}"
+    );
+    assert!(
+        lua.contains("__qsys_set_data(Controls[\"third\"], __qsys_get_data(Controls[\"second\"], Properties[\"Type\"].Value), Properties[\"Type\"].Value)"),
+        "Reading .Any and writing .Generic must call __qsys_get_data / __qsys_set_data:\n{lua}"
+    );
+    // Standard fields (.String, .Value) still work directly
+    assert!(
+        lua.contains("print(ctl.String)") && lua.contains("print(ctl.Value)"),
+        "Standard .String and .Value fields must still emit direct field access:\n{lua}"
+    );
+}

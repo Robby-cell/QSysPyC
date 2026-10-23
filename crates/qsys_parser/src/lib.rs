@@ -18,12 +18,23 @@ pub struct ParsedModule {
     pub module: ast::Module,
 }
 
+/// Normalizes `Control.[Type](...)` shorthand into valid Python subscript syntax `Control [Type](...)`
+/// while preserving exact byte offsets and spans.
+fn normalize_source(src: &str) -> std::borrow::Cow<'_, str> {
+    if src.contains("Control.[") {
+        std::borrow::Cow::Owned(src.replace("Control.[", "Control ["))
+    } else {
+        std::borrow::Cow::Borrowed(src)
+    }
+}
+
 /// Parses Python source text into our clean, curated QSysPy AST.
 pub fn parse_module(file: Arc<SourceFile>) -> Result<ParsedModule, Diagnostics> {
     let mut diagnostics = Diagnostics::new();
+    let normalized = normalize_source(&file.src);
 
     // Parse using Ruff
-    let parsed = parse_unchecked(&file.src, ParseOptions::from(Mode::Module));
+    let parsed = parse_unchecked(&normalized, ParseOptions::from(Mode::Module));
 
     // Collect syntax errors
     for err in parsed.errors() {
@@ -73,7 +84,8 @@ pub fn parse_module(file: Arc<SourceFile>) -> Result<ParsedModule, Diagnostics> 
 /// Always lowers the recovered Ruff AST even when syntax errors are present.
 pub fn parse_module_lossy(file: Arc<SourceFile>) -> (ParsedModule, Diagnostics) {
     let mut diagnostics = Diagnostics::new();
-    let parsed = parse_unchecked(&file.src, ParseOptions::from(Mode::Module));
+    let normalized = normalize_source(&file.src);
+    let parsed = parse_unchecked(&normalized, ParseOptions::from(Mode::Module));
 
     for err in parsed.errors() {
         let span = text_range_to_span(err.range());

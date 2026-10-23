@@ -1,7 +1,7 @@
 use qsys_ir::*;
 use qsys_model::{
-    ControlKind, ControlLayoutDef, GraphicItem, GraphicItemKind, PageLayout, PropertyKind,
-    is_design_time_method,
+    ControlKind, ControlLayoutDef, ControlStyle, GraphicItem, GraphicItemKind, PageLayout,
+    PropertyKind, is_design_time_method,
 };
 
 use crate::context::CodegenContext;
@@ -14,6 +14,10 @@ pub fn emit_plugin(plugin: &IRPlugin, ctx: &mut CodegenContext) -> String {
     }
     for prop in &plugin.properties {
         ctx.properties.insert(prop.id, prop.def.clone());
+    }
+    for binding in &plugin.event_bindings {
+        ctx.method_handler_controls
+            .insert(binding.handler_name.clone(), binding.control_id);
     }
 
     // Pre-load symbol names
@@ -99,6 +103,7 @@ pub fn emit_plugin(plugin: &IRPlugin, ctx: &mut CodegenContext) -> String {
     // Runtime Phase (guarded by `if Controls then`)
     emitter.write_line("if Controls then");
     emitter.indent();
+    let runtime_body_offset = emitter.buffer.len();
 
     // Emit runtime methods (excluding design-time lifecycle methods)
     for method in &plugin.methods {
@@ -221,6 +226,11 @@ pub fn emit_plugin(plugin: &IRPlugin, ctx: &mut CodegenContext) -> String {
         emitter.write_line(&format!("{}_runtime(nil)", plugin.class_name));
     }
 
+    if emitter.ctx.needs_generic_data_helper {
+        let helper_code = format_generic_data_helpers();
+        emitter.buffer.insert_str(runtime_body_offset, &helper_code);
+    }
+
     emitter.dedent();
     emitter.write_line("end");
 
@@ -304,78 +314,118 @@ fn emit_get_properties(emitter: &mut LuaEmitter<'_>, props: &[IRPropertyBinding]
     emitter.write_line("end\n");
 }
 
+fn emit_control_table_insert(
+    emitter: &mut LuaEmitter<'_>,
+    c: &IRControlBinding,
+    kind: &ControlKind,
+) {
+    emitter.write_line("table.insert(ctls, {");
+    emitter.indent();
+    emitter.write_line(&format!("Name = {},", escape_lua_string(&c.def.name)));
+    emitter.write_line(&format!(
+        "ControlType = {},",
+        escape_lua_string(kind.qsys_type_str())
+    ));
+
+    match kind {
+        ControlKind::Button { button_type } => {
+            emitter.write_line(&format!(
+                "ButtonType = {},",
+                escape_lua_string(button_type.as_str())
+            ));
+        }
+        ControlKind::Knob {
+            unit,
+            min,
+            max,
+            default,
+        }
+        | ControlKind::Fader {
+            unit,
+            min,
+            max,
+            default,
+        } => {
+            emitter.write_line(&format!(
+                "ControlUnit = {},",
+                escape_lua_string(unit.as_str())
+            ));
+            emitter.write_line(&format!("Min = {},", format_lua_float(*min)));
+            emitter.write_line(&format!("Max = {},", format_lua_float(*max)));
+            emitter.write_line(&format!("DefaultValue = {},", format_lua_float(*default)));
+        }
+        ControlKind::Text { text_type, default } => {
+            emitter.write_line(&format!(
+                "TextType = {},",
+                escape_lua_string(text_type.as_str())
+            ));
+            emitter.write_line(&format!("String = {},", escape_lua_string(default)));
+        }
+        ControlKind::Indicator { unit } => {
+            emitter.write_line(&format!(
+                "ControlUnit = {},",
+                escape_lua_string(unit.as_str())
+            ));
+        }
+    }
+
+    emitter.write_line(&format!(
+        "PinStyle = {},",
+        escape_lua_string(c.def.pin_style.as_str())
+    ));
+    emitter.write_line(&format!("UserPin = {},", c.def.user_pin));
+    if let Some(ref prop_name) = c.def.count_property {
+        emitter.write_line(&format!(
+            "Count = props[{}].Value,",
+            escape_lua_string(prop_name)
+        ));
+    } else {
+        emitter.write_line(&format!("Count = {},", c.def.count));
+    }
+
+    emitter.dedent();
+    emitter.write_line("})");
+}
+
 fn emit_get_controls(emitter: &mut LuaEmitter<'_>, controls: &[IRControlBinding]) {
     emitter.write_line("function GetControls(props)");
     emitter.indent();
     emitter.write_line("local ctls = {}");
 
     for c in controls {
-        emitter.write_line("table.insert(ctls, {");
-        emitter.indent();
-        emitter.write_line(&format!("Name = {},", escape_lua_string(&c.def.name)));
-        emitter.write_line(&format!(
-            "ControlType = {},",
-            escape_lua_string(c.def.kind.qsys_type_str())
-        ));
+        if let Some(ref gspec) = c.def.generic_spec {
+            let prop_expr = format!("props[{}].Value", escape_lua_string(&gspec.property_name));
+            let choices: Vec<String> = if gspec.choices.is_empty() {
+                vec![
+                    "String".to_string(),
+                    "Integer".to_string(),
+                    "Float".to_string(),
+                    "Boolean".to_string(),
+                    "Trigger".to_string(),
+                ]
+            } else {
+                gspec.choices.clone()
+            };
 
-        match &c.def.kind {
-            ControlKind::Button { button_type } => {
+            for (idx, choice) in choices.iter().enumerate() {
+                let keyword = if idx == 0 { "if" } else { "elseif" };
+                let kind = gspec.resolve_choice_kind(choice);
                 emitter.write_line(&format!(
-                    "ButtonType = {},",
-                    escape_lua_string(button_type.as_str())
+                    "{keyword} {prop_expr} == {} then",
+                    escape_lua_string(choice)
                 ));
+                emitter.indent();
+                emit_control_table_insert(emitter, c, &kind);
+                emitter.dedent();
             }
-            ControlKind::Knob {
-                unit,
-                min,
-                max,
-                default,
-            }
-            | ControlKind::Fader {
-                unit,
-                min,
-                max,
-                default,
-            } => {
-                emitter.write_line(&format!(
-                    "ControlUnit = {},",
-                    escape_lua_string(unit.as_str())
-                ));
-                emitter.write_line(&format!("Min = {},", format_lua_float(*min)));
-                emitter.write_line(&format!("Max = {},", format_lua_float(*max)));
-                emitter.write_line(&format!("DefaultValue = {},", format_lua_float(*default)));
-            }
-            ControlKind::Text { text_type, default } => {
-                emitter.write_line(&format!(
-                    "TextType = {},",
-                    escape_lua_string(text_type.as_str())
-                ));
-                emitter.write_line(&format!("String = {},", escape_lua_string(default)));
-            }
-            ControlKind::Indicator { unit } => {
-                emitter.write_line(&format!(
-                    "ControlUnit = {},",
-                    escape_lua_string(unit.as_str())
-                ));
-            }
-        }
-
-        emitter.write_line(&format!(
-            "PinStyle = {},",
-            escape_lua_string(c.def.pin_style.as_str())
-        ));
-        emitter.write_line(&format!("UserPin = {},", c.def.user_pin));
-        if let Some(ref prop_name) = c.def.count_property {
-            emitter.write_line(&format!(
-                "Count = props[{}].Value,",
-                escape_lua_string(prop_name)
-            ));
+            emitter.write_line("else");
+            emitter.indent();
+            emit_control_table_insert(emitter, c, &c.def.kind);
+            emitter.dedent();
+            emitter.write_line("end");
         } else {
-            emitter.write_line(&format!("Count = {},", c.def.count));
+            emit_control_table_insert(emitter, c, &c.def.kind);
         }
-
-        emitter.dedent();
-        emitter.write_line("})");
     }
 
     emitter.write_line("return ctls");
@@ -523,6 +573,38 @@ fn format_dynamic_channel_lua_expr(template: &str, prop_expr: &str) -> String {
     }
 }
 
+fn build_dynamic_style_lua_expr(emitter: &LuaEmitter<'_>, type_prop: &str) -> String {
+    let prop_expr = format!("props[{}].Value", escape_lua_string(type_prop));
+    let matching_gspec = emitter.ctx.controls.values().find_map(|d| {
+        d.generic_spec
+            .as_ref()
+            .filter(|g| g.property_name == type_prop && !g.choices.is_empty())
+    });
+
+    if let Some(gspec) = matching_gspec {
+        if gspec.choices.len() == 1 {
+            let st = ControlStyle::default_for_kind(&gspec.resolve_choice_kind(&gspec.choices[0]));
+            return escape_lua_string(st.as_str());
+        }
+        let mut expr = {
+            let last_choice = gspec.choices.last().unwrap();
+            let st = ControlStyle::default_for_kind(&gspec.resolve_choice_kind(last_choice));
+            escape_lua_string(st.as_str())
+        };
+        for choice in gspec.choices[..gspec.choices.len() - 1].iter().rev() {
+            let st = ControlStyle::default_for_kind(&gspec.resolve_choice_kind(choice));
+            let st_str = escape_lua_string(st.as_str());
+            let choice_str = escape_lua_string(choice);
+            expr = format!("({prop_expr} == {choice_str}) and {st_str} or ({expr})");
+        }
+        return expr;
+    }
+
+    format!(
+        "({prop_expr} == \"String\" or {prop_expr} == \"Text\") and \"Text\" or (({prop_expr} == \"Boolean\" or {prop_expr} == \"Toggle\" or {prop_expr} == \"Button\" or {prop_expr} == \"Trigger\") and \"Button\" or \"Knob\")"
+    )
+}
+
 fn emit_control_layout_fields(
     emitter: &mut LuaEmitter<'_>,
     ctl: &ControlLayoutDef,
@@ -533,7 +615,10 @@ fn emit_control_layout_fields(
     h: i64,
 ) {
     emitter.write_line(&format!("PrettyName = {pretty_expr},"));
-    if let Some(ref style) = ctl.style {
+    if let Some(ref type_prop) = ctl.type_property {
+        let style_expr = build_dynamic_style_lua_expr(emitter, type_prop);
+        emitter.write_line(&format!("Style = {style_expr},"));
+    } else if let Some(ref style) = ctl.style {
         emitter.write_line(&format!("Style = {},", escape_lua_string(style.as_str())));
     }
     emitter.write_line(&format!("Position = {{ {pos_x_expr}, {pos_y_expr} }},"));
@@ -692,6 +777,17 @@ fn emit_method(emitter: &mut LuaEmitter<'_>, class_name: &str, method: &IRFuncti
     let fn_name = format!("{class_name}_{}", method.name);
     let mut param_names = Vec::new();
 
+    let prev_handler_ctl = emitter.ctx.active_handler_control;
+    let handler_ctl = emitter
+        .ctx
+        .method_handler_controls
+        .get(&method.name)
+        .copied();
+    emitter.ctx.active_handler_control = handler_ctl;
+    if let (Some(ctl_id), Some(first_param)) = (handler_ctl, method.params.first()) {
+        emitter.ctx.local_controls.insert(first_param.id, ctl_id);
+    }
+
     // The first parameter is `self`
     param_names.push("self".to_string());
 
@@ -712,6 +808,37 @@ fn emit_method(emitter: &mut LuaEmitter<'_>, class_name: &str, method: &IRFuncti
     emitter.emit_statements(&method.body);
     emitter.dedent();
     emitter.write_line("end\n");
+
+    emitter.ctx.active_handler_control = prev_handler_ctl;
+}
+
+fn format_generic_data_helpers() -> String {
+    let mut out = String::new();
+    out.push_str("    local function __qsys_get_data(ctl, kind)\n");
+    out.push_str("        local k = kind and string.lower(tostring(kind)) or \"\"\n");
+    out.push_str(
+        "        if k == \"string\" or k == \"text\" or k == \"readonly\" or k == \"pin\" then\n",
+    );
+    out.push_str("            return ctl.String\n");
+    out.push_str("        elseif k == \"boolean\" or k == \"bool\" or k == \"toggle\" or k == \"button\" or k == \"momentary\" or k == \"trigger\" or k == \"indicator\" or k == \"led\" then\n");
+    out.push_str("            return ctl.Boolean\n");
+    out.push_str("        else\n");
+    out.push_str("            return ctl.Value\n");
+    out.push_str("        end\n");
+    out.push_str("    end\n\n");
+    out.push_str("    local function __qsys_set_data(ctl, val, kind)\n");
+    out.push_str("        local k = kind and string.lower(tostring(kind)) or \"\"\n");
+    out.push_str(
+        "        if k == \"string\" or k == \"text\" or k == \"readonly\" or k == \"pin\" then\n",
+    );
+    out.push_str("            ctl.String = tostring(val)\n");
+    out.push_str("        elseif k == \"boolean\" or k == \"bool\" or k == \"toggle\" or k == \"button\" or k == \"momentary\" or k == \"trigger\" or k == \"indicator\" or k == \"led\" then\n");
+    out.push_str("            ctl.Boolean = not not val\n");
+    out.push_str("        else\n");
+    out.push_str("            ctl.Value = tonumber(val) or 0\n");
+    out.push_str("        end\n");
+    out.push_str("    end\n\n");
+    out
 }
 
 fn emit_truthy_helper(emitter: &mut LuaEmitter<'_>) {

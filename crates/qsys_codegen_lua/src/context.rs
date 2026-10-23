@@ -10,7 +10,11 @@ pub struct CodegenContext {
     pub functions: FxHashMap<FunctionId, String>,
     pub symbol_names: FxHashMap<SymbolId, String>,
     pub declared_locals: FxHashSet<SymbolId>,
+    pub method_handler_controls: FxHashMap<String, ControlId>,
+    pub active_handler_control: Option<ControlId>,
+    pub local_controls: FxHashMap<SymbolId, ControlId>,
     pub needs_truthy_helper: bool,
+    pub needs_generic_data_helper: bool,
 }
 
 impl CodegenContext {

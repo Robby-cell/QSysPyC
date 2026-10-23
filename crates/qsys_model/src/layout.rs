@@ -188,6 +188,8 @@ pub struct ControlLayoutDef {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub count_property: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub type_property: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_control_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub channel_index: Option<usize>,
@@ -211,6 +213,7 @@ impl ControlLayoutDef {
             is_disabled: false,
             is_invisible: false,
             count_property: None,
+            type_property: None,
             base_control_name: None,
             channel_index: None,
             dynamic_repeat: None,
@@ -288,6 +291,8 @@ pub struct UiControlSpec {
     pub invisible: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub count_property: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub type_property: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_control_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -668,6 +673,7 @@ fn arrange_node(
                 is_disabled: spec.read_only,
                 is_invisible: spec.invisible,
                 count_property: spec.count_property.clone(),
+                type_property: spec.type_property.clone(),
                 base_control_name: spec.base_control_name.clone(),
                 channel_index: spec.channel_index,
                 dynamic_repeat,

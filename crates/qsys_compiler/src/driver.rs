@@ -241,6 +241,11 @@ fn build_ui_preview(
     let mut group_children = Vec::new();
     for ctl in controls {
         let style = ControlStyle::default_for_kind(&ctl.def.kind);
+        let type_property = ctl
+            .def
+            .generic_spec
+            .as_ref()
+            .map(|g| g.property_name.clone());
         if ctl.def.count <= 1 {
             group_children.push(UiNode::Control(UiControlSpec {
                 control_name: ctl.def.name.clone(),
@@ -255,6 +260,7 @@ fn build_ui_preview(
                 margin: None,
                 read_only: false,
                 invisible: false,
+                type_property: type_property.clone(),
                 count_property: ctl.def.count_property.clone(),
                 base_control_name: None,
                 channel_index: None,
@@ -280,6 +286,7 @@ fn build_ui_preview(
                     margin: None,
                     read_only: false,
                     invisible: false,
+                    type_property: type_property.clone(),
                     count_property: ctl.def.count_property.clone(),
                     base_control_name: Some(ctl.def.name.clone()),
                     channel_index: Some(ch),

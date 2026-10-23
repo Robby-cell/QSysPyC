@@ -3,8 +3,8 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use qsys_diagnostics::{DiagnosticKind, Diagnostics, Span};
 use qsys_ir::{ControlId, PropertyId};
 use qsys_model::{
-    ButtonType, ControlDef, ControlKind, ControlUnit, PageLayout, PinStyle, PluginInfo,
-    PropertyDef, TextType,
+    ButtonType, ControlDef, ControlKind, ControlUnit, GenericControlSpec, PageLayout, PinStyle,
+    PluginInfo, PropertyDef, TextType,
 };
 use qsys_parser::ast;
 
@@ -312,15 +312,139 @@ pub fn extract_class_declarations(
 }
 
 fn is_control_decl_expr(expr: &ast::Expr) -> bool {
-    matches!(
-        &expr.kind,
-        ast::ExprKind::Call { callee, .. }
-            if matches!(
-                &callee.kind,
-                ast::ExprKind::Attribute { value, .. }
-                    if matches!(&value.kind, ast::ExprKind::Ident(obj) if obj == "Control")
-            )
-    )
+    match &expr.kind {
+        ast::ExprKind::Call { callee, .. } => match &callee.kind {
+            ast::ExprKind::Attribute { value, .. } | ast::ExprKind::Subscript { value, .. } => {
+                matches!(&value.kind, ast::ExprKind::Ident(obj) if obj == "Control")
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+fn resolve_type_property_arg(
+    val: &ast::Expr,
+    control_name: &str,
+    properties: &[DeclaredProperty],
+    prop_resolutions: &mut Vec<(Span, PropertyId)>,
+    diagnostics: &mut Diagnostics,
+) -> Option<(String, Vec<String>, String)> {
+    let mut prop_ident_opt: Option<&str> = None;
+    let mut prop_key_opt: Option<String> = None;
+
+    let mut target = val;
+    if let ast::ExprKind::Attribute { value, attr } = &target.kind
+        && attr == "Value"
+    {
+        target = value;
+    }
+
+    match &target.kind {
+        ast::ExprKind::Ident(id) => {
+            prop_ident_opt = Some(id.as_str());
+        }
+        ast::ExprKind::Attribute { value, attr } if matches!(&value.kind, ast::ExprKind::Ident(s) if s == "self") =>
+        {
+            prop_ident_opt = Some(attr.as_str());
+        }
+        ast::ExprKind::Subscript { value, index } if matches!(&value.kind, ast::ExprKind::Ident(s) if s == "props" || s == "Properties") => {
+            if let Some(s) = eval_constant(index).and_then(|c| c.as_str().map(String::from)) {
+                prop_key_opt = Some(s);
+            }
+        }
+        _ => {}
+    }
+
+    let default_choices = || {
+        vec![
+            "Integer".to_string(),
+            "Float".to_string(),
+            "String".to_string(),
+            "Boolean".to_string(),
+        ]
+    };
+
+    if let Some(prop_ident) = prop_ident_opt
+        && let Some(prop) = properties
+            .iter()
+            .find(|p| p.ident == prop_ident || p.def.name == prop_ident)
+    {
+        prop_resolutions.push((val.span, prop.id));
+        match &prop.def.kind {
+            qsys_model::PropertyKind::Enum { choices, default } => {
+                return Some((prop.def.name.clone(), choices.clone(), default.clone()));
+            }
+            qsys_model::PropertyKind::String { default } => {
+                let def_choice = if default.is_empty() {
+                    "String".to_string()
+                } else {
+                    default.clone()
+                };
+                return Some((prop.def.name.clone(), default_choices(), def_choice));
+            }
+            _ => {
+                diagnostics.report(
+                    DiagnosticKind::InvalidDeclarationArgument {
+                        name: control_name.to_string(),
+                        message: format!(
+                            "Property '{}' used for generic Control[Type] must be a Property.Enum or Property.String",
+                            prop.ident
+                        ),
+                    },
+                    val.span,
+                );
+                return None;
+            }
+        }
+    }
+
+    if let Some(prop_key) = prop_key_opt {
+        if let Some(prop) = properties
+            .iter()
+            .find(|p| p.def.name == prop_key || p.ident == prop_key)
+        {
+            prop_resolutions.push((val.span, prop.id));
+            match &prop.def.kind {
+                qsys_model::PropertyKind::Enum { choices, default } => {
+                    return Some((prop.def.name.clone(), choices.clone(), default.clone()));
+                }
+                qsys_model::PropertyKind::String { default } => {
+                    let def_choice = if default.is_empty() {
+                        "String".to_string()
+                    } else {
+                        default.clone()
+                    };
+                    return Some((prop.def.name.clone(), default_choices(), def_choice));
+                }
+                _ => {
+                    diagnostics.report(
+                        DiagnosticKind::InvalidDeclarationArgument {
+                            name: control_name.to_string(),
+                            message: format!(
+                                "Property '{}' used for generic Control[Type] must be a Property.Enum or Property.String",
+                                prop.def.name
+                            ),
+                        },
+                        val.span,
+                    );
+                    return None;
+                }
+            }
+        }
+        return Some((prop_key, default_choices(), "String".to_string()));
+    }
+
+    diagnostics.report(
+        DiagnosticKind::InvalidDeclarationArgument {
+            name: control_name.to_string(),
+            message:
+                "Generic Control[Type] requires a declared Property.Enum (e.g. Control[Type](...))"
+                    .to_string(),
+        },
+        val.span,
+    );
+    None
 }
 
 fn resolve_count_arg(
@@ -434,19 +558,36 @@ fn try_parse_control(
     prop_resolutions: &mut Vec<(Span, PropertyId)>,
     diagnostics: &mut Diagnostics,
 ) -> Option<ControlDef> {
-    let (kind_str, args, kwargs) = match &expr.kind {
+    let (kind_str, subscript_type_expr, args, kwargs) = match &expr.kind {
         ast::ExprKind::Call {
             callee,
             args,
             kwargs,
         } => match &callee.kind {
             ast::ExprKind::Attribute { value, attr } => match &value.kind {
-                ast::ExprKind::Ident(obj) if obj == "Control" => (attr.as_str(), args, kwargs),
+                ast::ExprKind::Ident(obj) if obj == "Control" => {
+                    (attr.as_str(), None, args, kwargs)
+                }
+                _ => return None,
+            },
+            ast::ExprKind::Subscript { value, index } => match &value.kind {
+                ast::ExprKind::Ident(obj) if obj == "Control" => {
+                    ("Generic", Some(index.as_ref()), args, kwargs)
+                }
                 _ => return None,
             },
             _ => return None,
         },
         _ => return None,
+    };
+
+    let is_generic_method =
+        matches!(kind_str, "Generic" | "Dynamic") && subscript_type_expr.is_none();
+    let has_kwarg_type = kwargs.iter().any(|(k, _)| k == "type" || k == "property");
+    let positional_name_arg = if is_generic_method && !has_kwarg_type {
+        args.get(1)
+    } else {
+        args.first()
     };
 
     // 1. Check keyword: name="..."
@@ -467,7 +608,7 @@ fn try_parse_control(
                 return None;
             }
         },
-        None => match args.first() {
+        None => match positional_name_arg {
             Some(val) => match eval_constant(val).and_then(|c| c.as_str().map(String::from)) {
                 Some(s) => s,
                 None => {
@@ -764,6 +905,89 @@ fn try_parse_control(
                 text_type: TextType::Text,
                 default,
             }
+        }
+
+        // Property-typed generic control: `Control[Type](...)`, `Control.[Type](...)`, or `Control.Generic(Type, ...)`
+        "Generic" | "Dynamic" => {
+            let type_expr = subscript_type_expr
+                .or_else(|| {
+                    kwargs
+                        .iter()
+                        .find(|(k, _)| k == "type" || k == "property")
+                        .map(|(_, v)| v)
+                })
+                .or_else(|| args.first());
+
+            let Some(type_expr) = type_expr else {
+                diagnostics.report(
+                    DiagnosticKind::InvalidDeclarationArgument {
+                        name: control_name,
+                        message: "Control.Generic requires a Property reference (e.g. Control[Type]() or Control.Generic(Type))".to_string(),
+                    },
+                    span,
+                );
+                return None;
+            };
+
+            let (prop_name, choices, default_choice) = resolve_type_property_arg(
+                type_expr,
+                &control_name,
+                properties,
+                prop_resolutions,
+                diagnostics,
+            )?;
+
+            let unit = parse_unit(diagnostics)?;
+            let min = kwargs
+                .iter()
+                .find(|(k, _)| k == "min")
+                .and_then(|(_, v)| eval_constant(v))
+                .and_then(|c| c.as_f64())
+                .unwrap_or(0.0);
+            let max = kwargs
+                .iter()
+                .find(|(k, _)| k == "max")
+                .and_then(|(_, v)| eval_constant(v))
+                .and_then(|c| c.as_f64())
+                .unwrap_or(100.0);
+
+            let (default_num, default_str) = match kwargs.iter().find(|(k, _)| k == "default") {
+                Some((_, val)) => match eval_constant(val) {
+                    Some(ConstValue::Float(f)) => (f, f.to_string()),
+                    Some(ConstValue::Int(i)) => (i as f64, i.to_string()),
+                    Some(ConstValue::String(s)) => {
+                        let num = s.parse::<f64>().unwrap_or(min);
+                        (num, s)
+                    }
+                    Some(ConstValue::Bool(b)) => (if b { 1.0 } else { 0.0 }, b.to_string()),
+                    _ => (min, String::new()),
+                },
+                None => (min, String::new()),
+            };
+
+            let gspec = GenericControlSpec {
+                property_name: prop_name,
+                choices,
+                default_choice: default_choice.clone(),
+                unit,
+                min,
+                max,
+                default_num,
+                default_str,
+                button_type: ButtonType::Toggle,
+                text_type: TextType::Text,
+            };
+            let resolved_kind = gspec.resolve_choice_kind(&default_choice);
+
+            let mut def = ControlDef::new(control_name, resolved_kind)
+                .with_pin_style(pin_style)
+                .with_user_pin(user_pin)
+                .with_count_property(count_property)
+                .with_generic_spec(Some(gspec));
+            if count > 1 {
+                def = def.with_count(count);
+            }
+            return Some(def);
         }
 
         _ => {

@@ -723,9 +723,16 @@ impl<'a> UiParserCtx<'a> {
         label_override: Option<String>,
         span: Span,
     ) -> Vec<UiNode> {
-        let style = get_kwarg_str(kwargs, "style")
-            .map(|s| ControlStyle::from_name(&s))
-            .unwrap_or_else(|| ControlStyle::default_for_kind(&ctl.def.kind));
+        let explicit_style = get_kwarg_str(kwargs, "style").map(|s| ControlStyle::from_name(&s));
+        let type_property = if explicit_style.is_none() {
+            ctl.def
+                .generic_spec
+                .as_ref()
+                .map(|g| g.property_name.clone())
+        } else {
+            None
+        };
+        let style = explicit_style.unwrap_or_else(|| ControlStyle::default_for_kind(&ctl.def.kind));
 
         let label_pos_str = get_kwarg_str(kwargs, "label_pos").unwrap_or_else(|| "top".to_string());
         let label_width = get_kwarg_f64(kwargs, "label_width").unwrap_or(88.0);
@@ -790,6 +797,7 @@ impl<'a> UiParserCtx<'a> {
                 margin,
                 read_only,
                 invisible,
+                type_property: type_property.clone(),
                 count_property: None,
                 base_control_name: None,
                 channel_index: None,
@@ -823,6 +831,7 @@ impl<'a> UiParserCtx<'a> {
                 margin,
                 read_only,
                 invisible,
+                type_property: type_property.clone(),
                 count_property: ctl.def.count_property.clone(),
                 base_control_name: Some(ctl.def.name.clone()),
                 channel_index: Some(ch),
@@ -896,6 +905,7 @@ impl<'a> UiParserCtx<'a> {
                 margin,
                 read_only,
                 invisible,
+                type_property: type_property.clone(),
                 count_property: ctl.def.count_property.clone(),
                 base_control_name: Some(ctl.def.name.clone()),
                 channel_index: Some(ch),

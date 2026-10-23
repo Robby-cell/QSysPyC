@@ -1,4 +1,5 @@
 use qsys_ir::*;
+use qsys_model::{ControlDef, ControlKind, ControlMember};
 
 use crate::context::CodegenContext;
 
@@ -47,6 +48,9 @@ impl<'a> LuaEmitter<'a> {
         match stmt {
             IRStmt::Assign { target, value, .. } => {
                 if let IRExpr::Local(sym_id) = target {
+                    if let Some(ctl_id) = self.resolve_control_id_for_expr(value) {
+                        self.ctx.local_controls.insert(*sym_id, ctl_id);
+                    }
                     let var_name = self.ctx.get_symbol_name(*sym_id);
                     let val_str = self.emit_expr(value);
                     self.write_indent();
@@ -55,6 +59,40 @@ impl<'a> LuaEmitter<'a> {
                             .push_str(&format!("local {var_name} = {val_str}\n"));
                     } else {
                         self.buffer.push_str(&format!("{var_name} = {val_str}\n"));
+                    }
+                } else if let IRExpr::Attribute { object, attr } = target
+                    && ControlMember::from_ident(attr).is_some_and(|m| m.is_generic_accessor())
+                {
+                    if let Some(def) = self.resolve_control_def_for_expr(object) {
+                        let obj_str = self.emit_expr(object);
+                        let val_str = self.emit_expr(value);
+                        if let Some(ref gspec) = def.generic_spec {
+                            self.ctx.needs_generic_data_helper = true;
+                            let prop_str = format!(
+                                "Properties[{}].Value",
+                                escape_lua_string(&gspec.property_name)
+                            );
+                            self.write_line(&format!(
+                                "__qsys_set_data({obj_str}, {val_str}, {prop_str})"
+                            ));
+                        } else {
+                            let member = match def.kind {
+                                ControlKind::Text { .. } => "String",
+                                ControlKind::Button { .. } | ControlKind::Indicator { .. } => {
+                                    "Boolean"
+                                }
+                                ControlKind::Knob { .. } | ControlKind::Fader { .. } => "Value",
+                            };
+                            self.write_line(&format!("{obj_str}.{member} = {val_str}"));
+                        }
+                    } else {
+                        self.ctx.needs_generic_data_helper = true;
+                        let obj_str = self.emit_expr(object);
+                        let val_str = self.emit_expr(value);
+                        let prop_arg = self.default_generic_prop_expr();
+                        self.write_line(&format!(
+                            "__qsys_set_data({obj_str}, {val_str}, {prop_arg})"
+                        ));
                     }
                 } else {
                     let target_str = self.emit_expr(target);
@@ -140,15 +178,21 @@ impl<'a> LuaEmitter<'a> {
                             self.write_line(&format!("for _, {var_name} in ipairs({iter_str}) do"));
                         }
                     }
-                } else if let IRExpr::Control(ctl_id) = iterable
-                    && let Some(def) = self.ctx.controls.get(ctl_id)
-                    && let Some(ref prop_name) = def.count_property
-                {
-                    let ctl_str = format!("Controls[{}]", escape_lua_string(&def.name));
-                    let prop_str = format!("Properties[{}].Value", escape_lua_string(prop_name));
-                    self.write_line(&format!(
-                        "for _, {var_name} in ipairs(({prop_str} == 1) and {{ {ctl_str} }} or {ctl_str}) do"
-                    ));
+                } else if let IRExpr::Control(ctl_id) = iterable {
+                    self.ctx.local_controls.insert(*target_id, *ctl_id);
+                    if let Some(def) = self.ctx.controls.get(ctl_id)
+                        && let Some(ref prop_name) = def.count_property
+                    {
+                        let ctl_str = format!("Controls[{}]", escape_lua_string(&def.name));
+                        let prop_str =
+                            format!("Properties[{}].Value", escape_lua_string(prop_name));
+                        self.write_line(&format!(
+                            "for _, {var_name} in ipairs(({prop_str} == 1) and {{ {ctl_str} }} or {ctl_str}) do"
+                        ));
+                    } else {
+                        let iter_str = self.emit_expr(iterable);
+                        self.write_line(&format!("for _, {var_name} in ipairs({iter_str}) do"));
+                    }
                 } else {
                     let iter_str = self.emit_expr(iterable);
                     self.write_line(&format!("for _, {var_name} in ipairs({iter_str}) do"));
@@ -490,6 +534,33 @@ impl<'a> LuaEmitter<'a> {
                 if matches!(object.as_ref(), IRExpr::Property(_)) && attr == "Value" {
                     return self.emit_expr(object);
                 }
+                if ControlMember::from_ident(attr).is_some_and(|m| m.is_generic_accessor()) {
+                    if let Some(def) = self.resolve_control_def_for_expr(object) {
+                        let obj_str = self.emit_expr(object);
+                        if let Some(ref gspec) = def.generic_spec {
+                            self.ctx.needs_generic_data_helper = true;
+                            let prop_str = format!(
+                                "Properties[{}].Value",
+                                escape_lua_string(&gspec.property_name)
+                            );
+                            return format!("__qsys_get_data({obj_str}, {prop_str})");
+                        } else {
+                            let member = match def.kind {
+                                ControlKind::Text { .. } => "String",
+                                ControlKind::Button { .. } | ControlKind::Indicator { .. } => {
+                                    "Boolean"
+                                }
+                                ControlKind::Knob { .. } | ControlKind::Fader { .. } => "Value",
+                            };
+                            return format!("{obj_str}.{member}");
+                        }
+                    } else {
+                        self.ctx.needs_generic_data_helper = true;
+                        let obj_str = self.emit_expr(object);
+                        let prop_arg = self.default_generic_prop_expr();
+                        return format!("__qsys_get_data({obj_str}, {prop_arg})");
+                    }
+                }
                 let obj_str = self.emit_expr(object);
                 format!("{obj_str}.{attr}")
             }
@@ -602,6 +673,37 @@ impl<'a> LuaEmitter<'a> {
             self.dedent();
             self.write_line("end\n");
         }
+    }
+
+    pub fn resolve_control_id_for_expr(&self, expr: &IRExpr) -> Option<ControlId> {
+        match expr {
+            IRExpr::Control(ctl_id) => Some(*ctl_id),
+            IRExpr::Index { base, .. } => self.resolve_control_id_for_expr(base),
+            IRExpr::Local(sym_id) => self
+                .ctx
+                .local_controls
+                .get(sym_id)
+                .copied()
+                .or(self.ctx.active_handler_control),
+            _ => self.ctx.active_handler_control,
+        }
+    }
+
+    pub fn resolve_control_def_for_expr(&self, expr: &IRExpr) -> Option<ControlDef> {
+        self.resolve_control_id_for_expr(expr)
+            .and_then(|ctl_id| self.ctx.controls.get(&ctl_id).cloned())
+    }
+
+    pub fn default_generic_prop_expr(&self) -> String {
+        for def in self.ctx.controls.values() {
+            if let Some(ref gspec) = def.generic_spec {
+                return format!(
+                    "Properties[{}].Value",
+                    escape_lua_string(&gspec.property_name)
+                );
+            }
+        }
+        "nil".to_string()
     }
 }
 
