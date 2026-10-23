@@ -9,8 +9,9 @@ pub use controls::{
     TextType,
 };
 pub use layout::{
-    Color, ControlLayoutDef, ControlStyle, DynamicRepeatSpec, FlexDirection, GraphicItem,
-    GraphicItemKind, LabelPlacement, PageLayout, Position, Size, UiControlSpec, UiNode, UiPageSpec,
+    Color, ControlLayoutDef, ControlStyle, DynAxisExpr, DynLinearSum, DynLinearTerm,
+    DynamicRepeatSpec, FlexDirection, GraphicItem, GraphicItemKind, LabelPlacement, PageLayout,
+    Position, Size, UiControlSpec, UiNode, UiPageSpec,
 };
 pub use plugin_info::PluginInfo;
 pub use properties::{PropertyDef, PropertyKind};

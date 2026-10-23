@@ -154,6 +154,293 @@ impl ControlStyle {
     }
 }
 
+/// A single `count_property * step` linear term in a dynamic layout coordinate or size.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DynLinearTerm {
+    pub count_property: String,
+    pub step: i64,
+}
+
+/// A linear expression `base + sum(count_property_i * step_i)` in points.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct DynLinearSum {
+    pub base: i64,
+    pub terms: Vec<DynLinearTerm>,
+}
+
+impl DynLinearSum {
+    pub fn static_val(base: i64) -> Self {
+        Self {
+            base,
+            terms: Vec::new(),
+        }
+    }
+
+    pub fn add_term(&mut self, count_property: String, step: i64) {
+        if step == 0 {
+            return;
+        }
+        if let Some(existing) = self
+            .terms
+            .iter_mut()
+            .find(|t| t.count_property == count_property)
+        {
+            existing.step += step;
+        } else {
+            self.terms.push(DynLinearTerm {
+                count_property,
+                step,
+            });
+        }
+    }
+
+    pub fn add_sum(&self, other: &Self) -> Self {
+        let mut out = self.clone();
+        out.base += other.base;
+        for t in &other.terms {
+            out.add_term(t.count_property.clone(), t.step);
+        }
+        out
+    }
+
+    pub fn min_value_at_one(&self) -> i64 {
+        let mut total = self.base;
+        for term in &self.terms {
+            let mult = parse_base_prop_and_multiplier(&term.count_property)
+                .map(|(_, m)| m)
+                .unwrap_or(1);
+            total += term.step * mult;
+        }
+        total
+    }
+
+    pub fn normalized_rates(&self) -> Option<Vec<(String, i64)>> {
+        let mut rates: Vec<(String, i64)> = Vec::new();
+        for term in &self.terms {
+            let (base_prop, mult) = parse_base_prop_and_multiplier(&term.count_property)?;
+            let eff_rate = term.step * mult;
+            if eff_rate <= 0 {
+                return None;
+            }
+            if let Some(existing) = rates.iter_mut().find(|(p, _)| p == base_prop) {
+                existing.1 += eff_rate;
+            } else {
+                rates.push((base_prop.to_string(), eff_rate));
+            }
+        }
+        Some(rates)
+    }
+
+    /// Returns true if `self >= other` for all positive integer property values (`>= 1`).
+    pub fn dominates(&self, other: &Self) -> bool {
+        if self == other {
+            return true;
+        }
+        if self.min_value_at_one() < other.min_value_at_one() {
+            return false;
+        }
+        let Some(self_rates) = self.normalized_rates() else {
+            return false;
+        };
+        let Some(other_rates) = other.normalized_rates() else {
+            return false;
+        };
+        for (prop, other_rate) in &other_rates {
+            let self_rate = self_rates
+                .iter()
+                .find(|(p, _)| p == prop)
+                .map(|(_, r)| *r)
+                .unwrap_or(0);
+            if self_rate < *other_rate {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+fn parse_base_prop_and_multiplier(spec: &str) -> Option<(&str, i64)> {
+    if !spec.contains("{PROP:") {
+        return Some((spec, 1));
+    }
+    if let Some(inner) = spec
+        .strip_prefix("{PROP:")
+        .and_then(|s| s.strip_suffix('}'))
+        && !inner.contains("{PROP:")
+    {
+        return Some((inner, 1));
+    }
+    if let Some((left, right)) = spec.split_once(" * ") {
+        if let Some(prop) = left
+            .strip_prefix("{PROP:")
+            .and_then(|s| s.strip_suffix('}'))
+            && !prop.contains("{PROP:")
+            && let Ok(k) = right.trim().parse::<i64>()
+            && k > 0
+        {
+            return Some((prop, k));
+        }
+        if let Some(prop) = right
+            .strip_prefix("{PROP:")
+            .and_then(|s| s.strip_suffix('}'))
+            && !prop.contains("{PROP:")
+            && let Ok(k) = left.trim().parse::<i64>()
+            && k > 0
+        {
+            return Some((prop, k));
+        }
+    }
+    None
+}
+
+/// A dynamic coordinate or dimension which is the maximum of an optional static minimum
+/// and one or more `DynLinearSum` branches.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct DynAxisExpr {
+    pub min_static: Option<i64>,
+    pub branches: Vec<DynLinearSum>,
+}
+
+impl DynAxisExpr {
+    pub fn static_val(v: f64) -> Self {
+        Self {
+            min_static: Some(v.round() as i64),
+            branches: Vec::new(),
+        }
+    }
+
+    pub fn from_sum(sum: DynLinearSum) -> Self {
+        if sum.terms.is_empty() {
+            Self {
+                min_static: Some(sum.base),
+                branches: Vec::new(),
+            }
+        } else {
+            Self {
+                min_static: None,
+                branches: vec![sum],
+            }
+        }
+    }
+
+    pub fn is_dynamic(&self) -> bool {
+        !self.branches.is_empty()
+    }
+
+    pub fn into_opt(self) -> Option<Self> {
+        if self.is_dynamic() { Some(self) } else { None }
+    }
+
+    pub fn add_const(&self, delta: i64) -> Self {
+        if delta == 0 {
+            return self.clone();
+        }
+        if self.branches.is_empty() {
+            Self {
+                min_static: Some(self.min_static.unwrap_or(0) + delta),
+                branches: Vec::new(),
+            }
+        } else {
+            let mut out = Self {
+                min_static: self.min_static.map(|m| m + delta),
+                branches: self
+                    .branches
+                    .iter()
+                    .map(|b| {
+                        let mut c = b.clone();
+                        c.base += delta;
+                        c
+                    })
+                    .collect(),
+            };
+            out.normalize();
+            out
+        }
+    }
+
+    fn to_sums(&self) -> Vec<DynLinearSum> {
+        if self.branches.is_empty() {
+            vec![DynLinearSum::static_val(self.min_static.unwrap_or(0))]
+        } else {
+            let mut sums = self.branches.clone();
+            if let Some(ms) = self.min_static {
+                sums.push(DynLinearSum::static_val(ms));
+            }
+            sums
+        }
+    }
+
+    pub fn seq_add(&self, other: &Self) -> Self {
+        if !self.is_dynamic() && !other.is_dynamic() {
+            return Self {
+                min_static: Some(self.min_static.unwrap_or(0) + other.min_static.unwrap_or(0)),
+                branches: Vec::new(),
+            };
+        }
+        let left_sums = self.to_sums();
+        let right_sums = other.to_sums();
+        let mut min_static: Option<i64> = None;
+        let mut branches = Vec::new();
+        for l in &left_sums {
+            for r in &right_sums {
+                let combined = l.add_sum(r);
+                if combined.terms.is_empty() {
+                    min_static = Some(
+                        min_static
+                            .map(|m| m.max(combined.base))
+                            .unwrap_or(combined.base),
+                    );
+                } else {
+                    branches.push(combined);
+                }
+            }
+        }
+        let mut out = Self {
+            min_static,
+            branches,
+        };
+        out.normalize();
+        out
+    }
+
+    pub fn max_with(&self, other: &Self) -> Self {
+        let min_static = match (self.min_static, other.min_static) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (Some(a), None) | (None, Some(a)) => Some(a),
+            (None, None) => None,
+        };
+        let mut branches = self.branches.clone();
+        branches.extend(other.branches.clone());
+        let mut out = Self {
+            min_static,
+            branches,
+        };
+        out.normalize();
+        out
+    }
+
+    pub fn normalize(&mut self) {
+        let mut pruned: Vec<DynLinearSum> = Vec::new();
+        for cand in &self.branches {
+            if pruned.iter().any(|existing| existing.dominates(cand)) {
+                continue;
+            }
+            pruned.retain(|existing| !cand.dominates(existing));
+            pruned.push(cand.clone());
+        }
+        self.branches = pruned;
+
+        if let Some(ms) = self.min_static
+            && self
+                .branches
+                .iter()
+                .any(|b| b.min_value_at_one() >= ms && b.normalized_rates().is_some())
+        {
+            self.min_static = None;
+        }
+    }
+}
+
 /// Specification for emitting a dynamic `for i = 1, props["..."].Value do` loop
 /// in `GetControlLayout(props)` when a control's `count` is driven by a `Property`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -195,6 +482,10 @@ pub struct ControlLayoutDef {
     pub channel_index: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dynamic_repeat: Option<DynamicRepeatSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dyn_x: Option<DynAxisExpr>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dyn_y: Option<DynAxisExpr>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub skip_lua_emit: bool,
 }
@@ -217,6 +508,8 @@ impl ControlLayoutDef {
             base_control_name: None,
             channel_index: None,
             dynamic_repeat: None,
+            dyn_x: None,
+            dyn_y: None,
             skip_lua_emit: false,
         }
     }
@@ -247,6 +540,14 @@ pub struct GraphicItem {
     pub position: Position,
     pub size: Size,
     pub color: Option<Color>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dyn_x: Option<DynAxisExpr>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dyn_y: Option<DynAxisExpr>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dyn_width: Option<DynAxisExpr>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dyn_height: Option<DynAxisExpr>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub skip_lua_emit: bool,
 }
@@ -377,8 +678,15 @@ impl UiPageSpec {
         };
 
         let measured = measure_node(&root_node);
+        let (dyn_measured_w, _dyn_measured_h) =
+            measure_dyn_node(&root_node, FlexDirection::Column, self.gap);
         let total_width = self.width.unwrap_or_else(|| measured.width.max(260.0));
         let total_height = measured.height.max(80.0);
+        let dyn_total_width = match self.width {
+            Some(w) => DynAxisExpr::static_val(w),
+            None if dyn_measured_w.is_dynamic() => dyn_measured_w,
+            None => DynAxisExpr::static_val(total_width),
+        };
 
         let mut controls = Vec::new();
         let mut graphics = Vec::new();
@@ -388,6 +696,9 @@ impl UiPageSpec {
             0.0,
             0.0,
             total_width,
+            &DynAxisExpr::static_val(0.0),
+            &DynAxisExpr::static_val(0.0),
+            &dyn_total_width,
             FlexDirection::Column,
             self.gap,
             &mut controls,
@@ -399,6 +710,173 @@ impl UiPageSpec {
             size: Size::new(total_width, total_height),
             controls,
             graphics,
+        }
+    }
+}
+
+fn is_preview_tail_node(node: &UiNode) -> bool {
+    matches!(
+        node,
+        UiNode::Control(spec) if spec.skip_lua_emit && !spec.is_dynamic_repeat_head
+    )
+}
+
+fn measure_dyn_node(
+    node: &UiNode,
+    parent_dir: FlexDirection,
+    parent_gap: f64,
+) -> (DynAxisExpr, DynAxisExpr) {
+    match node {
+        UiNode::Spacer { width, height } => (
+            DynAxisExpr::static_val(*width),
+            DynAxisExpr::static_val(*height),
+        ),
+
+        UiNode::Header { width, height, .. } => {
+            let dw = match (width, parent_dir) {
+                (Some(w), _) => DynAxisExpr::static_val(*w),
+                (None, FlexDirection::Column) => DynAxisExpr::default(),
+                (None, FlexDirection::Row) => DynAxisExpr::static_val(220.0),
+            };
+            (dw, DynAxisExpr::static_val(*height))
+        }
+
+        UiNode::Label {
+            text,
+            width,
+            height,
+            ..
+        } => {
+            let auto_w = ((text.chars().count() as f64) * 7.2 + 12.0).max(56.0);
+            (
+                DynAxisExpr::static_val(width.unwrap_or(auto_w)),
+                DynAxisExpr::static_val(*height),
+            )
+        }
+
+        UiNode::Control(spec) => {
+            let sz = measure_node(node);
+            if spec.is_dynamic_repeat_head
+                && let Some(prop_name) = &spec.count_property
+            {
+                match parent_dir {
+                    FlexDirection::Row => {
+                        let step_x = (sz.width + parent_gap).round() as i64;
+                        let mut sum = DynLinearSum::static_val(-(parent_gap.round() as i64));
+                        sum.add_term(prop_name.clone(), step_x);
+                        (
+                            DynAxisExpr::from_sum(sum),
+                            DynAxisExpr::static_val(sz.height),
+                        )
+                    }
+                    FlexDirection::Column => {
+                        let step_y = (sz.height + parent_gap).round() as i64;
+                        let mut sum = DynLinearSum::static_val(-(parent_gap.round() as i64));
+                        sum.add_term(prop_name.clone(), step_y);
+                        (
+                            DynAxisExpr::static_val(sz.width),
+                            DynAxisExpr::from_sum(sum),
+                        )
+                    }
+                }
+            } else {
+                (
+                    DynAxisExpr::static_val(sz.width),
+                    DynAxisExpr::static_val(sz.height),
+                )
+            }
+        }
+
+        UiNode::Row {
+            children,
+            gap,
+            padding,
+        } => {
+            let mut total_w = DynAxisExpr::static_val(0.0);
+            let mut max_h = DynAxisExpr::default();
+            let mut first = true;
+            for child in children.iter().filter(|c| !is_preview_tail_node(c)) {
+                let (cw, ch) = measure_dyn_node(child, FlexDirection::Row, *gap);
+                if !first {
+                    total_w = total_w.add_const(gap.round() as i64);
+                }
+                first = false;
+                total_w = total_w.seq_add(&cw);
+                max_h = max_h.max_with(&ch);
+            }
+            let pad2 = (2.0 * padding).round() as i64;
+            if max_h.min_static.is_none() && max_h.branches.is_empty() {
+                max_h = DynAxisExpr::static_val(0.0);
+            }
+            (total_w.add_const(pad2), max_h.add_const(pad2))
+        }
+
+        UiNode::Col {
+            children,
+            gap,
+            padding,
+        } => {
+            let mut max_w = DynAxisExpr::default();
+            let mut total_h = DynAxisExpr::static_val(0.0);
+            let mut first = true;
+            for child in children.iter().filter(|c| !is_preview_tail_node(c)) {
+                let (cw, ch) = measure_dyn_node(child, FlexDirection::Column, *gap);
+                if !first {
+                    total_h = total_h.add_const(gap.round() as i64);
+                }
+                first = false;
+                max_w = max_w.max_with(&cw);
+                total_h = total_h.seq_add(&ch);
+            }
+            let pad2 = (2.0 * padding).round() as i64;
+            if max_w.min_static.is_none() && max_w.branches.is_empty() {
+                max_w = DynAxisExpr::static_val(0.0);
+            }
+            (max_w.add_const(pad2), total_h.add_const(pad2))
+        }
+
+        UiNode::GroupBox {
+            title,
+            children,
+            direction,
+            gap,
+            padding,
+            width,
+            height,
+            ..
+        } => {
+            let header_offset = if title.is_empty() { 0.0 } else { 24.0 };
+            let (inner_w, inner_h) = match direction {
+                FlexDirection::Row => measure_dyn_node(
+                    &UiNode::Row {
+                        children: children.clone(),
+                        gap: *gap,
+                        padding: 0.0,
+                    },
+                    FlexDirection::Row,
+                    *gap,
+                ),
+                FlexDirection::Column => measure_dyn_node(
+                    &UiNode::Col {
+                        children: children.clone(),
+                        gap: *gap,
+                        padding: 0.0,
+                    },
+                    FlexDirection::Column,
+                    *gap,
+                ),
+            };
+            let pad2 = (2.0 * padding).round() as i64;
+            let h_extra = (2.0 * padding + header_offset).round() as i64;
+            let dw = match width {
+                Some(w) => DynAxisExpr::static_val(*w),
+                None => inner_w.add_const(pad2),
+            };
+            let dh = match height {
+                Some(h) => DynAxisExpr::static_val(*h),
+                None => inner_h.add_const(h_extra),
+            };
+            (dw, dh)
         }
     }
 }
@@ -508,13 +986,20 @@ fn arrange_node(
     x: f64,
     y: f64,
     available_w: f64,
+    dyn_x: &DynAxisExpr,
+    dyn_y: &DynAxisExpr,
+    dyn_available_w: &DynAxisExpr,
     parent_dir: FlexDirection,
     parent_gap: f64,
     controls: &mut Vec<ControlLayoutDef>,
     graphics: &mut Vec<GraphicItem>,
-) -> Size {
+) -> (Size, DynAxisExpr, DynAxisExpr) {
     match node {
-        UiNode::Spacer { width, height } => Size::new(*width, *height),
+        UiNode::Spacer { width, height } => (
+            Size::new(*width, *height),
+            DynAxisExpr::static_val(*width),
+            DynAxisExpr::static_val(*height),
+        ),
 
         UiNode::Header {
             text,
@@ -524,6 +1009,11 @@ fn arrange_node(
             color,
         } => {
             let w = width.unwrap_or(available_w);
+            let dyn_w = match width {
+                Some(explicit_w) => DynAxisExpr::static_val(*explicit_w),
+                None => dyn_available_w.clone(),
+            };
+            let dyn_h = DynAxisExpr::static_val(*height);
             graphics.push(GraphicItem {
                 kind: GraphicItemKind::Header {
                     text: text.clone(),
@@ -531,10 +1021,14 @@ fn arrange_node(
                 },
                 position: Position::new(x, y),
                 size: Size::new(w, *height),
+                dyn_x: dyn_x.clone().into_opt(),
+                dyn_y: dyn_y.clone().into_opt(),
+                dyn_width: dyn_w.clone().into_opt(),
+                dyn_height: None,
                 color: color.clone(),
                 skip_lua_emit: false,
             });
-            Size::new(w, *height)
+            (Size::new(w, *height), dyn_w, dyn_h)
         }
 
         UiNode::Label {
@@ -555,10 +1049,18 @@ fn arrange_node(
                 },
                 position: Position::new(x, y),
                 size: Size::new(w, *height),
+                dyn_x: dyn_x.clone().into_opt(),
+                dyn_y: dyn_y.clone().into_opt(),
+                dyn_width: None,
+                dyn_height: None,
                 color: color.clone(),
                 skip_lua_emit: false,
             });
-            Size::new(w, *height)
+            (
+                Size::new(w, *height),
+                DynAxisExpr::static_val(w),
+                DynAxisExpr::static_val(*height),
+            )
         }
 
         UiNode::Control(spec) => {
@@ -567,55 +1069,69 @@ fn arrange_node(
             let ctl_h = spec.height.unwrap_or(def_size.height);
             let skip_lbl_lua = spec.skip_lua_emit || spec.is_dynamic_repeat_head;
 
-            let (ctl_x, ctl_y, total_w, total_h, lbl_info) = if let Some(ref lbl) = spec.label {
-                match spec.label_placement {
-                    LabelPlacement::Top => {
-                        let box_w = ctl_w.max(64.0);
-                        graphics.push(GraphicItem {
-                            kind: GraphicItemKind::Label {
-                                text: lbl.clone(),
-                                font_size: 11,
-                                h_align: "Left".to_string(),
-                            },
-                            position: Position::new(x, y),
-                            size: Size::new(box_w, 18.0),
-                            color: None,
-                            skip_lua_emit: skip_lbl_lua,
-                        });
-                        (
-                            x,
-                            y + 20.0,
-                            box_w,
-                            ctl_h + 20.0,
-                            Some((x, y, box_w, 18.0, 11u32)),
-                        )
+            let (ctl_x, ctl_y, ctl_dyn_x, ctl_dyn_y, total_w, total_h, lbl_info) =
+                if let Some(ref lbl) = spec.label {
+                    match spec.label_placement {
+                        LabelPlacement::Top => {
+                            let box_w = ctl_w.max(64.0);
+                            graphics.push(GraphicItem {
+                                kind: GraphicItemKind::Label {
+                                    text: lbl.clone(),
+                                    font_size: 11,
+                                    h_align: "Left".to_string(),
+                                },
+                                position: Position::new(x, y),
+                                size: Size::new(box_w, 18.0),
+                                dyn_x: dyn_x.clone().into_opt(),
+                                dyn_y: dyn_y.clone().into_opt(),
+                                dyn_width: None,
+                                dyn_height: None,
+                                color: None,
+                                skip_lua_emit: skip_lbl_lua,
+                            });
+                            (
+                                x,
+                                y + 20.0,
+                                dyn_x.clone(),
+                                dyn_y.add_const(20),
+                                box_w,
+                                ctl_h + 20.0,
+                                Some((x, y, box_w, 18.0, 11u32)),
+                            )
+                        }
+                        LabelPlacement::Left { width: lbl_w } => {
+                            let row_h = ctl_h.max(22.0);
+                            let lbl_y_off = ((row_h - 18.0) / 2.0).max(0.0);
+                            let lbl_y = y + lbl_y_off;
+                            graphics.push(GraphicItem {
+                                kind: GraphicItemKind::Label {
+                                    text: lbl.clone(),
+                                    font_size: 12,
+                                    h_align: "Left".to_string(),
+                                },
+                                position: Position::new(x, lbl_y),
+                                size: Size::new(lbl_w, 18.0),
+                                dyn_x: dyn_x.clone().into_opt(),
+                                dyn_y: dyn_y.add_const(lbl_y_off.round() as i64).into_opt(),
+                                dyn_width: None,
+                                dyn_height: None,
+                                color: None,
+                                skip_lua_emit: skip_lbl_lua,
+                            });
+                            (
+                                x + lbl_w + 8.0,
+                                y,
+                                dyn_x.add_const((lbl_w + 8.0).round() as i64),
+                                dyn_y.clone(),
+                                lbl_w + 8.0 + ctl_w,
+                                row_h,
+                                Some((x, lbl_y, lbl_w, 18.0, 12u32)),
+                            )
+                        }
                     }
-                    LabelPlacement::Left { width: lbl_w } => {
-                        let row_h = ctl_h.max(22.0);
-                        let lbl_y = y + ((row_h - 18.0) / 2.0).max(0.0);
-                        graphics.push(GraphicItem {
-                            kind: GraphicItemKind::Label {
-                                text: lbl.clone(),
-                                font_size: 12,
-                                h_align: "Left".to_string(),
-                            },
-                            position: Position::new(x, lbl_y),
-                            size: Size::new(lbl_w, 18.0),
-                            color: None,
-                            skip_lua_emit: skip_lbl_lua,
-                        });
-                        (
-                            x + lbl_w + 8.0,
-                            y,
-                            lbl_w + 8.0 + ctl_w,
-                            row_h,
-                            Some((x, lbl_y, lbl_w, 18.0, 12u32)),
-                        )
-                    }
-                }
-            } else {
-                (x, y, ctl_w, ctl_h, None)
-            };
+                } else {
+                    (x, y, dyn_x.clone(), dyn_y.clone(), ctl_w, ctl_h, None)
+                };
 
             let dynamic_repeat = if spec.is_dynamic_repeat_head
                 && let (Some(prop_name), Some(base_name)) =
@@ -667,6 +1183,8 @@ fn arrange_node(
                 style: Some(spec.style.clone()),
                 position: Position::new(ctl_x, ctl_y),
                 size: Size::new(ctl_w, ctl_h),
+                dyn_x: ctl_dyn_x.into_opt(),
+                dyn_y: ctl_dyn_y.into_opt(),
                 color: spec.color.clone(),
                 margin: spec.margin,
                 legend: spec.legend.clone(),
@@ -680,7 +1198,8 @@ fn arrange_node(
                 skip_lua_emit: spec.skip_lua_emit,
             });
 
-            Size::new(total_w, total_h)
+            let (dyn_w, dyn_h) = measure_dyn_node(node, parent_dir, parent_gap);
+            (Size::new(total_w, total_h), dyn_w, dyn_h)
         }
 
         UiNode::Row {
@@ -689,26 +1208,41 @@ fn arrange_node(
             padding,
         } => {
             let measured = measure_node(node);
+            let (dyn_measured_w, dyn_measured_h) = measure_dyn_node(node, parent_dir, parent_gap);
             let inner_h = (measured.height - 2.0 * padding).max(0.0);
+            let pad_i = padding.round() as i64;
+            let child_dyn_y = dyn_y.add_const(pad_i);
             let mut cur_x = x + padding;
+            let mut cur_dyn_x = dyn_x.add_const(pad_i);
             for child in children {
+                let is_tail = is_preview_tail_node(child);
                 let child_sz = measure_node(child);
-                // Vertically align non-label/groupbox children if desired, or top-align cleanly
-                let arranged = arrange_node(
+                let (child_dw_meas, _) = measure_dyn_node(child, FlexDirection::Row, *gap);
+                let (arranged, child_dw, _child_dh) = arrange_node(
                     child,
                     cur_x,
                     y + padding,
                     child_sz.width,
+                    &cur_dyn_x,
+                    &child_dyn_y,
+                    &child_dw_meas,
                     FlexDirection::Row,
                     *gap,
                     controls,
                     graphics,
                 );
                 cur_x += arranged.width + gap;
+                if !is_tail {
+                    cur_dyn_x = cur_dyn_x.seq_add(&child_dw).add_const(gap.round() as i64);
+                }
             }
-            Size::new(
-                (cur_x - gap + padding - x).max(measured.width),
-                inner_h + 2.0 * padding,
+            (
+                Size::new(
+                    (cur_x - gap + padding - x).max(measured.width),
+                    inner_h + 2.0 * padding,
+                ),
+                dyn_measured_w,
+                dyn_measured_h,
             )
         }
 
@@ -718,28 +1252,50 @@ fn arrange_node(
             padding,
         } => {
             let measured = measure_node(node);
+            let (dyn_measured_w, _dyn_measured_h) = measure_dyn_node(node, parent_dir, parent_gap);
             let box_w = available_w.max(measured.width);
+            let dyn_box_w = dyn_available_w.max_with(&dyn_measured_w);
             let inner_w = (box_w - 2.0 * padding).max(0.0);
+            let pad_i = padding.round() as i64;
+            let dyn_inner_w = dyn_box_w.add_const(-2 * pad_i);
+            let child_dyn_x = dyn_x.add_const(pad_i);
             let mut cur_y = y + padding;
+            let mut cur_dyn_y = dyn_y.add_const(pad_i);
+            let mut total_dyn_h = DynAxisExpr::static_val(0.0);
+            let mut first_dyn = true;
             for child in children {
-                let arranged = arrange_node(
+                let is_tail = is_preview_tail_node(child);
+                let (arranged, _child_dw, child_dh) = arrange_node(
                     child,
                     x + padding,
                     cur_y,
                     inner_w,
+                    &child_dyn_x,
+                    &cur_dyn_y,
+                    &dyn_inner_w,
                     FlexDirection::Column,
                     *gap,
                     controls,
                     graphics,
                 );
                 cur_y += arranged.height + gap;
+                if !is_tail {
+                    let gap_i = gap.round() as i64;
+                    cur_dyn_y = cur_dyn_y.seq_add(&child_dh).add_const(gap_i);
+                    if !first_dyn {
+                        total_dyn_h = total_dyn_h.add_const(gap_i);
+                    }
+                    first_dyn = false;
+                    total_dyn_h = total_dyn_h.seq_add(&child_dh);
+                }
             }
             let total_h = if children.is_empty() {
                 2.0 * padding
             } else {
                 cur_y - gap + padding - y
             };
-            Size::new(box_w, total_h)
+            let dyn_total_h = total_dyn_h.add_const(2 * pad_i);
+            (Size::new(box_w, total_h), dyn_box_w, dyn_total_h)
         }
 
         UiNode::GroupBox {
@@ -754,8 +1310,17 @@ fn arrange_node(
             stroke,
         } => {
             let measured = measure_node(node);
+            let (dyn_measured_w, dyn_measured_h) = measure_dyn_node(node, parent_dir, parent_gap);
             let box_w = width.unwrap_or_else(|| available_w.max(measured.width));
             let box_h = height.unwrap_or(measured.height);
+            let dyn_box_w = match width {
+                Some(w) => DynAxisExpr::static_val(*w),
+                None => dyn_available_w.max_with(&dyn_measured_w),
+            };
+            let dyn_box_h = match height {
+                Some(h) => DynAxisExpr::static_val(*h),
+                None => dyn_measured_h,
+            };
             let header_offset = if title.is_empty() { 0.0 } else { 24.0 };
 
             // Insert GroupBox graphic first so it renders behind its child controls
@@ -766,6 +1331,10 @@ fn arrange_node(
                 },
                 position: Position::new(x, y),
                 size: Size::new(box_w, box_h),
+                dyn_x: dyn_x.clone().into_opt(),
+                dyn_y: dyn_y.clone().into_opt(),
+                dyn_width: dyn_box_w.clone().into_opt(),
+                dyn_height: dyn_box_h.clone().into_opt(),
                 color: color.clone(),
                 skip_lua_emit: false,
             });
@@ -773,6 +1342,11 @@ fn arrange_node(
             let inner_w = (box_w - 2.0 * padding).max(0.0);
             let inner_x = x + padding;
             let inner_y = y + padding + header_offset;
+            let pad_i = padding.round() as i64;
+            let header_i = header_offset.round() as i64;
+            let dyn_inner_w = dyn_box_w.add_const(-2 * pad_i);
+            let dyn_inner_x = dyn_x.add_const(pad_i);
+            let dyn_inner_y = dyn_y.add_const(pad_i + header_i);
 
             match direction {
                 FlexDirection::Row => {
@@ -786,6 +1360,9 @@ fn arrange_node(
                         inner_x,
                         inner_y,
                         inner_w,
+                        &dyn_inner_x,
+                        &dyn_inner_y,
+                        &dyn_inner_w,
                         FlexDirection::Row,
                         *gap,
                         controls,
@@ -803,6 +1380,9 @@ fn arrange_node(
                         inner_x,
                         inner_y,
                         inner_w,
+                        &dyn_inner_x,
+                        &dyn_inner_y,
+                        &dyn_inner_w,
                         FlexDirection::Column,
                         *gap,
                         controls,
@@ -811,7 +1391,7 @@ fn arrange_node(
                 }
             }
 
-            Size::new(box_w, box_h)
+            (Size::new(box_w, box_h), dyn_box_w, dyn_box_h)
         }
     }
 }

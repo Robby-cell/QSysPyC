@@ -856,3 +856,49 @@ class WakeOnLan(QSysPlugin):
         "Consecutive indexed assignments on property-counted controls must emit __qsys_ctl without leading '(':\n{lua}"
     );
 }
+
+#[test]
+fn test_dynamic_container_sizing_and_sibling_positioning() {
+    let src = r#"
+class DynamicLayoutPlugin(QSysPlugin):
+    InputType = Property.Enum(name="Input Type", choices=["Float", "Integer"], default="Float")
+    InputCount = Property.Integer(name="Input Count", default=4, min=1, max=100)
+    Inputs = Control.Generic(InputType, name="Inputs", count=InputCount)
+    Outputs = Control.Float(name="Outputs", min=-1000000, max=1000000, count=InputCount*2)
+
+    layout = [UI.Page(
+        "Main",
+        UI.Header("My First Plugin"),
+        UI.GroupBox(
+            "Controls",
+            UI.Col(
+                UI.Row(UI.Field("Input", Inputs, style="text", color="Green", width=56)),
+                UI.Field("Output {i} Value", Outputs, direction="row", style="text", color="Red", width=56),
+            )
+        ),
+    ), UI.Page(
+        "Main but number 2",
+        UI.GroupBox(
+            "Vertical Outputs",
+            UI.Field("Output", Outputs),
+        ),
+    )]
+"#;
+    let lua = compile_to_lua(src);
+
+    // On "Main", both Header and GroupBox must scale width dynamically with `16 + (props["Input Count"].Value * 2) * 72`
+    assert!(
+        lua.contains("Type = \"Header\",\n            Text = \"My First Plugin\",\n            Position = { 16, 16 },\n            Size = { 16 + (props[\"Input Count\"].Value * 2) * 72, 28 },"),
+        "Header on Main page must dynamically size width to match the GroupBox:\n{lua}"
+    );
+    assert!(
+        lua.contains("Type = \"GroupBox\",\n            Text = \"Controls\",\n            Position = { 16, 56 },\n            Size = { 16 + (props[\"Input Count\"].Value * 2) * 72, 152 },"),
+        "GroupBox on Main page must dynamically size width to fit the widest dynamic row:\n{lua}"
+    );
+
+    // On "Main but number 2", the vertical GroupBox must scale height dynamically with `(props["Input Count"].Value * 2)`
+    assert!(
+        lua.contains("Type = \"GroupBox\",\n            Text = \"Vertical Outputs\",\n            Position = { 16, 16 },\n            Size = { 228, 38 + (props[\"Input Count\"].Value * 2) * 86 },"),
+        "GroupBox on second page must dynamically size height to fit the vertical dynamic control list:\n{lua}"
+    );
+}

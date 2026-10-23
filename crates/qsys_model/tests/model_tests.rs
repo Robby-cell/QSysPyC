@@ -120,6 +120,10 @@ fn test_layout_and_graphic_definitions() {
         },
         position: Position::new(0.0, 0.0),
         size: Size::new(300.0, 40.0),
+        dyn_x: None,
+        dyn_y: None,
+        dyn_width: None,
+        dyn_height: None,
         color: Some(Color::rgb(30, 30, 30)),
         skip_lua_emit: false,
     };

@@ -1,7 +1,7 @@
 use qsys_ir::*;
 use qsys_model::{
-    ControlKind, ControlLayoutDef, ControlStyle, GraphicItem, GraphicItemKind, PageLayout,
-    PropertyKind, is_design_time_method,
+    ControlKind, ControlLayoutDef, ControlStyle, DynAxisExpr, DynLinearSum, GraphicItem,
+    GraphicItemKind, PageLayout, PropertyKind, is_design_time_method,
 };
 
 use crate::context::CodegenContext;
@@ -231,7 +231,9 @@ pub fn emit_plugin(plugin: &IRPlugin, ctx: &mut CodegenContext) -> String {
         runtime_helpers.push_str(&format_generic_data_helpers());
     }
     if !runtime_helpers.is_empty() {
-        emitter.buffer.insert_str(runtime_body_offset, &runtime_helpers);
+        emitter
+            .buffer
+            .insert_str(runtime_body_offset, &runtime_helpers);
     }
 
     emitter.dedent();
@@ -496,11 +498,60 @@ pub(crate) fn emit_page_layout_body(emitter: &mut LuaEmitter<'_>, page: &PageLay
     }
 }
 
+fn format_dyn_linear_sum(sum: &DynLinearSum) -> String {
+    if sum.terms.is_empty() {
+        return sum.base.to_string();
+    }
+    let mut parts = Vec::new();
+    if sum.base != 0 {
+        parts.push(sum.base.to_string());
+    }
+    for term in &sum.terms {
+        let raw_count = format_count_lua_expr(&term.count_property, "props");
+        let count_lua = if raw_count.contains(' ') {
+            format!("({raw_count})")
+        } else {
+            raw_count
+        };
+        if term.step == 1 {
+            parts.push(count_lua);
+        } else {
+            parts.push(format!("{count_lua} * {}", term.step));
+        }
+    }
+    parts.join(" + ")
+}
+
+fn format_dyn_axis_expr(expr: &DynAxisExpr) -> String {
+    let mut candidates = Vec::new();
+    if let Some(ms) = expr.min_static {
+        candidates.push(ms.to_string());
+    }
+    for branch in &expr.branches {
+        candidates.push(format_dyn_linear_sum(branch));
+    }
+    match candidates.len() {
+        0 => "0".to_string(),
+        1 => candidates.into_iter().next().unwrap(),
+        _ => format!("math.max({})", candidates.join(", ")),
+    }
+}
+
+fn format_axis_or_static(dyn_opt: &Option<DynAxisExpr>, static_val: f64) -> String {
+    if let Some(expr) = dyn_opt
+        && expr.is_dynamic()
+    {
+        format_dyn_axis_expr(expr)
+    } else {
+        (static_val.round() as i64).to_string()
+    }
+}
+
 fn emit_graphic_item(emitter: &mut LuaEmitter<'_>, g: &GraphicItem) {
-    let x = g.position.x.round() as i64;
-    let y = g.position.y.round() as i64;
-    let w = g.size.width.round() as i64;
-    let h = g.size.height.round() as i64;
+    let x = format_axis_or_static(&g.dyn_x, g.position.x);
+    let y = format_axis_or_static(&g.dyn_y, g.position.y);
+    let w = format_axis_or_static(&g.dyn_width, g.size.width);
+    let h = format_axis_or_static(&g.dyn_height, g.size.height);
 
     emitter.write_line("table.insert(graphics, {");
     emitter.indent();
@@ -642,10 +693,10 @@ fn emit_control_layout_fields(
 }
 
 fn emit_control_layout_item(emitter: &mut LuaEmitter<'_>, ctl: &ControlLayoutDef) {
-    let x = ctl.position.x.round() as i64;
-    let y = ctl.position.y.round() as i64;
     let w = ctl.size.width.round() as i64;
     let h = ctl.size.height.round() as i64;
+    let x_str = format_axis_or_static(&ctl.dyn_x, ctl.position.x);
+    let y_str = format_axis_or_static(&ctl.dyn_y, ctl.position.y);
 
     if let Some(ref rep) = ctl.dynamic_repeat {
         let prop_expr = format_count_lua_expr(&rep.count_property, "props");
@@ -658,19 +709,27 @@ fn emit_control_layout_item(emitter: &mut LuaEmitter<'_>, ctl: &ControlLayoutDef
         emitter.indent();
 
         if let Some(ref lbl_tmpl) = rep.label_template {
-            let lx = (ctl.position.x + rep.label_offset_x).round() as i64;
-            let ly = (ctl.position.y + rep.label_offset_y).round() as i64;
+            let lbl_dyn_x = ctl
+                .dyn_x
+                .as_ref()
+                .map(|e| e.add_const(rep.label_offset_x.round() as i64));
+            let lbl_dyn_y = ctl
+                .dyn_y
+                .as_ref()
+                .map(|e| e.add_const(rep.label_offset_y.round() as i64));
+            let lx_str = format_axis_or_static(&lbl_dyn_x, ctl.position.x + rep.label_offset_x);
+            let ly_str = format_axis_or_static(&lbl_dyn_y, ctl.position.y + rep.label_offset_y);
             let lw = rep.label_width.round() as i64;
             let lh = rep.label_height.round() as i64;
             let l_pos_x = if dx == 0 {
-                lx.to_string()
+                lx_str
             } else {
-                format!("{lx} + (i - 1) * {dx}")
+                format!("{lx_str} + (i - 1) * {dx}")
             };
             let l_pos_y = if dy == 0 {
-                ly.to_string()
+                ly_str
             } else {
-                format!("{ly} + (i - 1) * {dy}")
+                format!("{ly_str} + (i - 1) * {dy}")
             };
             let lbl_text_expr = format_dynamic_channel_lua_expr(lbl_tmpl, &prop_expr);
 
@@ -687,14 +746,14 @@ fn emit_control_layout_item(emitter: &mut LuaEmitter<'_>, ctl: &ControlLayoutDef
         }
 
         let pos_x = if dx == 0 {
-            x.to_string()
+            x_str.clone()
         } else {
-            format!("{x} + (i - 1) * {dx}")
+            format!("{x_str} + (i - 1) * {dx}")
         };
         let pos_y = if dy == 0 {
-            y.to_string()
+            y_str.clone()
         } else {
-            format!("{y} + (i - 1) * {dy}")
+            format!("{y_str} + (i - 1) * {dy}")
         };
         let pretty_expr = format_dynamic_channel_lua_expr(&rep.pretty_name_template, &prop_expr);
 
@@ -713,8 +772,6 @@ fn emit_control_layout_item(emitter: &mut LuaEmitter<'_>, ctl: &ControlLayoutDef
     }
 
     let pretty = escape_lua_string(ctl.pretty_name.as_deref().unwrap_or(&ctl.name));
-    let x_str = x.to_string();
-    let y_str = y.to_string();
 
     if let (Some(prop_name), Some(base_name), Some(ch)) = (
         &ctl.count_property,
