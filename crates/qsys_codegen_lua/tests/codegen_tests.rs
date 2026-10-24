@@ -902,3 +902,136 @@ class DynamicLayoutPlugin(QSysPlugin):
         "GroupBox on second page must dynamically size height to fit the vertical dynamic control list:\n{lua}"
     );
 }
+
+#[test]
+fn test_hoisting_classes_and_functions_in_script_and_plugin() {
+    let script_src = r#"
+def foo():
+    return Bar().value
+
+class Bar:
+    value = 42
+
+print(foo())
+"#;
+    let script_lua = compile_to_lua(script_src);
+
+    let bar_pos = script_lua
+        .find("local Bar = {}")
+        .expect("Bar class table should be emitted");
+    let foo_pos = script_lua
+        .find("local function foo()")
+        .expect("foo function should be emitted");
+    assert!(
+        bar_pos < foo_pos,
+        "Class Bar must be hoisted before function foo in Lua output:\n{script_lua}"
+    );
+    assert!(
+        script_lua.contains("Bar.value = 42"),
+        "Class attribute Bar.value = 42 must be emitted on class table:\n{script_lua}"
+    );
+    assert!(
+        script_lua.contains("return Bar.new().value"),
+        "foo() must instantiate Bar.new().value:\n{script_lua}"
+    );
+
+    let plugin_src = r#"
+def make_default():
+    return Helper().scale
+
+class Helper:
+    scale = 10
+
+    def compute(self, x: int) -> int:
+        return x * bump(self.scale)
+
+def bump(v: int) -> int:
+    return v + 1
+
+class MyPlugin(QSysPlugin):
+    Out = Control.Float(name="Out")
+
+    def runtime(self):
+        self.Out.Value = make_default() + Helper().compute(3)
+"#;
+    let plugin_lua = compile_to_lua(plugin_src);
+    let helper_pos = plugin_lua
+        .find("local Helper = {}")
+        .expect("Helper class should be emitted");
+    let make_default_pos = plugin_lua
+        .find("local function make_default()")
+        .expect("make_default should be emitted");
+    let bump_decl_pos = plugin_lua
+        .find("local bump")
+        .expect("bump should be forward-declared because Helper:compute calls it");
+    assert!(
+        bump_decl_pos < helper_pos && helper_pos < make_default_pos,
+        "Forward declaration `local bump` must precede `local Helper = {{}}`, which must precede `local function make_default()`:\n{plugin_lua}"
+    );
+    assert!(
+        plugin_lua.contains("Helper.scale = 10"),
+        "Class attribute Helper.scale = 10 must be emitted:\n{plugin_lua}"
+    );
+}
+
+#[test]
+fn test_module_import_namespacing_and_hoisting() {
+    let bundled_src = r#"# --- Bundled module: helpers.py ---
+def get_magic():
+    return Foo().value
+
+class Foo:
+    value = 42
+
+    def __init__(self, mult: int):
+        self.mult = mult
+
+    def calc(self) -> int:
+        return self.value * self.mult
+# --- End bundled modules ---
+import helpers
+
+class MyPlugin(QSysPlugin):
+    Out = Control.Float(name="Out")
+
+    def runtime(self):
+        f = helpers.Foo(3)
+        self.Out.Value = f.calc() + helpers.get_magic()
+"#;
+    let lua = compile_to_lua(bundled_src);
+
+    assert!(
+        lua.contains("local helpers\ndo\n"),
+        "Imported module must be wrapped in `local helpers do ... end` block:\n{lua}"
+    );
+    assert!(
+        lua.contains("helpers = {\n        get_magic = get_magic,\n        Foo = Foo,\n    }"),
+        "Module block must export `get_magic` and `Foo` on `helpers` table:\n{lua}"
+    );
+    assert!(
+        lua.contains("local f = helpers.Foo.new(3)"),
+        "`helpers.Foo(3)` must compile to `helpers.Foo.new(3)`:\n{lua}"
+    );
+    assert!(
+        lua.contains("f:calc() + helpers.get_magic()"),
+        "Instance method on `helpers.Foo` must use `f:calc()` and module function must use `helpers.get_magic()`:\n{lua}"
+    );
+
+    // Also test `from helpers import Foo` and `import helpers as h`
+    let from_import_src = r#"# --- Bundled module: helpers.py ---
+class Foo:
+    value = 99
+# --- End bundled modules ---
+import helpers as h
+from helpers import Foo
+
+x = h.Foo().value + Foo().value
+"#;
+    let from_lua = compile_to_lua(from_import_src);
+    assert!(
+        from_lua.contains("local h = helpers")
+            && from_lua.contains("local Foo = helpers.Foo")
+            && from_lua.contains("(h.Foo.new().value + Foo.new().value)"),
+        "Aliased import and from-import must bind to the module namespace table:\n{from_lua}"
+    );
+}

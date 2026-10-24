@@ -129,7 +129,7 @@ pub fn analyze_lossy_with_env(
 
     // 1. Collect helper classes
     let mut custom_classes: Vec<ast::ClassDef> = Vec::new();
-    // 2. Collect top-level statements (constants, helper classes, utility functions, etc.) in source order
+    // 2. Collect top-level statements (constants, helper classes, utility functions, bundled modules, imports, etc.) in source order
     let mut module_statements: Vec<ast::Stmt> = Vec::new();
 
     for stmt in &parsed.module.statements {
@@ -144,7 +144,14 @@ pub fn analyze_lossy_with_env(
                     module_statements.push(stmt.clone());
                 }
             }
-            ast::StmtKind::Import { .. } | ast::StmtKind::ImportFrom { .. } => {}
+            ast::StmtKind::ModuleDef { body, .. } => {
+                for m_stmt in body {
+                    if let ast::StmtKind::ClassDef(cls) = &m_stmt.kind {
+                        custom_classes.push(cls.clone());
+                    }
+                }
+                module_statements.push(stmt.clone());
+            }
             _ => {
                 module_statements.push(stmt.clone());
             }
@@ -169,7 +176,7 @@ pub fn analyze_lossy_with_env(
         }
     };
 
-    // Pre-populate module scope with top-level constants, classes, and functions for class-based targets
+    // Pre-populate module scope with top-level constants, classes, functions, and imports for class-based targets
     if matches!(
         classification,
         TargetClassification::Plugin { .. } | TargetClassification::TextController { .. }
@@ -184,17 +191,7 @@ pub fn analyze_lossy_with_env(
         let mut module_analyzer =
             ExprAnalyzer::new(&mut scope_stack, &mut type_map, &mut diagnostics, &env)
                 .with_context(module_context);
-        for stmt in &parsed.module.statements {
-            if let ast::StmtKind::ClassDef(cls) = &stmt.kind
-                && cls
-                    .bases
-                    .iter()
-                    .any(|b| b == "QSysPlugin" || b == "TextController")
-            {
-                continue;
-            }
-            module_analyzer.analyze_stmt(stmt);
-        }
+        module_analyzer.analyze_statements(&module_statements);
     }
 
     let target = match classification {
@@ -583,117 +580,46 @@ pub fn analyze_lossy_with_env(
         }
 
         TargetClassification::ProceduralScript => {
+            let mut analyzer =
+                ExprAnalyzer::new(&mut scope_stack, &mut type_map, &mut diagnostics, &env)
+                    .with_context(ExecutionContext::Runtime);
+            analyzer.analyze_statements(&parsed.module.statements);
+
             let mut methods = Vec::new();
             let mut top_level_statements = Vec::new();
 
-            // Pre-register top-level functions so they can call each other in any order
-            let mut fn_ids: FxHashMap<String, FunctionId> = FxHashMap::default();
             for stmt in &parsed.module.statements {
                 if let ast::StmtKind::FunctionDef(f) = &stmt.kind {
-                    let func_id = scope_stack.alloc_function_id();
-                    let func_sym = scope_stack.alloc_symbol_id();
-                    scope_stack.define(Symbol::new(
-                        func_sym,
-                        f.name.clone(),
-                        SymbolKind::Method {
-                            id: func_id,
-                            param_count: f.params.len(),
-                            has_self: false,
-                        },
-                        f.span,
-                    ));
-                    type_map.insert_resolution(f.span, ResolvedTarget::Function(func_id));
-                    fn_ids.insert(f.name.clone(), func_id);
-                }
-            }
-
-            for stmt in &parsed.module.statements {
-                match &stmt.kind {
-                    ast::StmtKind::FunctionDef(f) => {
-                        let func_id = *fn_ids.get(&f.name).unwrap();
-
-                        scope_stack.push_scope(ScopeKind::Function {
-                            name: f.name.clone(),
-                        });
-
-                        let mut resolved_params = Vec::new();
-                        for (idx, param) in f.params.iter().enumerate() {
-                            let param_ty =
-                                type_from_annotation(param.type_annotation.as_deref(), &env);
-                            let param_sym = scope_stack.alloc_symbol_id();
-                            type_map.insert_symbol_name(param_sym, param.name.clone());
-                            scope_stack.define(Symbol::new(
-                                param_sym,
-                                param.name.clone(),
-                                SymbolKind::Parameter {
-                                    id: param_sym,
-                                    ty: param_ty.clone(),
-                                    index: idx,
-                                },
-                                param.span,
-                            ));
-                            type_map
-                                .insert_resolution(param.span, ResolvedTarget::Local(param_sym));
-                            type_map.insert_type(param.span, param_ty);
-                            resolved_params.push((param_sym, param.name.clone()));
-                        }
-
-                        let mut analyzer = ExprAnalyzer::new(
-                            &mut scope_stack,
-                            &mut type_map,
-                            &mut diagnostics,
-                            &env,
-                        )
-                        .with_context(ExecutionContext::Runtime);
-                        analyzer.analyze_statements(&f.body);
-
-                        scope_stack.pop_scope();
-
-                        let mut ret_ty = type_from_annotation(f.return_type.as_deref(), &env);
-                        if ret_ty == Type::Any {
-                            for body_stmt in &f.body {
-                                if let ast::StmtKind::Return(Some(ret_expr)) = &body_stmt.kind
-                                    && let Some(inferred) = type_map.get_type(ret_expr.span)
-                                    && *inferred != Type::Any
-                                {
-                                    ret_ty = inferred.clone();
-                                    break;
-                                }
-                            }
-                        }
-                        type_map.insert_function_return_type(f.name.clone(), ret_ty);
-
-                        methods.push(ResolvedMethod {
-                            id: func_id,
-                            name: f.name.clone(),
-                            params: resolved_params,
-                            body: f.body.clone(),
-                            span: f.span,
-                        });
-                    }
-                    ast::StmtKind::ClassDef(_) => {
-                        let mut analyzer = ExprAnalyzer::new(
-                            &mut scope_stack,
-                            &mut type_map,
-                            &mut diagnostics,
-                            &env,
-                        )
-                        .with_context(ExecutionContext::Runtime);
-                        analyzer.analyze_stmt(stmt);
-                        top_level_statements.push(stmt.clone());
-                    }
-                    ast::StmtKind::Import { .. } | ast::StmtKind::ImportFrom { .. } => {}
-                    _ => {
-                        let mut analyzer = ExprAnalyzer::new(
-                            &mut scope_stack,
-                            &mut type_map,
-                            &mut diagnostics,
-                            &env,
-                        )
-                        .with_context(ExecutionContext::Runtime);
-                        analyzer.analyze_stmt(stmt);
-                        top_level_statements.push(stmt.clone());
-                    }
+                    let func_id = type_map
+                        .get_resolution(f.span)
+                        .and_then(|r| match r {
+                            ResolvedTarget::Function(id) => Some(*id),
+                            _ => None,
+                        })
+                        .unwrap_or(FunctionId(0));
+                    let resolved_params = f
+                        .params
+                        .iter()
+                        .map(|p| {
+                            let sym_id = type_map
+                                .get_resolution(p.span)
+                                .and_then(|r| match r {
+                                    ResolvedTarget::Local(id) => Some(*id),
+                                    _ => None,
+                                })
+                                .unwrap_or(SymbolId(0));
+                            (sym_id, p.name.clone())
+                        })
+                        .collect();
+                    methods.push(ResolvedMethod {
+                        id: func_id,
+                        name: f.name.clone(),
+                        params: resolved_params,
+                        body: f.body.clone(),
+                        span: f.span,
+                    });
+                } else {
+                    top_level_statements.push(stmt.clone());
                 }
             }
 

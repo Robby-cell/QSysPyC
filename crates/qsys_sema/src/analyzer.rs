@@ -67,8 +67,237 @@ impl<'a> ExprAnalyzer<'a> {
     }
 
     pub fn analyze_statements(&mut self, stmts: &[ast::Stmt]) {
+        if matches!(
+            self.scope_stack.current_scope().kind,
+            ScopeKind::Class { .. }
+        ) {
+            for stmt in stmts {
+                self.analyze_stmt(stmt);
+            }
+            return;
+        }
+
+        // Pass 1: Process bundled module definitions and imports so module namespaces are bound
         for stmt in stmts {
-            self.analyze_stmt(stmt);
+            if matches!(
+                stmt.kind,
+                ast::StmtKind::ModuleDef { .. }
+                    | ast::StmtKind::Import { .. }
+                    | ast::StmtKind::ImportFrom { .. }
+            ) {
+                self.analyze_stmt(stmt);
+            }
+        }
+
+        // Pass 2: Hoist ClassDef, FunctionDef, and module-level Assign declarations
+        for stmt in stmts {
+            if let ast::StmtKind::ClassDef(c) = &stmt.kind {
+                self.pre_register_class(c);
+            }
+        }
+        for stmt in stmts {
+            if let ast::StmtKind::FunctionDef(f) = &stmt.kind {
+                self.pre_register_function(f);
+            }
+        }
+        if matches!(self.scope_stack.current_scope().kind, ScopeKind::Module) {
+            for stmt in stmts {
+                if let ast::StmtKind::Assign { target, value } = &stmt.kind
+                    && let ast::ExprKind::Ident(name) = &target.kind
+                    && self.scope_stack.lookup(name).is_none()
+                {
+                    let sym_id = self.scope_stack.alloc_symbol_id();
+                    let quick_ty = self.peek_expr_type(value);
+                    self.scope_stack.define(Symbol::new(
+                        sym_id,
+                        name.clone(),
+                        SymbolKind::Variable {
+                            id: sym_id,
+                            ty: quick_ty.clone(),
+                        },
+                        target.span,
+                    ));
+                    self.type_map.insert_symbol_name(sym_id, name.clone());
+                    self.type_map
+                        .insert_resolution(target.span, ResolvedTarget::Local(sym_id));
+                    self.type_map.insert_type(target.span, quick_ty);
+                }
+            }
+        }
+
+        // Pass 3: Analyze ClassDef bodies first so all class/instance attributes and method return types are populated
+        for stmt in stmts {
+            if matches!(stmt.kind, ast::StmtKind::ClassDef(_)) {
+                self.analyze_stmt(stmt);
+            }
+        }
+
+        // Pass 4: Analyze FunctionDef bodies and remaining statements
+        for stmt in stmts {
+            if !matches!(
+                stmt.kind,
+                ast::StmtKind::ModuleDef { .. }
+                    | ast::StmtKind::Import { .. }
+                    | ast::StmtKind::ImportFrom { .. }
+                    | ast::StmtKind::ClassDef(_)
+            ) {
+                self.analyze_stmt(stmt);
+            }
+        }
+    }
+
+    fn peek_expr_type(&self, expr: &ast::Expr) -> Type {
+        match &expr.kind {
+            ast::ExprKind::Int(_) => Type::Int,
+            ast::ExprKind::Float(_) => Type::Float,
+            ast::ExprKind::String(_) => Type::String,
+            ast::ExprKind::Bool(_) => Type::Bool,
+            ast::ExprKind::None => Type::None,
+            ast::ExprKind::Ident(name) => {
+                if let Some(sym) = self.scope_stack.lookup(name) {
+                    match &sym.kind {
+                        SymbolKind::Variable { ty, .. } | SymbolKind::Parameter { ty, .. } => {
+                            ty.clone()
+                        }
+                        SymbolKind::Class { name, .. } | SymbolKind::UserClass { name } => {
+                            Type::UserClass { name: name.clone() }
+                        }
+                        SymbolKind::Module { name } => Type::UserModule { name: name.clone() },
+                        _ => Type::Any,
+                    }
+                } else {
+                    Type::Any
+                }
+            }
+            ast::ExprKind::Call { callee, .. } => {
+                let callee_ty = self.peek_expr_type(callee);
+                if let Type::UserClass { name } = callee_ty {
+                    Type::UserInstance { name }
+                } else if let ast::ExprKind::Ident(fn_name) = &callee.kind {
+                    self.type_map
+                        .get_function_return_type(fn_name)
+                        .cloned()
+                        .unwrap_or(Type::Any)
+                } else {
+                    Type::Any
+                }
+            }
+            ast::ExprKind::Attribute { value, attr } => {
+                let base_ty = self.peek_expr_type(value);
+                match base_ty {
+                    Type::UserInstance { ref name } | Type::UserClass { ref name } => self
+                        .type_map
+                        .get_class_member_type(name, attr)
+                        .cloned()
+                        .unwrap_or(Type::Any),
+                    Type::UserModule { ref name } => self
+                        .type_map
+                        .get_module_member_type(name, attr)
+                        .cloned()
+                        .unwrap_or(Type::Any),
+                    _ => Type::Any,
+                }
+            }
+            _ => Type::Any,
+        }
+    }
+
+    fn pre_register_class(&mut self, c: &ast::ClassDef) {
+        let sym_id = self.scope_stack.alloc_symbol_id();
+
+        if let Some(base_name) = c.bases.first()
+            && !matches!(
+                base_name.as_str(),
+                "QSysPlugin" | "TextController" | "object"
+            )
+        {
+            let base_cls = base_name
+                .rsplit('.')
+                .next()
+                .unwrap_or(base_name.as_str())
+                .to_string();
+            self.type_map.insert_class_base(c.name.clone(), base_cls);
+        }
+
+        self.scope_stack.define(Symbol::new(
+            sym_id,
+            c.name.clone(),
+            SymbolKind::Class {
+                name: c.name.clone(),
+                base: c.bases.first().cloned(),
+            },
+            c.span,
+        ));
+
+        for body_stmt in &c.body {
+            match &body_stmt.kind {
+                ast::StmtKind::FunctionDef(f) => {
+                    let mut ret_ty =
+                        crate::type_from_annotation(f.return_type.as_deref(), self.env);
+                    if ret_ty == Type::Any {
+                        for s in &f.body {
+                            if let ast::StmtKind::Return(Some(ret_expr)) = &s.kind {
+                                let peeked = self.peek_expr_type(ret_expr);
+                                if peeked != Type::Any {
+                                    ret_ty = peeked;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    self.type_map
+                        .insert_class_member_type(c.name.clone(), f.name.clone(), ret_ty);
+                }
+                ast::StmtKind::Assign { target, value } => {
+                    if let ast::ExprKind::Ident(attr_name) = &target.kind {
+                        let attr_ty = self.peek_expr_type(value);
+                        self.type_map.insert_class_member_type(
+                            c.name.clone(),
+                            attr_name.clone(),
+                            attr_ty,
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn pre_register_function(&mut self, f: &ast::FunctionDef) {
+        if self.type_map.get_resolution(f.span).is_some() {
+            return;
+        }
+        let func_id = self.scope_stack.alloc_function_id();
+        let sym_id = self.scope_stack.alloc_symbol_id();
+
+        self.scope_stack.define(Symbol::new(
+            sym_id,
+            f.name.clone(),
+            SymbolKind::Method {
+                id: func_id,
+                param_count: f.params.len(),
+                has_self: f.params.first().is_some_and(|p| p.name == "self"),
+            },
+            f.span,
+        ));
+        self.type_map
+            .insert_resolution(f.span, ResolvedTarget::Function(func_id));
+
+        let mut ret_ty = crate::type_from_annotation(f.return_type.as_deref(), self.env);
+        if ret_ty == Type::Any {
+            for s in &f.body {
+                if let ast::StmtKind::Return(Some(ret_expr)) = &s.kind {
+                    let peeked = self.peek_expr_type(ret_expr);
+                    if peeked != Type::Any {
+                        ret_ty = peeked;
+                        break;
+                    }
+                }
+            }
+        }
+        if ret_ty != Type::Any {
+            self.type_map
+                .insert_function_return_type(f.name.clone(), ret_ty);
         }
     }
 
@@ -78,7 +307,21 @@ impl<'a> ExprAnalyzer<'a> {
                 let val_ty = self.infer_expr(value);
                 match &target.kind {
                     ast::ExprKind::Ident(name) => {
-                        let sym_id = if let Some(existing) = self.scope_stack.lookup(name) {
+                        let enclosing_class = match &self.scope_stack.current_scope().kind {
+                            ScopeKind::Class { name } => Some(name.clone()),
+                            _ => None,
+                        };
+                        let sym_id = if let Some(existing) =
+                            self.scope_stack.current_scope().symbols.get(name)
+                        {
+                            match existing.kind {
+                                SymbolKind::Variable { id, .. }
+                                | SymbolKind::Parameter { id, .. } => id,
+                                _ => self.scope_stack.alloc_symbol_id(),
+                            }
+                        } else if enclosing_class.is_none()
+                            && let Some(existing) = self.scope_stack.lookup(name)
+                        {
                             match existing.kind {
                                 SymbolKind::Variable { id, .. }
                                 | SymbolKind::Parameter { id, .. } => id,
@@ -87,6 +330,13 @@ impl<'a> ExprAnalyzer<'a> {
                         } else {
                             self.scope_stack.alloc_symbol_id()
                         };
+                        if let Some(cls_name) = enclosing_class {
+                            self.type_map.insert_class_member_type(
+                                cls_name,
+                                name.clone(),
+                                val_ty.clone(),
+                            );
+                        }
                         self.scope_stack.define(Symbol::new(
                             sym_id,
                             name.clone(),
@@ -211,26 +461,33 @@ impl<'a> ExprAnalyzer<'a> {
             }
 
             ast::StmtKind::FunctionDef(f) => {
-                let func_id = self.scope_stack.alloc_function_id();
-                let sym_id = self.scope_stack.alloc_symbol_id();
-
                 let enclosing_class = match &self.scope_stack.current_scope().kind {
                     ScopeKind::Class { name } => Some(name.clone()),
                     _ => None,
                 };
 
-                self.scope_stack.define(Symbol::new(
-                    sym_id,
-                    f.name.clone(),
-                    SymbolKind::Method {
-                        id: func_id,
-                        param_count: f.params.len(),
-                        has_self: f.params.first().is_some_and(|p| p.name == "self"),
-                    },
-                    f.span,
-                ));
-                self.type_map
-                    .insert_resolution(f.span, ResolvedTarget::Function(func_id));
+                let func_id = if let Some(ResolvedTarget::Function(existing_id)) =
+                    self.type_map.get_resolution(f.span)
+                {
+                    *existing_id
+                } else {
+                    let new_id = self.scope_stack.alloc_function_id();
+                    let sym_id = self.scope_stack.alloc_symbol_id();
+                    self.scope_stack.define(Symbol::new(
+                        sym_id,
+                        f.name.clone(),
+                        SymbolKind::Method {
+                            id: new_id,
+                            param_count: f.params.len(),
+                            has_self: f.params.first().is_some_and(|p| p.name == "self"),
+                        },
+                        f.span,
+                    ));
+                    self.type_map
+                        .insert_resolution(f.span, ResolvedTarget::Function(new_id));
+                    new_id
+                };
+                let _ = func_id;
 
                 self.scope_stack.push_scope(ScopeKind::Function {
                     name: f.name.clone(),
@@ -266,8 +523,14 @@ impl<'a> ExprAnalyzer<'a> {
                     ));
                 }
 
-                // A nested function body only runs when called, so its execution phase is unknown.
-                let outer_context = std::mem::replace(&mut self.context, ExecutionContext::Unknown);
+                // A module-level function in a plugin (ExecutionContext::Both) only runs when called,
+                // whereas a function in a runtime-only script stays in ExecutionContext::Runtime.
+                let fn_context = if self.context == ExecutionContext::Both {
+                    ExecutionContext::Unknown
+                } else {
+                    self.context
+                };
+                let outer_context = std::mem::replace(&mut self.context, fn_context);
                 self.analyze_statements(&f.body);
                 self.context = outer_context;
                 self.scope_stack.pop_scope();
@@ -295,39 +558,13 @@ impl<'a> ExprAnalyzer<'a> {
             }
 
             ast::StmtKind::ClassDef(c) => {
-                let sym_id = self.scope_stack.alloc_symbol_id();
-
-                if let Some(base_name) = c.bases.first()
-                    && !matches!(
-                        base_name.as_str(),
-                        "QSysPlugin" | "TextController" | "object"
-                    )
+                if !self
+                    .scope_stack
+                    .current_scope()
+                    .symbols
+                    .contains_key(&c.name)
                 {
-                    self.type_map
-                        .insert_class_base(c.name.clone(), base_name.clone());
-                }
-
-                self.scope_stack.define(Symbol::new(
-                    sym_id,
-                    c.name.clone(),
-                    SymbolKind::Class {
-                        name: c.name.clone(),
-                        base: c.bases.first().cloned(),
-                    },
-                    c.span,
-                ));
-
-                // Pre-register methods on the class so intra-class `self.method()` calls resolve cleanly
-                for body_stmt in &c.body {
-                    if let ast::StmtKind::FunctionDef(f) = &body_stmt.kind {
-                        let annotated_ret =
-                            crate::type_from_annotation(f.return_type.as_deref(), self.env);
-                        self.type_map.insert_class_member_type(
-                            c.name.clone(),
-                            f.name.clone(),
-                            annotated_ret,
-                        );
-                    }
+                    self.pre_register_class(c);
                 }
 
                 self.scope_stack.push_scope(ScopeKind::Class {
@@ -335,6 +572,172 @@ impl<'a> ExprAnalyzer<'a> {
                 });
                 self.analyze_statements(&c.body);
                 self.scope_stack.pop_scope();
+            }
+
+            ast::StmtKind::ModuleDef { name, body, .. } => {
+                self.type_map.register_module(name.clone());
+                self.scope_stack.push_scope(ScopeKind::Module);
+                self.analyze_statements(body);
+
+                let exported: Vec<(String, Type)> =
+                    self.scope_stack
+                        .current_scope()
+                        .symbols
+                        .iter()
+                        .map(|(sym_name, sym)| {
+                            let ty = match &sym.kind {
+                                SymbolKind::Class { name: cls_name, .. }
+                                | SymbolKind::UserClass { name: cls_name } => Type::UserClass {
+                                    name: cls_name.clone(),
+                                },
+                                SymbolKind::Method { .. } => self
+                                    .type_map
+                                    .get_function_return_type(sym_name)
+                                    .cloned()
+                                    .unwrap_or(Type::Any),
+                                SymbolKind::Variable { ty, .. }
+                                | SymbolKind::Parameter { ty, .. } => ty.clone(),
+                                SymbolKind::Module { name: sub_mod } => Type::UserModule {
+                                    name: sub_mod.clone(),
+                                },
+                                _ => Type::Any,
+                            };
+                            (sym_name.clone(), ty)
+                        })
+                        .collect();
+
+                self.scope_stack.pop_scope();
+
+                for (member_name, member_ty) in exported {
+                    self.type_map
+                        .insert_module_member_type(name.clone(), member_name, member_ty);
+                }
+            }
+
+            ast::StmtKind::Import { module, alias } => {
+                if module == "qsys" || module.starts_with("qsys.") {
+                    return;
+                }
+                let mod_stem = module
+                    .trim_start_matches('.')
+                    .rsplit('.')
+                    .next()
+                    .unwrap_or(module.as_str())
+                    .to_string();
+                let bound_name = alias.clone().unwrap_or_else(|| mod_stem.clone());
+                let sym_id = self.scope_stack.alloc_symbol_id();
+                self.scope_stack.define(Symbol::new(
+                    sym_id,
+                    bound_name.clone(),
+                    SymbolKind::Module {
+                        name: mod_stem.clone(),
+                    },
+                    stmt.span,
+                ));
+                self.type_map.insert_symbol_name(sym_id, bound_name);
+                self.type_map
+                    .insert_type(stmt.span, Type::UserModule { name: mod_stem });
+            }
+
+            ast::StmtKind::ImportFrom {
+                module, aliases, ..
+            } => {
+                if module == "qsys" || module.starts_with("qsys.") {
+                    return;
+                }
+                let mod_stem = module
+                    .trim_start_matches('.')
+                    .rsplit('.')
+                    .next()
+                    .unwrap_or(module.as_str())
+                    .to_string();
+
+                for (orig_name, alias_opt) in aliases {
+                    if orig_name == "*" {
+                        for member_name in self.type_map.module_member_names(&mod_stem) {
+                            if let Some(member_ty) = self
+                                .type_map
+                                .get_module_member_type(&mod_stem, &member_name)
+                                .cloned()
+                            {
+                                let sym_id = self.scope_stack.alloc_symbol_id();
+                                let kind = if let Type::UserClass { ref name } = member_ty {
+                                    SymbolKind::Class {
+                                        name: name.clone(),
+                                        base: None,
+                                    }
+                                } else {
+                                    SymbolKind::Variable {
+                                        id: sym_id,
+                                        ty: member_ty,
+                                    }
+                                };
+                                self.scope_stack.define(Symbol::new(
+                                    sym_id,
+                                    member_name.clone(),
+                                    kind,
+                                    stmt.span,
+                                ));
+                                self.type_map.insert_symbol_name(sym_id, member_name);
+                            }
+                        }
+                        continue;
+                    }
+
+                    let bound_name = alias_opt.clone().unwrap_or_else(|| orig_name.clone());
+                    if let Some(member_ty) = self
+                        .type_map
+                        .get_module_member_type(&mod_stem, orig_name)
+                        .cloned()
+                    {
+                        let sym_id = self.scope_stack.alloc_symbol_id();
+                        let kind = if let Type::UserClass { ref name } = member_ty {
+                            SymbolKind::Class {
+                                name: name.clone(),
+                                base: None,
+                            }
+                        } else {
+                            self.type_map
+                                .insert_function_return_type(bound_name.clone(), member_ty.clone());
+                            SymbolKind::Variable {
+                                id: sym_id,
+                                ty: member_ty,
+                            }
+                        };
+                        self.scope_stack.define(Symbol::new(
+                            sym_id,
+                            bound_name.clone(),
+                            kind,
+                            stmt.span,
+                        ));
+                        self.type_map.insert_symbol_name(sym_id, bound_name);
+                    } else if self.type_map.is_known_module(&mod_stem) {
+                        let known_members = self.type_map.module_member_names(&mod_stem);
+                        let candidates = find_closest_match(orig_name, &known_members)
+                            .map(|c| vec![c])
+                            .unwrap_or_default();
+                        self.diagnostics.report(
+                            DiagnosticKind::UnknownClassMember {
+                                class_name: mod_stem.clone(),
+                                member: orig_name.clone(),
+                                candidates,
+                            },
+                            stmt.span,
+                        );
+                    } else {
+                        let sym_id = self.scope_stack.alloc_symbol_id();
+                        self.scope_stack.define(Symbol::new(
+                            sym_id,
+                            bound_name.clone(),
+                            SymbolKind::Variable {
+                                id: sym_id,
+                                ty: Type::Any,
+                            },
+                            stmt.span,
+                        ));
+                        self.type_map.insert_symbol_name(sym_id, bound_name);
+                    }
+                }
             }
 
             _ => {}
@@ -374,6 +777,11 @@ impl<'a> ExprAnalyzer<'a> {
                         }
                         SymbolKind::Class { name, .. } | SymbolKind::UserClass { name } => {
                             Type::UserClass { name: name.clone() }
+                        }
+                        SymbolKind::Module { name } => {
+                            self.type_map
+                                .insert_resolution(expr.span, ResolvedTarget::Local(symbol.id));
+                            Type::UserModule { name: name.clone() }
                         }
                     }
                 } else if let Some(global) = self.env.global(name) {
@@ -564,7 +972,7 @@ impl<'a> ExprAnalyzer<'a> {
                             Type::Any
                         }
                     }
-                    Type::UserInstance { ref name } => {
+                    Type::UserInstance { ref name } | Type::UserClass { ref name } => {
                         if let Some(member_ty) =
                             self.type_map.get_class_member_type(name, attr).cloned()
                         {
@@ -572,6 +980,29 @@ impl<'a> ExprAnalyzer<'a> {
                         } else {
                             let known_members = self.type_map.class_member_names(name);
                             if !known_members.is_empty() {
+                                let candidates = find_closest_match(attr, &known_members)
+                                    .map(|c| vec![c])
+                                    .unwrap_or_default();
+                                self.diagnostics.report(
+                                    DiagnosticKind::UnknownClassMember {
+                                        class_name: name.clone(),
+                                        member: attr.clone(),
+                                        candidates,
+                                    },
+                                    expr.span,
+                                );
+                            }
+                            Type::Any
+                        }
+                    }
+                    Type::UserModule { ref name } => {
+                        if let Some(member_ty) =
+                            self.type_map.get_module_member_type(name, attr).cloned()
+                        {
+                            member_ty
+                        } else {
+                            if self.type_map.is_known_module(name) {
+                                let known_members = self.type_map.module_member_names(name);
                                 let candidates = find_closest_match(attr, &known_members)
                                     .map(|c| vec![c])
                                     .unwrap_or_default();
@@ -748,6 +1179,11 @@ impl<'a> ExprAnalyzer<'a> {
                     ) = receiver_ty
                         && let Some(ret_ty) =
                             self.type_map.get_class_member_type(name, attr).cloned()
+                    {
+                        ret_ty
+                    } else if let Some(Type::UserModule { ref name }) = receiver_ty
+                        && let Some(ret_ty) =
+                            self.type_map.get_module_member_type(name, attr).cloned()
                     {
                         ret_ty
                     } else if receiver_ty == Some(Type::String) {

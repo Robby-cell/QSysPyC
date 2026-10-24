@@ -1,4 +1,4 @@
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 
 use qsys_diagnostics::Span;
@@ -42,6 +42,9 @@ pub enum Type {
     UserInstance {
         name: String,
     }, // Custom class instance object (e.g. `dev = Device(...)`)
+    UserModule {
+        name: String,
+    }, // Imported Python module namespace (e.g. `import helpers`)
 
     Any,
 }
@@ -78,7 +81,8 @@ impl Type {
             | Self::ControlHandle
             | Self::Native { .. }
             | Self::ClassInstance { .. }
-            | Self::UserInstance { .. } => TruthinessStrategy::Direct,
+            | Self::UserInstance { .. }
+            | Self::UserModule { .. } => TruthinessStrategy::Direct,
 
             Self::Int | Self::Float => TruthinessStrategy::NumericNotZero,
             Self::String => TruthinessStrategy::StringNonEmpty,
@@ -109,6 +113,8 @@ pub struct TypeMap {
     symbol_names: FxHashMap<SymbolId, String>,
     class_bases: FxHashMap<String, String>,
     class_member_types: FxHashMap<(String, String), Type>,
+    module_member_types: FxHashMap<(String, String), Type>,
+    known_modules: FxHashSet<String>,
     function_return_types: FxHashMap<String, Type>,
 }
 
@@ -190,6 +196,40 @@ impl TypeMap {
 
     pub fn get_function_return_type(&self, fn_name: &str) -> Option<&Type> {
         self.function_return_types.get(fn_name)
+    }
+
+    pub fn register_module(&mut self, mod_name: impl Into<String>) {
+        self.known_modules.insert(mod_name.into());
+    }
+
+    pub fn is_known_module(&self, mod_name: &str) -> bool {
+        self.known_modules.contains(mod_name)
+    }
+
+    pub fn insert_module_member_type(
+        &mut self,
+        mod_name: impl Into<String>,
+        member_name: impl Into<String>,
+        ty: Type,
+    ) {
+        self.module_member_types
+            .insert((mod_name.into(), member_name.into()), ty);
+    }
+
+    pub fn get_module_member_type(&self, mod_name: &str, member_name: &str) -> Option<&Type> {
+        self.module_member_types
+            .get(&(mod_name.to_string(), member_name.to_string()))
+    }
+
+    pub fn module_member_names(&self, mod_name: &str) -> Vec<String> {
+        let mut names = Vec::new();
+        for (m, member) in self.module_member_types.keys() {
+            if m == mod_name && !names.contains(member) {
+                names.push(member.clone());
+            }
+        }
+        names.sort();
+        names
     }
 
     pub fn insert_type(&mut self, span: Span, ty: Type) {

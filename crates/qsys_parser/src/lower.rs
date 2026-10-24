@@ -10,6 +10,17 @@ pub(crate) fn text_range_to_span(range: TextRange) -> Span {
     Span::new(range.start().to_usize(), range.end().to_usize())
 }
 
+fn extract_base_name(expr: &ruff::Expr) -> Option<String> {
+    match expr {
+        ruff::Expr::Name(n) => Some(n.id.to_string()),
+        ruff::Expr::Attribute(a) => {
+            let prefix = extract_base_name(&a.value)?;
+            Some(format!("{prefix}.{}", a.attr))
+        }
+        _ => None,
+    }
+}
+
 pub(crate) struct Lowerer<'a> {
     pub diagnostics: &'a mut Diagnostics,
 }
@@ -73,18 +84,23 @@ impl<'a> Lowerer<'a> {
                     .map(|m| m.to_string())
                     .unwrap_or_default();
                 let names = imp.names.iter().map(|a| a.name.to_string()).collect();
-                out.push(Stmt::new(StmtKind::ImportFrom { module, names }, span));
+                let aliases = imp
+                    .names
+                    .iter()
+                    .map(|a| (a.name.to_string(), a.asname.as_ref().map(|n| n.to_string())))
+                    .collect();
+                out.push(Stmt::new(
+                    StmtKind::ImportFrom {
+                        module,
+                        names,
+                        aliases,
+                    },
+                    span,
+                ));
             }
 
             ruff::Stmt::ClassDef(c) => {
-                let bases = c
-                    .bases()
-                    .iter()
-                    .filter_map(|b| match b {
-                        ruff::Expr::Name(n) => Some(n.id.to_string()),
-                        _ => None,
-                    })
-                    .collect();
+                let bases = c.bases().iter().filter_map(extract_base_name).collect();
 
                 let body = self.lower_suite(&c.body);
                 out.push(Stmt::new(

@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use qsys_ir::*;
 use qsys_model::{ControlDef, ControlKind, ControlMember};
 
@@ -40,6 +42,138 @@ impl<'a> LuaEmitter<'a> {
 
     pub fn emit_statements(&mut self, stmts: &[IRStmt]) {
         for stmt in stmts {
+            if let IRStmt::FunctionDef(f) = stmt {
+                self.ctx.functions.insert(f.id, f.name.clone());
+            }
+        }
+        for stmt in stmts {
+            self.emit_stmt(stmt);
+        }
+    }
+
+    /// Emits a block of top-level or module-level statements with declaration hoisting:
+    /// 1. Bundled module definitions (`IRStmt::ModuleDef`) and imports (`IRStmt::ImportBinding`)
+    /// 2. Pure constant assignments (`CONST = 42`)
+    /// 3. Forward `local` declarations for mutually-referenced functions/variables
+    /// 4. Custom class definitions (`IRStmt::ClassDef`), topologically sorted by base class
+    /// 5. Function definitions (`IRStmt::FunctionDef`)
+    /// 6. Remaining executable statements in source order
+    pub fn emit_hoisted_statements(&mut self, stmts: &[IRStmt]) {
+        for stmt in stmts {
+            if let IRStmt::FunctionDef(f) = stmt {
+                self.ctx.functions.insert(f.id, f.name.clone());
+            }
+        }
+
+        // 1. Emit bundled modules and import bindings first
+        for stmt in stmts {
+            if matches!(
+                stmt,
+                IRStmt::ModuleDef { .. } | IRStmt::ImportBinding { .. }
+            ) {
+                self.emit_stmt(stmt);
+            }
+        }
+
+        // 2. Emit pure constant assignments (`CONST = 42`) before classes and functions
+        let mut emitted_const_indices = HashSet::new();
+        for (idx, stmt) in stmts.iter().enumerate() {
+            if let IRStmt::Assign {
+                target: IRExpr::Local(_),
+                value,
+                ..
+            } = stmt
+                && is_pure_const_expr(value)
+            {
+                self.emit_stmt(stmt);
+                emitted_const_indices.insert(idx);
+            }
+        }
+
+        let classes: Vec<&IRClass> = stmts
+            .iter()
+            .filter_map(|s| match s {
+                IRStmt::ClassDef(c) => Some(c),
+                _ => None,
+            })
+            .collect();
+        let sorted_classes = sort_classes_topologically(&classes);
+
+        let functions: Vec<&IRFunction> = stmts
+            .iter()
+            .filter_map(|s| match s {
+                IRStmt::FunctionDef(f) => Some(f),
+                _ => None,
+            })
+            .collect();
+
+        // 3. Determine which functions or non-constant locals need a forward `local` declaration
+        //    (e.g. a function called from inside a class method or from an earlier function).
+        let mut forward_declared_fns = HashSet::new();
+        for (fn_idx, f) in functions.iter().enumerate() {
+            let referenced_in_class = sorted_classes
+                .iter()
+                .any(|c| class_references_function(c, f.id, &f.name));
+            let referenced_in_earlier_fn = functions[..fn_idx]
+                .iter()
+                .any(|earlier| stmts_reference_function(&earlier.body, f.id, &f.name));
+            if referenced_in_class || referenced_in_earlier_fn {
+                self.write_line(&format!("local {}", f.name));
+                forward_declared_fns.insert(f.id);
+            }
+        }
+
+        // Also forward-declare any non-constant local variable assigned later in `stmts`
+        // if it is referenced inside a class or function body.
+        for (idx, stmt) in stmts.iter().enumerate() {
+            if emitted_const_indices.contains(&idx) {
+                continue;
+            }
+            if let IRStmt::Assign {
+                target: IRExpr::Local(sym_id),
+                ..
+            } = stmt
+                && !self.ctx.declared_locals.contains(sym_id)
+            {
+                let referenced_in_decl = sorted_classes
+                    .iter()
+                    .any(|c| class_references_local(c, *sym_id))
+                    || functions
+                        .iter()
+                        .any(|f| stmts_reference_local(&f.body, *sym_id));
+                if referenced_in_decl {
+                    let var_name = self.ctx.get_symbol_name(*sym_id);
+                    self.write_line(&format!("local {var_name}"));
+                    self.ctx.declared_locals.insert(*sym_id);
+                }
+            }
+        }
+
+        // 4. Emit all classes (base classes before subclasses)
+        for cls in &sorted_classes {
+            self.emit_custom_class(cls);
+        }
+
+        // 5. Emit all functions
+        for f in &functions {
+            let is_forward = forward_declared_fns.contains(&f.id);
+            self.emit_function_def(f, is_forward);
+        }
+
+        // 6. Emit remaining executable statements in source order
+        for (idx, stmt) in stmts.iter().enumerate() {
+            if emitted_const_indices.contains(&idx) {
+                continue;
+            }
+            if matches!(
+                stmt,
+                IRStmt::ModuleDef { .. }
+                    | IRStmt::ImportBinding { .. }
+                    | IRStmt::ClassDef(_)
+                    | IRStmt::FunctionDef(_)
+            ) {
+                continue;
+            }
             self.emit_stmt(stmt);
         }
     }
@@ -267,28 +401,67 @@ impl<'a> LuaEmitter<'a> {
             }
 
             IRStmt::FunctionDef(f) => {
-                self.ctx.functions.insert(f.id, f.name.clone());
-                for param in &f.params {
-                    self.ctx.symbol_names.insert(param.id, param.name.clone());
-                    self.ctx.declared_locals.insert(param.id);
-                }
-
-                let params: Vec<_> = f.params.iter().map(|p| p.name.as_str()).collect();
-                let param_str = params.join(", ");
-
-                self.write_line(&format!("local function {}({})", f.name, param_str));
-                self.indent();
-                for s in &f.body {
-                    self.emit_stmt(s);
-                }
-                self.dedent();
-                self.write_line("end\n");
+                self.emit_function_def(f, false);
             }
 
             IRStmt::ClassDef(cls) => {
                 self.emit_custom_class(cls);
             }
+
+            IRStmt::ModuleDef {
+                name,
+                body,
+                exports,
+                ..
+            } => {
+                self.write_line(&format!("local {name}"));
+                self.write_line("do");
+                self.indent();
+
+                let saved_locals = self.ctx.declared_locals.clone();
+                self.emit_hoisted_statements(body);
+                self.ctx.declared_locals = saved_locals;
+
+                self.write_line(&format!("{name} = {{"));
+                self.indent();
+                for exp in exports {
+                    self.write_line(&format!("{exp} = {exp},"));
+                }
+                self.dedent();
+                self.write_line("}");
+
+                self.dedent();
+                self.write_line("end\n");
+            }
+
+            IRStmt::ImportBinding {
+                local_name, target, ..
+            } => {
+                let target_str = self.emit_expr(target);
+                self.write_line(&format!("local {local_name} = {target_str}"));
+            }
         }
+    }
+
+    pub fn emit_function_def(&mut self, f: &IRFunction, already_declared: bool) {
+        self.ctx.functions.insert(f.id, f.name.clone());
+        for param in &f.params {
+            self.ctx.symbol_names.insert(param.id, param.name.clone());
+            self.ctx.declared_locals.insert(param.id);
+        }
+
+        let params: Vec<_> = f.params.iter().map(|p| p.name.as_str()).collect();
+        let param_str = params.join(", ");
+
+        if already_declared {
+            self.write_line(&format!("function {}({})", f.name, param_str));
+        } else {
+            self.write_line(&format!("local function {}({})", f.name, param_str));
+        }
+        self.indent();
+        self.emit_statements(&f.body);
+        self.dedent();
+        self.write_line("end\n");
     }
 
     fn emit_else_branch(&mut self, else_branch: &[IRStmt]) {
@@ -602,6 +775,10 @@ impl<'a> LuaEmitter<'a> {
         if let Some(ref base) = cls.base {
             self.write_line(&format!("setmetatable({name}, {{ __index = {base} }})"));
         }
+        for (attr_name, val_expr) in &cls.class_vars {
+            let val_str = self.emit_expr(val_expr);
+            self.write_line(&format!("{name}.{attr_name} = {val_str}"));
+        }
         self.write_line("");
 
         // Emit constructor: `function ClassName.new(...)`
@@ -812,5 +989,252 @@ pub fn format_lua_float(f: f64) -> String {
         format!("{f:.1}")
     } else {
         format!("{f}")
+    }
+}
+
+fn is_pure_const_expr(expr: &IRExpr) -> bool {
+    match expr {
+        IRExpr::Int(_) | IRExpr::Float(_) | IRExpr::String(_) | IRExpr::Bool(_) | IRExpr::Nil => {
+            true
+        }
+        IRExpr::Tuple(items) | IRExpr::List(items) => items.iter().all(is_pure_const_expr),
+        IRExpr::Dict(pairs) => pairs
+            .iter()
+            .all(|(k, v)| is_pure_const_expr(k) && is_pure_const_expr(v)),
+        IRExpr::Binary { left, right, .. }
+        | IRExpr::LogicalAnd { left, right, .. }
+        | IRExpr::LogicalOr { left, right, .. } => {
+            is_pure_const_expr(left) && is_pure_const_expr(right)
+        }
+        IRExpr::Unary { operand, .. } => is_pure_const_expr(operand),
+        _ => false,
+    }
+}
+
+fn sort_classes_topologically<'a>(classes: &[&'a IRClass]) -> Vec<&'a IRClass> {
+    let mut visited = HashSet::new();
+    let mut ordered = Vec::with_capacity(classes.len());
+
+    fn visit<'a>(
+        cls: &'a IRClass,
+        all: &[&'a IRClass],
+        visited: &mut HashSet<String>,
+        ordered: &mut Vec<&'a IRClass>,
+    ) {
+        if !visited.insert(cls.name.clone()) {
+            return;
+        }
+        if let Some(ref base_name) = cls.base
+            && let Some(&base_cls) = all.iter().find(|c| &c.name == base_name)
+        {
+            visit(base_cls, all, visited, ordered);
+        }
+        ordered.push(cls);
+    }
+
+    for &cls in classes {
+        visit(cls, classes, &mut visited, &mut ordered);
+    }
+    ordered
+}
+
+fn class_references_function(cls: &IRClass, fn_id: FunctionId, fn_name: &str) -> bool {
+    cls.class_vars
+        .iter()
+        .any(|(_, e)| expr_references_function(e, fn_id, fn_name))
+        || cls
+            .constructor
+            .as_ref()
+            .is_some_and(|c| stmts_reference_function(&c.body, fn_id, fn_name))
+        || cls
+            .methods
+            .iter()
+            .any(|m| stmts_reference_function(&m.body, fn_id, fn_name))
+}
+
+fn stmts_reference_function(stmts: &[IRStmt], fn_id: FunctionId, fn_name: &str) -> bool {
+    stmts
+        .iter()
+        .any(|s| stmt_references_function(s, fn_id, fn_name))
+}
+
+fn stmt_references_function(stmt: &IRStmt, fn_id: FunctionId, fn_name: &str) -> bool {
+    match stmt {
+        IRStmt::Assign { target, value, .. } => {
+            expr_references_function(target, fn_id, fn_name)
+                || expr_references_function(value, fn_id, fn_name)
+        }
+        IRStmt::If {
+            condition,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            expr_references_function(condition, fn_id, fn_name)
+                || stmts_reference_function(then_branch, fn_id, fn_name)
+                || stmts_reference_function(else_branch, fn_id, fn_name)
+        }
+        IRStmt::While {
+            condition, body, ..
+        } => {
+            expr_references_function(condition, fn_id, fn_name)
+                || stmts_reference_function(body, fn_id, fn_name)
+        }
+        IRStmt::For { iterable, body, .. } => {
+            expr_references_function(iterable, fn_id, fn_name)
+                || stmts_reference_function(body, fn_id, fn_name)
+        }
+        IRStmt::Return {
+            value: Some(val), ..
+        }
+        | IRStmt::Expr { expr: val, .. } => expr_references_function(val, fn_id, fn_name),
+        IRStmt::FunctionDef(f) => stmts_reference_function(&f.body, fn_id, fn_name),
+        IRStmt::ClassDef(c) => class_references_function(c, fn_id, fn_name),
+        _ => false,
+    }
+}
+
+fn expr_references_function(expr: &IRExpr, fn_id: FunctionId, fn_name: &str) -> bool {
+    match expr {
+        IRExpr::Function(id) => *id == fn_id,
+        IRExpr::Global(name) => name == fn_name,
+        IRExpr::Tuple(items) | IRExpr::List(items) => items
+            .iter()
+            .any(|e| expr_references_function(e, fn_id, fn_name)),
+        IRExpr::Dict(pairs) => pairs.iter().any(|(k, v)| {
+            expr_references_function(k, fn_id, fn_name)
+                || expr_references_function(v, fn_id, fn_name)
+        }),
+        IRExpr::Binary { left, right, .. }
+        | IRExpr::LogicalAnd { left, right, .. }
+        | IRExpr::LogicalOr { left, right, .. } => {
+            expr_references_function(left, fn_id, fn_name)
+                || expr_references_function(right, fn_id, fn_name)
+        }
+        IRExpr::Unary { operand, .. } => expr_references_function(operand, fn_id, fn_name),
+        IRExpr::Call {
+            callee,
+            args,
+            kwargs,
+        } => {
+            expr_references_function(callee, fn_id, fn_name)
+                || args
+                    .iter()
+                    .any(|a| expr_references_function(a, fn_id, fn_name))
+                || kwargs
+                    .iter()
+                    .any(|(_, v)| expr_references_function(v, fn_id, fn_name))
+        }
+        IRExpr::MethodCall {
+            object,
+            args,
+            kwargs,
+            ..
+        } => {
+            expr_references_function(object, fn_id, fn_name)
+                || args
+                    .iter()
+                    .any(|a| expr_references_function(a, fn_id, fn_name))
+                || kwargs
+                    .iter()
+                    .any(|(_, v)| expr_references_function(v, fn_id, fn_name))
+        }
+        IRExpr::Attribute { object, .. } => expr_references_function(object, fn_id, fn_name),
+        IRExpr::Index { base, index, .. } => {
+            expr_references_function(base, fn_id, fn_name)
+                || expr_references_function(index, fn_id, fn_name)
+        }
+        _ => false,
+    }
+}
+
+fn class_references_local(cls: &IRClass, sym_id: SymbolId) -> bool {
+    cls.class_vars
+        .iter()
+        .any(|(_, e)| expr_references_local(e, sym_id))
+        || cls
+            .constructor
+            .as_ref()
+            .is_some_and(|c| stmts_reference_local(&c.body, sym_id))
+        || cls
+            .methods
+            .iter()
+            .any(|m| stmts_reference_local(&m.body, sym_id))
+}
+
+fn stmts_reference_local(stmts: &[IRStmt], sym_id: SymbolId) -> bool {
+    stmts.iter().any(|s| stmt_references_local(s, sym_id))
+}
+
+fn stmt_references_local(stmt: &IRStmt, sym_id: SymbolId) -> bool {
+    match stmt {
+        IRStmt::Assign { target, value, .. } => {
+            expr_references_local(target, sym_id) || expr_references_local(value, sym_id)
+        }
+        IRStmt::If {
+            condition,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            expr_references_local(condition, sym_id)
+                || stmts_reference_local(then_branch, sym_id)
+                || stmts_reference_local(else_branch, sym_id)
+        }
+        IRStmt::While {
+            condition, body, ..
+        } => expr_references_local(condition, sym_id) || stmts_reference_local(body, sym_id),
+        IRStmt::For { iterable, body, .. } => {
+            expr_references_local(iterable, sym_id) || stmts_reference_local(body, sym_id)
+        }
+        IRStmt::Return {
+            value: Some(val), ..
+        }
+        | IRStmt::Expr { expr: val, .. } => expr_references_local(val, sym_id),
+        IRStmt::FunctionDef(f) => stmts_reference_local(&f.body, sym_id),
+        IRStmt::ClassDef(c) => class_references_local(c, sym_id),
+        _ => false,
+    }
+}
+
+fn expr_references_local(expr: &IRExpr, sym_id: SymbolId) -> bool {
+    match expr {
+        IRExpr::Local(id) => *id == sym_id,
+        IRExpr::Tuple(items) | IRExpr::List(items) => {
+            items.iter().any(|e| expr_references_local(e, sym_id))
+        }
+        IRExpr::Dict(pairs) => pairs
+            .iter()
+            .any(|(k, v)| expr_references_local(k, sym_id) || expr_references_local(v, sym_id)),
+        IRExpr::Binary { left, right, .. }
+        | IRExpr::LogicalAnd { left, right, .. }
+        | IRExpr::LogicalOr { left, right, .. } => {
+            expr_references_local(left, sym_id) || expr_references_local(right, sym_id)
+        }
+        IRExpr::Unary { operand, .. } => expr_references_local(operand, sym_id),
+        IRExpr::Call {
+            callee,
+            args,
+            kwargs,
+        } => {
+            expr_references_local(callee, sym_id)
+                || args.iter().any(|a| expr_references_local(a, sym_id))
+                || kwargs.iter().any(|(_, v)| expr_references_local(v, sym_id))
+        }
+        IRExpr::MethodCall {
+            object,
+            args,
+            kwargs,
+            ..
+        } => {
+            expr_references_local(object, sym_id)
+                || args.iter().any(|a| expr_references_local(a, sym_id))
+                || kwargs.iter().any(|(_, v)| expr_references_local(v, sym_id))
+        }
+        IRExpr::Attribute { object, .. } => expr_references_local(object, sym_id),
+        IRExpr::Index { base, index, .. } => {
+            expr_references_local(base, sym_id) || expr_references_local(index, sym_id)
+        }
+        _ => false,
     }
 }

@@ -21,6 +21,19 @@ pub fn emit_script(script: &IRScript, ctx: &mut CodegenContext) -> String {
         emitter.write_line("-- Target: Q-SYS Procedural Script\n");
     }
 
+    if !script.is_controller {
+        let mut combined = Vec::with_capacity(script.body.len() + script.methods.len());
+        combined.extend(script.body.iter().cloned());
+        combined.extend(script.methods.iter().cloned().map(IRStmt::FunctionDef));
+        emitter.emit_hoisted_statements(&combined);
+        return emitter.buffer;
+    }
+
+    // Emit module-level statements (imports, helper classes, helper functions) before controller methods
+    if !script.top_level_stmts.is_empty() {
+        emitter.emit_hoisted_statements(&script.top_level_stmts);
+    }
+
     // Emit functions
     for func in &script.methods {
         let mut param_names = Vec::new();
@@ -82,8 +95,8 @@ pub fn emit_script(script: &IRScript, ctx: &mut CodegenContext) -> String {
         }
     }
 
-    // Emit top-level body statements (including custom classes in declaration order)
-    emitter.emit_statements(&script.body);
+    // Emit top-level body statements with declaration hoisting (classes before functions before executable statements)
+    emitter.emit_hoisted_statements(&script.body);
 
     emitter.buffer
 }

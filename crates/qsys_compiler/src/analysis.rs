@@ -547,19 +547,111 @@ impl Analyzer {
                     }
                     return items;
                 }
+                Some(Type::UserModule { ref name }) => {
+                    for member_name in model.type_map.module_member_names(name) {
+                        if !matches_prefix(&member_name, partial) {
+                            continue;
+                        }
+                        let member_ty = model.type_map.get_module_member_type(name, &member_name);
+                        if let Some(Type::UserClass { name: cls_name }) = member_ty {
+                            items.push(LspCompletion {
+                                label: member_name.clone(),
+                                kind: "Class".to_string(),
+                                detail: format!(
+                                    "class {name}.{cls_name} -> {name}.{cls_name}.new()"
+                                ),
+                                documentation: format!(
+                                    "Instantiates class `{cls_name}` from module `{name}`."
+                                ),
+                                insert_text: format!("{member_name}()"),
+                                is_snippet: false,
+                            });
+                            continue;
+                        }
+
+                        // Check if it's a function in the bundled ModuleDef
+                        let mut found_fn = None;
+                        for stmt in &parsed.module.statements {
+                            if let ast::StmtKind::ModuleDef {
+                                name: mod_name,
+                                body,
+                                ..
+                            } = &stmt.kind
+                                && mod_name == name
+                            {
+                                for m_stmt in body {
+                                    if let ast::StmtKind::FunctionDef(f) = &m_stmt.kind
+                                        && f.name == member_name
+                                    {
+                                        found_fn = Some(f);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+
+                        if let Some(f) = found_fn {
+                            let params_str: Vec<_> =
+                                f.params.iter().map(|p| p.name.as_str()).collect();
+                            let insert_text = if params_str.is_empty() {
+                                format!("{}()", f.name)
+                            } else {
+                                format!("{}(${{0}})", f.name)
+                            };
+                            items.push(LspCompletion {
+                                label: member_name.clone(),
+                                kind: "Function".to_string(),
+                                detail: format!("def {name}.{}({})", f.name, params_str.join(", ")),
+                                documentation: format!(
+                                    "Calls function `{}` in module `{name}`.",
+                                    f.name
+                                ),
+                                insert_text,
+                                is_snippet: !params_str.is_empty(),
+                            });
+                        } else {
+                            let ty_str = member_ty
+                                .and_then(format_type_display)
+                                .unwrap_or_else(|| "Any".to_string());
+                            items.push(LspCompletion {
+                                label: member_name.clone(),
+                                kind: "Variable".to_string(),
+                                detail: format!("{name}.{member_name}: {ty_str}"),
+                                documentation: format!(
+                                    "Exported member `{member_name}` from module `{name}`."
+                                ),
+                                insert_text: member_name,
+                                is_snippet: false,
+                            });
+                        }
+                    }
+                    return items;
+                }
                 Some(Type::UserInstance { ref name }) => {
                     let mut seen = Vec::new();
                     let mut current_cls = Some(name.as_str());
                     let mut depth = 0;
+                    let mut all_class_defs: Vec<&ast::ClassDef> = Vec::new();
+                    for stmt in &parsed.module.statements {
+                        match &stmt.kind {
+                            ast::StmtKind::ClassDef(cls) => all_class_defs.push(cls),
+                            ast::StmtKind::ModuleDef { body, .. } => {
+                                for m_stmt in body {
+                                    if let ast::StmtKind::ClassDef(cls) = &m_stmt.kind {
+                                        all_class_defs.push(cls);
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
                     while let Some(target_cls_name) = current_cls {
                         if depth > 16 {
                             break;
                         }
                         depth += 1;
-                        for stmt in &parsed.module.statements {
-                            if let ast::StmtKind::ClassDef(cls) = &stmt.kind
-                                && cls.name == target_cls_name
-                            {
+                        for cls in &all_class_defs {
+                            if cls.name == target_cls_name {
                                 for body_stmt in &cls.body {
                                     if let ast::StmtKind::FunctionDef(f) = &body_stmt.kind {
                                         if matches!(
@@ -932,6 +1024,29 @@ fn infer_receiver_type(
         }
     }
 
+    if model.type_map.is_known_module(receiver) {
+        return Some(Type::UserModule {
+            name: receiver.to_string(),
+        });
+    }
+
+    for stmt in &parsed.module.statements {
+        if let ast::StmtKind::Import {
+            module,
+            alias: Some(alias_name),
+        } = &stmt.kind
+            && alias_name == receiver
+        {
+            let mod_stem = module
+                .trim_start_matches('.')
+                .rsplit('.')
+                .next()
+                .unwrap_or(module.as_str())
+                .to_string();
+            return Some(Type::UserModule { name: mod_stem });
+        }
+    }
+
     // Fallback: inspect AST assignments `receiver = UdpSocket.New()` or `receiver = Foo()`
     find_assigned_type_in_module(&parsed.module.statements, receiver, &model.env)
 }
@@ -1002,6 +1117,8 @@ fn format_type_display(ty: &Type) -> Option<String> {
         Type::ControlHandle => Some("ControlHandle".to_string()),
         Type::PropertyHandle => Some("PropertyHandle".to_string()),
         Type::Native { name } | Type::UserInstance { name } => Some(name.clone()),
+        Type::UserClass { name } => Some(format!("type[{name}]")),
+        Type::UserModule { name } => Some(format!("module {name}")),
         Type::Float => Some("float".to_string()),
         Type::Int => Some("int".to_string()),
         Type::String => Some("str".to_string()),

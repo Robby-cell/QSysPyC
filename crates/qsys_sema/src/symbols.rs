@@ -37,6 +37,9 @@ pub enum SymbolKind {
     UserClass {
         name: String,
     },
+    Module {
+        name: String,
+    },
 }
 
 #[derive(Debug, Clone)]

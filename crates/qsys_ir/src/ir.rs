@@ -30,6 +30,7 @@ pub struct IRPropertyBinding {
 pub struct IRClass {
     pub name: String,
     pub base: Option<String>,
+    pub class_vars: Vec<(String, IRExpr)>,
     pub emit_init_method: bool,
     pub constructor: Option<IRFunction>,
     pub methods: Vec<IRFunction>,
@@ -62,6 +63,7 @@ pub struct IRScript {
     pub methods: Vec<IRFunction>,
     pub event_bindings: Vec<IREventBinding>,
     pub symbol_names: FxHashMap<SymbolId, String>,
+    pub top_level_stmts: Vec<IRStmt>,
     pub body: Vec<IRStmt>,
     pub span: Span,
 }
@@ -143,6 +145,17 @@ pub enum IRStmt {
     // [`IRFunction`] and [`IRClass`] already have a `span` field.
     FunctionDef(IRFunction),
     ClassDef(IRClass),
+    ModuleDef {
+        name: String,
+        body: Vec<IRStmt>,
+        exports: Vec<String>,
+        span: Span,
+    },
+    ImportBinding {
+        local_name: String,
+        target: IRExpr,
+        span: Span,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

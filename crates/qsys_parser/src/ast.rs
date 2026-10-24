@@ -27,6 +27,12 @@ pub enum StmtKind {
     ImportFrom {
         module: String,
         names: Vec<String>,
+        aliases: Vec<(String, Option<String>)>,
+    },
+    ModuleDef {
+        name: String,
+        path: String,
+        body: Vec<Stmt>,
     },
     ClassDef(ClassDef),
     FunctionDef(FunctionDef),

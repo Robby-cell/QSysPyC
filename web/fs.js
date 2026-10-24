@@ -810,6 +810,7 @@ export class WorkspaceManager {
         preambleLines.push(line);
       }
     }
+    preambleLines.push("# --- End bundled modules ---");
 
     const lineOffset = preambleLines.length;
     const bundledSource = `${preambleLines.join("\n")}\n${entrySource}`;

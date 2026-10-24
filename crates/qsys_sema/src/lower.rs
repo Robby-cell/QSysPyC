@@ -101,8 +101,8 @@ pub fn lower_to_ir(model: &SemanticModel) -> IRProgram {
                 .map(|m| lowerer.lower_function(m.id, &m.name, &m.params, &m.body, m.span))
                 .collect();
 
-            let mut body = lowerer.lower_statements(&c.module_statements);
-            body.extend(lowerer.lower_statements(&c.init_statements));
+            let top_level_stmts = lowerer.lower_statements(&c.module_statements);
+            let body = lowerer.lower_statements(&c.init_statements);
 
             let event_bindings = c
                 .event_bindings
@@ -138,6 +138,7 @@ pub fn lower_to_ir(model: &SemanticModel) -> IRProgram {
                 methods,
                 event_bindings,
                 symbol_names: model.type_map.symbol_names().clone(),
+                top_level_stmts,
                 body,
                 span: c.span,
             }))
@@ -168,6 +169,7 @@ pub fn lower_to_ir(model: &SemanticModel) -> IRProgram {
                 methods,
                 event_bindings: Vec::new(),
                 symbol_names: model.type_map.symbol_names().clone(),
+                top_level_stmts: Vec::new(),
                 body,
                 span: qsys_diagnostics::Span::new(0, 0),
             }))
@@ -251,6 +253,47 @@ impl<'a> StmtLowerer<'a> {
     fn lower_statements(&mut self, stmts: &[ast::Stmt]) -> Vec<IRStmt> {
         let mut ir_stmts = Vec::new();
         for stmt in stmts {
+            if let ast::StmtKind::ImportFrom {
+                module, aliases, ..
+            } = &stmt.kind
+            {
+                if module != "qsys" && !module.starts_with("qsys.") {
+                    let mod_stem = module
+                        .trim_start_matches('.')
+                        .rsplit('.')
+                        .next()
+                        .unwrap_or(module.as_str())
+                        .to_string();
+                    if self.type_map.is_known_module(&mod_stem) {
+                        for (orig_name, alias_opt) in aliases {
+                            if orig_name == "*" {
+                                for member_name in self.type_map.module_member_names(&mod_stem) {
+                                    ir_stmts.push(IRStmt::ImportBinding {
+                                        local_name: member_name.clone(),
+                                        target: IRExpr::Attribute {
+                                            object: Box::new(IRExpr::Global(mod_stem.clone())),
+                                            attr: member_name,
+                                        },
+                                        span: stmt.span,
+                                    });
+                                }
+                            } else {
+                                let local_name =
+                                    alias_opt.clone().unwrap_or_else(|| orig_name.clone());
+                                ir_stmts.push(IRStmt::ImportBinding {
+                                    local_name,
+                                    target: IRExpr::Attribute {
+                                        object: Box::new(IRExpr::Global(mod_stem.clone())),
+                                        attr: orig_name.clone(),
+                                    },
+                                    span: stmt.span,
+                                });
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
             if let Some(lowered) = self.lower_stmt(stmt) {
                 ir_stmts.push(lowered);
             }
@@ -421,9 +464,63 @@ impl<'a> StmtLowerer<'a> {
                 }
             }
 
-            ast::StmtKind::Pass
-            | ast::StmtKind::Import { .. }
-            | ast::StmtKind::ImportFrom { .. } => None,
+            ast::StmtKind::Pass | ast::StmtKind::ImportFrom { .. } => None,
+
+            ast::StmtKind::Import { module, alias } => {
+                if module == "qsys" || module.starts_with("qsys.") {
+                    return None;
+                }
+                let mod_stem = module
+                    .trim_start_matches('.')
+                    .rsplit('.')
+                    .next()
+                    .unwrap_or(module.as_str())
+                    .to_string();
+                if let Some(alias_name) = alias
+                    && alias_name != &mod_stem
+                    && self.type_map.is_known_module(&mod_stem)
+                {
+                    return Some(IRStmt::ImportBinding {
+                        local_name: alias_name.clone(),
+                        target: IRExpr::Global(mod_stem),
+                        span,
+                    });
+                }
+                None
+            }
+
+            ast::StmtKind::ModuleDef { name, body, .. } => {
+                let lowered_body = self.lower_statements(body);
+                let mut exports = Vec::new();
+                for s in body {
+                    match &s.kind {
+                        ast::StmtKind::ClassDef(cls) => {
+                            if !exports.contains(&cls.name) {
+                                exports.push(cls.name.clone());
+                            }
+                        }
+                        ast::StmtKind::FunctionDef(f) => {
+                            if !exports.contains(&f.name) {
+                                exports.push(f.name.clone());
+                            }
+                        }
+                        ast::StmtKind::Assign { target, .. } => {
+                            if let ast::ExprKind::Ident(var_name) = &target.kind
+                                && !exports.contains(var_name)
+                            {
+                                exports.push(var_name.clone());
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                Some(IRStmt::ModuleDef {
+                    name: name.clone(),
+                    body: lowered_body,
+                    exports,
+                    span,
+                })
+            }
 
             ast::StmtKind::FunctionDef(f) => {
                 let func_id = self
@@ -608,11 +705,12 @@ impl<'a> StmtLowerer<'a> {
 
                     let callee_ty = self.type_map.get_type(callee.span);
 
-                    // Calling a custom class: `Device(...)` -> lowers to `Device.new(...)`
-                    if let Some(Type::UserClass { name }) = callee_ty {
+                    // Calling a custom class: `Device(...)` or `helpers.Device(...)` -> lowers to `<class>.new(...)`
+                    if let Some(Type::UserClass { .. }) = callee_ty {
+                        let class_obj = self.lower_expr(callee);
                         return IRExpr::Call {
                             callee: Box::new(IRExpr::Attribute {
-                                object: Box::new(IRExpr::Global(name.clone())),
+                                object: Box::new(class_obj),
                                 attr: "new".to_string(),
                             }),
                             args: args_ir,
@@ -837,18 +935,27 @@ impl<'a> StmtLowerer<'a> {
             .cloned();
 
         let prev_base = std::mem::replace(&mut self.current_class_base, base.clone());
+        let mut class_vars = Vec::new();
         let mut constructor = None;
         let mut methods = Vec::new();
 
         for stmt in &cls.body {
-            if let ast::StmtKind::FunctionDef(f) = &stmt.kind {
-                let lowered_fn = self.lower_class_method(f);
+            match &stmt.kind {
+                ast::StmtKind::FunctionDef(f) => {
+                    let lowered_fn = self.lower_class_method(f);
 
-                if f.name == "__init__" {
-                    constructor = Some(lowered_fn);
-                } else {
-                    methods.push(lowered_fn);
+                    if f.name == "__init__" {
+                        constructor = Some(lowered_fn);
+                    } else {
+                        methods.push(lowered_fn);
+                    }
                 }
+                ast::StmtKind::Assign { target, value } => {
+                    if let ast::ExprKind::Ident(attr_name) = &target.kind {
+                        class_vars.push((attr_name.clone(), self.lower_expr(value)));
+                    }
+                }
+                _ => {}
             }
         }
 
@@ -875,6 +982,7 @@ impl<'a> StmtLowerer<'a> {
         IRClass {
             name: cls.name.clone(),
             base,
+            class_vars,
             constructor,
             emit_init_method,
             methods,
@@ -926,7 +1034,8 @@ fn find_inherited_init<'a>(
             break;
         }
         depth += 1;
-        let cls = classes.iter().find(|c| c.name == target_name)?;
+        let short_target = target_name.rsplit('.').next().unwrap_or(target_name);
+        let cls = classes.iter().find(|c| c.name == short_target)?;
         for stmt in &cls.body {
             if let ast::StmtKind::FunctionDef(f) = &stmt.kind
                 && f.name == "__init__"
@@ -945,14 +1054,16 @@ fn find_inherited_init<'a>(
 
 fn class_needs_init_method(class_name: &str, classes: &[ast::ClassDef]) -> bool {
     classes.iter().any(|c| {
-        c.bases.first().is_some_and(|b| b == class_name)
-            && c.body.iter().any(|stmt| {
-                if let ast::StmtKind::FunctionDef(f) = &stmt.kind {
-                    f.body.iter().any(stmt_calls_super_init)
-                } else {
-                    false
-                }
-            })
+        c.bases.first().is_some_and(|b| {
+            let short_b = b.rsplit('.').next().unwrap_or(b.as_str());
+            short_b == class_name
+        }) && c.body.iter().any(|stmt| {
+            if let ast::StmtKind::FunctionDef(f) = &stmt.kind {
+                f.body.iter().any(stmt_calls_super_init)
+            } else {
+                false
+            }
+        })
     })
 }
 

@@ -37,8 +37,8 @@ pub fn emit_plugin(plugin: &IRPlugin, ctx: &mut CodegenContext) -> String {
     // Emit the truthy helper at top-level so both design-time and runtime can use it
     emit_truthy_helper(&mut emitter);
 
-    // Emit top-level statements and helper classes in declaration order
-    emitter.emit_statements(&plugin.top_level_stmts);
+    // Emit top-level statements and helper classes with declaration hoisting
+    emitter.emit_hoisted_statements(&plugin.top_level_stmts);
 
     // Emit PluginInfo
     emit_plugin_info(&mut emitter, &plugin.info);
