@@ -721,7 +721,12 @@ impl<'a> LuaEmitter<'a> {
                 args,
                 kwargs,
             } => {
-                let callee_str = self.emit_expr(callee);
+                let raw_callee = self.emit_expr(callee);
+                let callee_str = if matches!(callee.as_ref(), IRExpr::Lambda { .. }) {
+                    format!("({raw_callee})")
+                } else {
+                    raw_callee
+                };
                 let mut rendered_args: Vec<_> =
                     args.iter().map(|arg| self.emit_expr(arg)).collect();
 
@@ -818,6 +823,20 @@ impl<'a> LuaEmitter<'a> {
                     let idx_str = self.emit_expr(index);
                     format!("{base_str}[{idx_str}]")
                 }
+            }
+
+            IRExpr::Lambda { params, body } => {
+                for param in params {
+                    self.ctx.symbol_names.insert(param.id, param.name.clone());
+                    self.ctx.declared_locals.insert(param.id);
+                }
+                let param_list: Vec<_> = params.iter().map(|p| p.name.as_str()).collect();
+                let body_str = self.emit_expr(body);
+                format!(
+                    "function({}) return {} end",
+                    param_list.join(", "),
+                    body_str
+                )
             }
 
             IRExpr::RawLua(code) => code.clone(),
@@ -1108,7 +1127,7 @@ fn class_references_function(cls: &IRClass, fn_id: FunctionId, fn_name: &str) ->
             .any(|m| stmts_reference_function(&m.body, fn_id, fn_name))
 }
 
-fn stmts_reference_function(stmts: &[IRStmt], fn_id: FunctionId, fn_name: &str) -> bool {
+pub(crate) fn stmts_reference_function(stmts: &[IRStmt], fn_id: FunctionId, fn_name: &str) -> bool {
     stmts
         .iter()
         .any(|s| stmt_references_function(s, fn_id, fn_name))
@@ -1200,6 +1219,7 @@ fn expr_references_function(expr: &IRExpr, fn_id: FunctionId, fn_name: &str) -> 
             expr_references_function(base, fn_id, fn_name)
                 || expr_references_function(index, fn_id, fn_name)
         }
+        IRExpr::Lambda { body, .. } => expr_references_function(body, fn_id, fn_name),
         _ => false,
     }
 }
@@ -1291,6 +1311,7 @@ fn expr_references_local(expr: &IRExpr, sym_id: SymbolId) -> bool {
         IRExpr::Index { base, index, .. } => {
             expr_references_local(base, sym_id) || expr_references_local(index, sym_id)
         }
+        IRExpr::Lambda { body, .. } => expr_references_local(body, sym_id),
         _ => false,
     }
 }

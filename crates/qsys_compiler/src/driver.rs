@@ -267,6 +267,8 @@ fn build_ui_preview(
                 dynamic_label_template: None,
                 dynamic_pretty_template: None,
                 dynamic_legend_template: None,
+                label_lua_expr: None,
+                pretty_lua_expr: None,
                 is_dynamic_repeat_head: false,
                 skip_lua_emit: false,
             }));
@@ -293,6 +295,8 @@ fn build_ui_preview(
                     dynamic_label_template: None,
                     dynamic_pretty_template: None,
                     dynamic_legend_template: None,
+                    label_lua_expr: None,
+                    pretty_lua_expr: None,
                     is_dynamic_repeat_head: false,
                     skip_lua_emit: false,
                 }));

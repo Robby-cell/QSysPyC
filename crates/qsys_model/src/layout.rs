@@ -450,6 +450,10 @@ pub struct DynamicRepeatSpec {
     pub label_template: Option<String>,
     pub pretty_name_template: String,
     pub legend_template: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label_lua_expr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pretty_name_lua_expr: Option<String>,
     pub step_x: f64,
     pub step_y: f64,
     pub label_offset_x: f64,
@@ -464,6 +468,8 @@ pub struct DynamicRepeatSpec {
 pub struct ControlLayoutDef {
     pub name: String,
     pub pretty_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pretty_name_lua_expr: Option<String>,
     pub style: Option<ControlStyle>,
     pub position: Position,
     pub size: Size,
@@ -495,6 +501,7 @@ impl ControlLayoutDef {
         Self {
             name: name.into(),
             pretty_name: None,
+            pretty_name_lua_expr: None,
             style: None,
             position,
             size,
@@ -540,6 +547,8 @@ pub struct GraphicItem {
     pub position: Position,
     pub size: Size,
     pub color: Option<Color>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_lua_expr: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dyn_x: Option<DynAxisExpr>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -604,6 +613,10 @@ pub struct UiControlSpec {
     pub dynamic_pretty_template: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dynamic_legend_template: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label_lua_expr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pretty_lua_expr: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub is_dynamic_repeat_head: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -1021,6 +1034,7 @@ fn arrange_node(
                 },
                 position: Position::new(x, y),
                 size: Size::new(w, *height),
+                text_lua_expr: None,
                 dyn_x: dyn_x.clone().into_opt(),
                 dyn_y: dyn_y.clone().into_opt(),
                 dyn_width: dyn_w.clone().into_opt(),
@@ -1049,6 +1063,7 @@ fn arrange_node(
                 },
                 position: Position::new(x, y),
                 size: Size::new(w, *height),
+                text_lua_expr: None,
                 dyn_x: dyn_x.clone().into_opt(),
                 dyn_y: dyn_y.clone().into_opt(),
                 dyn_width: None,
@@ -1082,6 +1097,7 @@ fn arrange_node(
                                 },
                                 position: Position::new(x, y),
                                 size: Size::new(box_w, 18.0),
+                                text_lua_expr: spec.label_lua_expr.clone(),
                                 dyn_x: dyn_x.clone().into_opt(),
                                 dyn_y: dyn_y.clone().into_opt(),
                                 dyn_width: None,
@@ -1111,6 +1127,7 @@ fn arrange_node(
                                 },
                                 position: Position::new(x, lbl_y),
                                 size: Size::new(lbl_w, 18.0),
+                                text_lua_expr: spec.label_lua_expr.clone(),
                                 dyn_x: dyn_x.clone().into_opt(),
                                 dyn_y: dyn_y.add_const(lbl_y_off.round() as i64).into_opt(),
                                 dyn_width: None,
@@ -1165,6 +1182,8 @@ fn arrange_node(
                     label_template: spec.dynamic_label_template.clone(),
                     pretty_name_template: pretty_tmpl,
                     legend_template: spec.dynamic_legend_template.clone(),
+                    label_lua_expr: spec.label_lua_expr.clone(),
+                    pretty_name_lua_expr: spec.pretty_lua_expr.clone(),
                     step_x,
                     step_y,
                     label_offset_x: lbl_ox,
@@ -1180,6 +1199,10 @@ fn arrange_node(
             controls.push(ControlLayoutDef {
                 name: spec.control_name.clone(),
                 pretty_name: spec.pretty_name.clone().or_else(|| spec.label.clone()),
+                pretty_name_lua_expr: spec
+                    .pretty_lua_expr
+                    .clone()
+                    .or_else(|| spec.label_lua_expr.clone()),
                 style: Some(spec.style.clone()),
                 position: Position::new(ctl_x, ctl_y),
                 size: Size::new(ctl_w, ctl_h),
@@ -1331,6 +1354,7 @@ fn arrange_node(
                 },
                 position: Position::new(x, y),
                 size: Size::new(box_w, box_h),
+                text_lua_expr: None,
                 dyn_x: dyn_x.clone().into_opt(),
                 dyn_y: dyn_y.clone().into_opt(),
                 dyn_width: dyn_box_w.clone().into_opt(),

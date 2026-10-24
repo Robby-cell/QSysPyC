@@ -22,7 +22,7 @@ pub use crate::binding::{ResolvedBinding, resolve_event_decorator};
 pub use crate::classifier::{TargetClassification, classify_module};
 pub use crate::declarations::{
     ConstValue, DeclaredControl, DeclaredProperty, ExtractedDeclarations, eval_constant,
-    extract_class_declarations,
+    extract_class_declarations, extract_class_declarations_with_module,
 };
 pub use crate::lower::lower_to_ir;
 pub use crate::symbols::{ScopeKind, ScopeStack, Symbol, SymbolKind};
@@ -105,6 +105,14 @@ pub(crate) fn type_from_annotation(ann: Option<&str>, env: &RuntimeEnv) -> Type 
         Some("None") => Type::None,
         Some("ControlHandle") => Type::ControlHandle,
         Some("PropertyHandle") => Type::PropertyHandle,
+        Some(s) if s.starts_with('(') && s.ends_with(')') => {
+            let inner = &s[1..s.len() - 1];
+            let elems = inner
+                .split(',')
+                .map(|part| type_from_annotation(Some(part.trim()), env))
+                .collect();
+            Type::Tuple(elems)
+        }
         Some(name) if env.object_type(name).is_some() => Type::Native {
             name: name.to_string(),
         },
@@ -197,7 +205,12 @@ pub fn analyze_lossy_with_env(
 
     let target = match classification {
         TargetClassification::Plugin { class } => {
-            let decls = extract_class_declarations(class, &mut scope_stack, &mut diagnostics);
+            let decls = extract_class_declarations_with_module(
+                class,
+                &module_statements,
+                &mut scope_stack,
+                &mut diagnostics,
+            );
 
             for (span, ctl_id) in &decls.ui_control_resolutions {
                 type_map.insert_resolution(*span, ResolvedTarget::Control(*ctl_id));
@@ -420,7 +433,12 @@ pub fn analyze_lossy_with_env(
         }
 
         TargetClassification::TextController { class } => {
-            let decls = extract_class_declarations(class, &mut scope_stack, &mut diagnostics);
+            let decls = extract_class_declarations_with_module(
+                class,
+                &module_statements,
+                &mut scope_stack,
+                &mut diagnostics,
+            );
 
             scope_stack.push_scope(ScopeKind::Class {
                 name: class.name.clone(),

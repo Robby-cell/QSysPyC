@@ -1304,6 +1304,33 @@ impl<'a> ExprAnalyzer<'a> {
                 }
             }
 
+            ast::ExprKind::Lambda { params, body } => {
+                self.scope_stack.push_scope(ScopeKind::Function {
+                    name: "<lambda>".to_string(),
+                });
+                for (idx, param) in params.iter().enumerate() {
+                    let param_sym = self.scope_stack.alloc_symbol_id();
+                    self.type_map
+                        .insert_symbol_name(param_sym, param.name.clone());
+                    self.scope_stack.define(Symbol::new(
+                        param_sym,
+                        param.name.clone(),
+                        SymbolKind::Parameter {
+                            id: param_sym,
+                            ty: Type::Any,
+                            index: idx,
+                        },
+                        param.span,
+                    ));
+                    self.type_map
+                        .insert_resolution(param.span, ResolvedTarget::Local(param_sym));
+                    self.type_map.insert_type(param.span, Type::Any);
+                }
+                let _ = self.infer_expr(body);
+                self.scope_stack.pop_scope();
+                Type::Any
+            }
+
             ast::ExprKind::Error => Type::Any,
         };
 

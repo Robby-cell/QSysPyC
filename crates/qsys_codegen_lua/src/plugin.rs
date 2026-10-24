@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use qsys_ir::*;
 use qsys_model::{
     ControlKind, ControlLayoutDef, ControlStyle, DynAxisExpr, DynLinearSum, GraphicItem,
@@ -5,7 +7,10 @@ use qsys_model::{
 };
 
 use crate::context::CodegenContext;
-use crate::emitter::{LuaEmitter, escape_lua_string, format_count_lua_expr, format_lua_float};
+use crate::emitter::{
+    LuaEmitter, escape_lua_string, format_count_lua_expr, format_lua_float,
+    stmts_reference_function,
+};
 
 pub fn emit_plugin(plugin: &IRPlugin, ctx: &mut CodegenContext) -> String {
     // Register controls and properties
@@ -78,14 +83,29 @@ pub fn emit_plugin(plugin: &IRPlugin, ctx: &mut CodegenContext) -> String {
         emit_get_controls(&mut emitter, &plugin.controls);
     }
 
+    let hoisted_method_ids = collect_design_time_hoisted_methods(plugin);
+    if !hoisted_method_ids.is_empty() {
+        let hoisted_methods: Vec<&IRFunction> = plugin
+            .methods
+            .iter()
+            .filter(|m| hoisted_method_ids.contains(&m.id))
+            .collect();
+        emit_method_group(&mut emitter, &plugin.class_name, &hoisted_methods);
+    }
+
     if let Some(m) = plugin
         .methods
         .iter()
         .find(|m| m.name == "get_control_layout")
     {
-        emit_lifecycle_method(&mut emitter, "GetControlLayout", m);
+        emit_lifecycle_method_with_alias(
+            &mut emitter,
+            "GetControlLayout",
+            m,
+            !hoisted_method_ids.is_empty(),
+        );
     } else {
-        emit_get_control_layout(&mut emitter, &plugin.pages);
+        emit_get_control_layout(&mut emitter, &plugin.pages, !hoisted_method_ids.is_empty());
     }
 
     if let Some(m) = plugin.methods.iter().find(|m| m.name == "get_components") {
@@ -105,13 +125,13 @@ pub fn emit_plugin(plugin: &IRPlugin, ctx: &mut CodegenContext) -> String {
     emitter.indent();
     let runtime_body_offset = emitter.buffer.len();
 
-    // Emit runtime methods (excluding design-time lifecycle methods)
-    for method in &plugin.methods {
-        if is_design_time_method(&method.name) {
-            continue;
-        }
-        emit_method(&mut emitter, &plugin.class_name, method);
-    }
+    // Emit runtime methods (excluding design-time lifecycle methods and already-hoisted helpers)
+    let runtime_methods: Vec<&IRFunction> = plugin
+        .methods
+        .iter()
+        .filter(|m| !is_design_time_method(&m.name) && !hoisted_method_ids.contains(&m.id))
+        .collect();
+    emit_method_group(&mut emitter, &plugin.class_name, &runtime_methods);
 
     // Emit event bindings
     for binding in &plugin.event_bindings {
@@ -457,9 +477,16 @@ fn emit_get_pages(emitter: &mut LuaEmitter<'_>, pages: &[PageLayout]) {
     emitter.write_line("end\n");
 }
 
-fn emit_get_control_layout(emitter: &mut LuaEmitter<'_>, pages: &[PageLayout]) {
+fn emit_get_control_layout(
+    emitter: &mut LuaEmitter<'_>,
+    pages: &[PageLayout],
+    needs_props_alias: bool,
+) {
     emitter.write_line("function GetControlLayout(props)");
     emitter.indent();
+    if needs_props_alias {
+        emitter.write_line("if not Controls then Properties = props end");
+    }
     emitter.write_line("local layout = {}");
     emitter.write_line("local graphics = {}");
 
@@ -586,8 +613,12 @@ fn emit_graphic_item(emitter: &mut LuaEmitter<'_>, g: &GraphicItem) {
             font_size,
             h_align,
         } => {
+            let text_expr = g
+                .text_lua_expr
+                .clone()
+                .unwrap_or_else(|| escape_lua_string(text));
             emitter.write_line("Type = \"Label\",");
-            emitter.write_line(&format!("Text = {},", escape_lua_string(text)));
+            emitter.write_line(&format!("Text = {text_expr},"));
             emitter.write_line(&format!("Position = {{ {x}, {y} }},"));
             emitter.write_line(&format!("Size = {{ {w}, {h} }},"));
             emitter.write_line(&format!("FontSize = {font_size},"));
@@ -708,7 +739,7 @@ fn emit_control_layout_item(emitter: &mut LuaEmitter<'_>, ctl: &ControlLayoutDef
         emitter.write_line(&format!("for i = 1, {prop_expr} do"));
         emitter.indent();
 
-        if let Some(ref lbl_tmpl) = rep.label_template {
+        if rep.label_template.is_some() || rep.label_lua_expr.is_some() {
             let lbl_dyn_x = ctl
                 .dyn_x
                 .as_ref()
@@ -731,7 +762,12 @@ fn emit_control_layout_item(emitter: &mut LuaEmitter<'_>, ctl: &ControlLayoutDef
             } else {
                 format!("{ly_str} + (i - 1) * {dy}")
             };
-            let lbl_text_expr = format_dynamic_channel_lua_expr(lbl_tmpl, &prop_expr);
+            let lbl_text_expr = rep.label_lua_expr.clone().unwrap_or_else(|| {
+                format_dynamic_channel_lua_expr(
+                    rep.label_template.as_deref().unwrap_or(""),
+                    &prop_expr,
+                )
+            });
 
             emitter.write_line("table.insert(graphics, {");
             emitter.indent();
@@ -755,7 +791,9 @@ fn emit_control_layout_item(emitter: &mut LuaEmitter<'_>, ctl: &ControlLayoutDef
         } else {
             format!("{y_str} + (i - 1) * {dy}")
         };
-        let pretty_expr = format_dynamic_channel_lua_expr(&rep.pretty_name_template, &prop_expr);
+        let pretty_expr = rep.pretty_name_lua_expr.clone().unwrap_or_else(|| {
+            format_dynamic_channel_lua_expr(&rep.pretty_name_template, &prop_expr)
+        });
 
         emitter.write_line(&format!(
             "local ctl_key = ({prop_expr} == 1) and {base_str} or ({base_prefix} .. tostring(i))"
@@ -771,7 +809,10 @@ fn emit_control_layout_item(emitter: &mut LuaEmitter<'_>, ctl: &ControlLayoutDef
         return;
     }
 
-    let pretty = escape_lua_string(ctl.pretty_name.as_deref().unwrap_or(&ctl.name));
+    let pretty = ctl
+        .pretty_name_lua_expr
+        .clone()
+        .unwrap_or_else(|| escape_lua_string(ctl.pretty_name.as_deref().unwrap_or(&ctl.name)));
 
     if let (Some(prop_name), Some(base_name), Some(ch)) = (
         &ctl.count_property,
@@ -812,6 +853,15 @@ fn emit_control_layout_item(emitter: &mut LuaEmitter<'_>, ctl: &ControlLayoutDef
 }
 
 fn emit_lifecycle_method(emitter: &mut LuaEmitter<'_>, lua_fn_name: &str, method: &IRFunction) {
+    emit_lifecycle_method_with_alias(emitter, lua_fn_name, method, false);
+}
+
+fn emit_lifecycle_method_with_alias(
+    emitter: &mut LuaEmitter<'_>,
+    lua_fn_name: &str,
+    method: &IRFunction,
+    needs_props_alias: bool,
+) {
     let mut param_names = Vec::new();
     for param in &method.params {
         emitter
@@ -828,12 +878,48 @@ fn emit_lifecycle_method(emitter: &mut LuaEmitter<'_>, lua_fn_name: &str, method
         param_names.join(", ")
     ));
     emitter.indent();
+    if needs_props_alias {
+        let props_var = param_names.first().map(|s| s.as_str()).unwrap_or("props");
+        emitter.write_line(&format!(
+            "if not Controls then Properties = {props_var} end"
+        ));
+    }
     emitter.emit_statements(&method.body);
     emitter.dedent();
     emitter.write_line("end\n");
 }
 
-fn emit_method(emitter: &mut LuaEmitter<'_>, class_name: &str, method: &IRFunction) {
+fn emit_method_group(emitter: &mut LuaEmitter<'_>, class_name: &str, methods: &[&IRFunction]) {
+    let mut forward_declared = HashSet::new();
+    for (idx, method) in methods.iter().enumerate() {
+        let fn_name = format!("{class_name}_{}", method.name);
+        let referenced_earlier = methods[..idx]
+            .iter()
+            .any(|earlier| stmts_reference_function(&earlier.body, method.id, &fn_name));
+        if referenced_earlier {
+            emitter.write_line(&format!("local {fn_name}"));
+            forward_declared.insert(method.id);
+        }
+    }
+    if !forward_declared.is_empty() {
+        emitter.write_line("");
+    }
+    for method in methods {
+        emit_method(
+            emitter,
+            class_name,
+            method,
+            forward_declared.contains(&method.id),
+        );
+    }
+}
+
+fn emit_method(
+    emitter: &mut LuaEmitter<'_>,
+    class_name: &str,
+    method: &IRFunction,
+    already_declared: bool,
+) {
     let fn_name = format!("{class_name}_{}", method.name);
     let mut param_names = Vec::new();
 
@@ -860,16 +946,113 @@ fn emit_method(emitter: &mut LuaEmitter<'_>, class_name: &str, method: &IRFuncti
         param_names.push(param.name.clone());
     }
 
-    emitter.write_line(&format!(
-        "local function {fn_name}({})",
-        param_names.join(", ")
-    ));
+    if already_declared {
+        emitter.write_line(&format!("function {fn_name}({})", param_names.join(", ")));
+    } else {
+        emitter.write_line(&format!(
+            "local function {fn_name}({})",
+            param_names.join(", ")
+        ));
+    }
     emitter.indent();
     emitter.emit_statements(&method.body);
     emitter.dedent();
     emitter.write_line("end\n");
 
     emitter.ctx.active_handler_control = prev_handler_ctl;
+}
+
+fn page_references_fn_name(page: &PageLayout, fn_name: &str) -> bool {
+    let call_prefix = format!("{fn_name}(");
+    page.graphics.iter().any(|g| {
+        g.text_lua_expr
+            .as_ref()
+            .is_some_and(|e| e.contains(&call_prefix))
+    }) || page.controls.iter().any(|c| {
+        c.pretty_name_lua_expr
+            .as_ref()
+            .is_some_and(|e| e.contains(&call_prefix))
+            || c.dynamic_repeat.as_ref().is_some_and(|rep| {
+                rep.label_lua_expr
+                    .as_ref()
+                    .is_some_and(|e| e.contains(&call_prefix))
+                    || rep
+                        .pretty_name_lua_expr
+                        .as_ref()
+                        .is_some_and(|e| e.contains(&call_prefix))
+            })
+    })
+}
+
+fn stmts_emit_page_referencing_fn_name(stmts: &[IRStmt], fn_name: &str) -> bool {
+    stmts.iter().any(|s| match s {
+        IRStmt::EmitPageLayout { page, .. } => page_references_fn_name(page, fn_name),
+        IRStmt::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            stmts_emit_page_referencing_fn_name(then_branch, fn_name)
+                || stmts_emit_page_referencing_fn_name(else_branch, fn_name)
+        }
+        IRStmt::While { body, .. } | IRStmt::For { body, .. } => {
+            stmts_emit_page_referencing_fn_name(body, fn_name)
+        }
+        IRStmt::FunctionDef(f) => stmts_emit_page_referencing_fn_name(&f.body, fn_name),
+        _ => false,
+    })
+}
+
+fn collect_design_time_hoisted_methods(plugin: &IRPlugin) -> HashSet<FunctionId> {
+    let mut hoisted = HashSet::new();
+
+    for cand in &plugin.methods {
+        if is_design_time_method(&cand.name) {
+            continue;
+        }
+        let fn_name = format!("{}_{}", plugin.class_name, cand.name);
+        let used_in_pages = plugin
+            .pages
+            .iter()
+            .any(|p| page_references_fn_name(p, &fn_name));
+        let used_in_lifecycle = plugin
+            .methods
+            .iter()
+            .filter(|m| is_design_time_method(&m.name))
+            .any(|m| {
+                stmts_reference_function(&m.body, cand.id, &fn_name)
+                    || stmts_emit_page_referencing_fn_name(&m.body, &fn_name)
+            });
+
+        if used_in_pages || used_in_lifecycle {
+            hoisted.insert(cand.id);
+        }
+    }
+
+    // Transitively include any helper methods called by already-hoisted methods
+    loop {
+        let mut added = false;
+        for cand in &plugin.methods {
+            if is_design_time_method(&cand.name) || hoisted.contains(&cand.id) {
+                continue;
+            }
+            let fn_name = format!("{}_{}", plugin.class_name, cand.name);
+            let called_by_hoisted = plugin
+                .methods
+                .iter()
+                .filter(|m| hoisted.contains(&m.id))
+                .any(|m| stmts_reference_function(&m.body, cand.id, &fn_name));
+            if called_by_hoisted {
+                hoisted.insert(cand.id);
+                added = true;
+            }
+        }
+        if !added {
+            break;
+        }
+    }
+
+    hoisted
 }
 
 fn format_ctl_index_helper() -> String {

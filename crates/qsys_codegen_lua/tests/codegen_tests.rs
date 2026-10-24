@@ -1101,3 +1101,132 @@ class MyPlugin(QSysPlugin):
         "Destructured string elements `b`, `d`, `q` must have inferred `Type::String` so `+` lowers to `..`:\n{lua}"
     );
 }
+
+#[test]
+fn test_ui_field_function_and_lambda_labels_with_tuple_return() {
+    let src = r#"
+from qsys import Control, ControlHandle, Property, QSysPlugin, UI, qsys
+
+active_track = 0
+
+class Funnel(QSysPlugin):
+    version = "1.0.0"
+    author = "Q-SYS Developer"
+    description = "Funnel Plugin"
+
+    InputType = Property.Enum(
+        "Input Type",
+        choices=["Boolean", "Number", "String"],
+        default="Boolean"
+    )
+    InputsPerTrack = Property.Integer(name="Inputs Per Track", default=2, min=1, max=100)
+    TrackCount = Property.Integer(name="Number of Tracks", default=2, min=2, max=100)
+
+    Inputs = Control.Generic(InputType, name="Inputs", count=InputsPerTrack*TrackCount, min=-65536, max=65535, default=0)
+    Outputs = Control.Generic(InputType, name="Outputs", count=InputsPerTrack, pins="Output")
+
+    def format_input(self, raw: int) -> str:
+        t, idx = self.calculate_track_and_index(raw)
+        return f"Track {t + 1}, Input {idx + 1}"
+
+    def get_control_layout(self, props):
+        layout = {}
+        graphics = []
+
+        UI.Page(
+            "Main",
+            UI.GroupBox(
+                "Funnel",
+                UI.Header("Funnel Controls"),
+                UI.Col(
+                    UI.Field(self.format_input, self.Inputs, direction="row"),
+                    UI.Field(lambda i: f"Out {i + 1}", self.Outputs, direction="row"),
+                )
+            )
+        )
+
+        return layout, graphics
+
+    def calculate_track_and_index(self, raw: int) -> (int, int):
+        cnt = self.InputsPerTrack.Value
+        return raw // cnt, raw % cnt
+
+    def get_input(self, track: int, idx: int) -> ControlHandle:
+        return self.Inputs[self.InputsPerTrack.Value * track + idx]
+
+    @Inputs.EventHandler
+    def on_inputs(self, ctl: ControlHandle, raw_idx: int) -> None:
+        t, idx = self.calculate_track_and_index(raw_idx)
+        print(t, idx)
+"#;
+    let file = SourceFile::new(FileId(1), "funnel.py", src);
+    let parsed = parse_module(file).expect("Parse failed");
+    let model = analyze(&parsed).expect("Semantic analysis failed");
+    let ir = model.into_ir();
+    let backend = LuaBackend::new();
+    let (lua, diags) = backend
+        .emit(&ir, &CodegenConfig::default())
+        .expect("Codegen should succeed");
+    assert!(!diags.has_errors());
+
+    // 1. Both `Funnel_format_input` and `Funnel_calculate_track_and_index` must be hoisted before `GetControlLayout`
+    let fmt_pos = lua
+        .find("local function Funnel_format_input(self, raw)")
+        .expect("Funnel_format_input should be emitted");
+    let calc_decl_pos = lua
+        .find("local Funnel_calculate_track_and_index")
+        .expect("Funnel_calculate_track_and_index should be forward-declared since format_input precedes it");
+    let layout_pos = lua
+        .find("function GetControlLayout(props)")
+        .expect("GetControlLayout should be emitted");
+    assert!(
+        calc_decl_pos < fmt_pos && fmt_pos < layout_pos,
+        "Helper methods used in UI.Field must be hoisted before GetControlLayout:\n{lua}"
+    );
+
+    // 2. GetControlLayout must alias `Properties = props` when not in runtime so helper methods can read `self.InputsPerTrack.Value`
+    assert!(
+        lua.contains("if not Controls then Properties = props end"),
+        "GetControlLayout must alias Properties = props for design-time helper calls:\n{lua}"
+    );
+
+    // 3. `UI.Field(self.format_input, self.Inputs)` must emit `Text = Funnel_format_input(nil, i - 1)` and `PrettyName = Funnel_format_input(nil, i - 1)`
+    assert!(
+        lua.contains("Text = Funnel_format_input(nil, i - 1),")
+            && lua.contains("PrettyName = Funnel_format_input(nil, i - 1),"),
+        "UI.Field with method reference must call Funnel_format_input(nil, i - 1) in GetControlLayout:\n{lua}"
+    );
+
+    // 4. `UI.Field(lambda i: f"Out {i + 1}", self.Outputs)` must emit an inline Lua function call with `i - 1`
+    assert!(
+        lua.contains("Text = (function(i) return (\"Out \" .. tostring((i + 1))) end)(i - 1),"),
+        "UI.Field with lambda must emit inline Lua function called with `i - 1`:\n{lua}"
+    );
+
+    // 5. Verify UI preview solved labels in `IRPlugin.pages`
+    if let qsys_ir::IRProgram::Plugin(plugin) = ir {
+        let page = &plugin.pages[0];
+        let label_texts: Vec<&str> = page
+            .graphics
+            .iter()
+            .filter_map(|g| match &g.kind {
+                qsys_model::GraphicItemKind::Label { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            label_texts,
+            vec![
+                "Track 1, Input 1",
+                "Track 1, Input 2",
+                "Track 2, Input 1",
+                "Track 2, Input 2",
+                "Out 1",
+                "Out 2",
+            ],
+            "Solved PageLayout preview labels must evaluate both the method and the lambda"
+        );
+    } else {
+        panic!("Expected IRProgram::Plugin");
+    }
+}

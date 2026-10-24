@@ -229,6 +229,10 @@ pub enum IRExpr {
         index: Box<IRExpr>,
         is_zero_based: bool,
     },
+    Lambda {
+        params: Vec<IRParam>,
+        body: Box<IRExpr>,
+    },
 
     RawLua(String),
 }

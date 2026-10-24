@@ -125,6 +125,7 @@ fn test_layout_and_graphic_definitions() {
         dyn_width: None,
         dyn_height: None,
         color: Some(Color::rgb(30, 30, 30)),
+        text_lua_expr: None,
         skip_lua_emit: false,
     };
 

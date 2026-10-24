@@ -148,6 +148,17 @@ impl<'a> Lowerer<'a> {
 
                 let return_type = f.returns.as_ref().map(|r| match r.as_ref() {
                     ruff::Expr::Name(n) => n.id.to_string(),
+                    ruff::Expr::Tuple(t) => {
+                        let elems: Vec<String> = t
+                            .elts
+                            .iter()
+                            .map(|e| match e {
+                                ruff::Expr::Name(n) => n.id.to_string(),
+                                _ => "Any".to_string(),
+                            })
+                            .collect();
+                        format!("({})", elems.join(", "))
+                    }
                     _ => "Any".to_string(),
                 });
 
@@ -499,6 +510,25 @@ impl<'a> Lowerer<'a> {
                 ExprKind::Subscript { value, index }
             }
 
+            ruff::Expr::Lambda(lam) => {
+                let params = lam
+                    .parameters
+                    .as_ref()
+                    .map(|ps| {
+                        ps.args
+                            .iter()
+                            .map(|arg| Param {
+                                name: arg.parameter.name.to_string(),
+                                type_annotation: None,
+                                span: text_range_to_span(arg.range()),
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let body = Box::new(self.lower_expr(&lam.body));
+                ExprKind::Lambda { params, body }
+            }
+
             ruff::Expr::BinOp(b) => {
                 let left = Box::new(self.lower_expr(&b.left));
                 let right = Box::new(self.lower_expr(&b.right));
@@ -768,6 +798,19 @@ fn substitute_expr_ident(expr: &Expr, target: &str, replacement: &Expr) -> Expr 
             value: Box::new(substitute_expr_ident(value, target, replacement)),
             index: Box::new(substitute_expr_ident(index, target, replacement)),
         },
+        ExprKind::Lambda { params, body } => {
+            if params.iter().any(|p| p.name == target) {
+                ExprKind::Lambda {
+                    params: params.clone(),
+                    body: body.clone(),
+                }
+            } else {
+                ExprKind::Lambda {
+                    params: params.clone(),
+                    body: Box::new(substitute_expr_ident(body, target, replacement)),
+                }
+            }
+        }
     };
     Expr::new(kind, expr.span)
 }

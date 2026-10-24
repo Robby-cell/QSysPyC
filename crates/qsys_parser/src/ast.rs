@@ -149,6 +149,10 @@ pub enum ExprKind {
         value: Box<Expr>,
         index: Box<Expr>,
     },
+    Lambda {
+        params: Vec<Param>,
+        body: Box<Expr>,
+    },
     Error,
 }
 

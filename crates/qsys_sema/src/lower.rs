@@ -8,16 +8,48 @@ use qsys_runtime::{CallStyle, Lowering, RuntimeEnv};
 use crate::declarations::DeclaredControl;
 use crate::types::{ResolvedTarget, Type};
 use crate::ui_layout::{
-    extract_graphics_append, is_layout_target, is_ui_layout_expr, parse_ui_layout_expr,
-    substitute_ui_vars,
+    UiResolveEnv, extract_graphics_append, is_layout_target, is_ui_layout_expr,
+    parse_ui_layout_expr_with_env, substitute_ui_vars,
 };
 use crate::{SemanticModel, TargetKind, TruthinessStrategy, TypeMap};
 
 pub fn lower_to_ir(model: &SemanticModel) -> IRProgram {
     match &model.target {
         TargetKind::Plugin(p) => {
-            let mut lowerer =
-                StmtLowerer::new(model, true, &p.class_name, &p.controls, &p.helper_classes);
+            let mut ui_env = UiResolveEnv::from_class_and_module(
+                &p.init_statements,
+                &p.module_statements,
+                &p.properties,
+            );
+            for m in &p.methods {
+                ui_env.class_methods.insert(
+                    m.name.clone(),
+                    ast::FunctionDef {
+                        name: m.name.clone(),
+                        params: m
+                            .params
+                            .iter()
+                            .map(|(_, s)| ast::Param {
+                                name: s.clone(),
+                                type_annotation: None,
+                                span: m.span,
+                            })
+                            .collect(),
+                        return_type: None,
+                        decorators: Vec::new(),
+                        body: m.body.clone(),
+                        span: m.span,
+                    },
+                );
+            }
+            let mut lowerer = StmtLowerer::new(
+                model,
+                true,
+                &p.class_name,
+                &p.controls,
+                &p.helper_classes,
+                ui_env,
+            );
 
             let classes = p
                 .helper_classes
@@ -86,8 +118,14 @@ pub fn lower_to_ir(model: &SemanticModel) -> IRProgram {
         }
 
         TargetKind::TextController(c) => {
-            let mut lowerer =
-                StmtLowerer::new(model, false, &c.class_name, &c.controls, &c.helper_classes);
+            let mut lowerer = StmtLowerer::new(
+                model,
+                false,
+                &c.class_name,
+                &c.controls,
+                &c.helper_classes,
+                UiResolveEnv::empty(),
+            );
 
             let classes = c
                 .helper_classes
@@ -145,7 +183,14 @@ pub fn lower_to_ir(model: &SemanticModel) -> IRProgram {
         }
 
         TargetKind::ProceduralScript(s) => {
-            let mut lowerer = StmtLowerer::new(model, false, "Script", &[], &s.classes);
+            let mut lowerer = StmtLowerer::new(
+                model,
+                false,
+                "Script",
+                &[],
+                &s.classes,
+                UiResolveEnv::empty(),
+            );
 
             let classes = s
                 .classes
@@ -186,6 +231,7 @@ struct StmtLowerer<'a> {
     custom_classes: &'a [ast::ClassDef],
     current_class_base: Option<String>,
     local_ui_vars: FxHashMap<String, ast::Expr>,
+    ui_env: UiResolveEnv<'a>,
 }
 
 impl<'a> StmtLowerer<'a> {
@@ -195,6 +241,7 @@ impl<'a> StmtLowerer<'a> {
         plugin_class_name: &'a str,
         controls: &'a [DeclaredControl],
         custom_classes: &'a [ast::ClassDef],
+        ui_env: UiResolveEnv<'a>,
     ) -> Self {
         Self {
             type_map: &model.type_map,
@@ -205,6 +252,7 @@ impl<'a> StmtLowerer<'a> {
             custom_classes,
             current_class_base: None,
             local_ui_vars: FxHashMap::default(),
+            ui_env,
         }
     }
 
@@ -215,10 +263,11 @@ impl<'a> StmtLowerer<'a> {
     ) -> Option<IRStmt> {
         let mut dummy_diags = Diagnostics::new();
         let mut dummy_res = Vec::new();
-        let mut pages = parse_ui_layout_expr(
+        let mut pages = parse_ui_layout_expr_with_env(
             self.plugin_class_name,
             expr,
             self.controls,
+            &self.ui_env,
             &mut dummy_diags,
             &mut dummy_res,
         );
@@ -526,6 +575,9 @@ impl<'a> StmtLowerer<'a> {
             }
 
             ast::StmtKind::FunctionDef(f) => {
+                self.ui_env
+                    .local_functions
+                    .insert(f.name.clone(), f.clone());
                 let func_id = self
                     .type_map
                     .get_resolution(f.span)
@@ -591,6 +643,30 @@ impl<'a> StmtLowerer<'a> {
             ast::ExprKind::Bool(b) => IRExpr::Bool(*b),
             ast::ExprKind::None => IRExpr::Nil,
             ast::ExprKind::Ident(name) => IRExpr::Global(name.clone()),
+
+            ast::ExprKind::Lambda { params, body } => {
+                let ir_params = params
+                    .iter()
+                    .map(|p| {
+                        let sym_id = self
+                            .type_map
+                            .get_resolution(p.span)
+                            .and_then(|r| match r {
+                                ResolvedTarget::Local(id) => Some(*id),
+                                _ => None,
+                            })
+                            .unwrap_or(SymbolId(0));
+                        IRParam {
+                            name: p.name.clone(),
+                            id: sym_id,
+                        }
+                    })
+                    .collect();
+                IRExpr::Lambda {
+                    params: ir_params,
+                    body: Box::new(self.lower_expr(body)),
+                }
+            }
 
             ast::ExprKind::Tuple(items) => {
                 let lowered = items.iter().map(|item| self.lower_expr(item)).collect();

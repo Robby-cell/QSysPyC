@@ -10,8 +10,8 @@ use qsys_parser::ast;
 
 use crate::symbols::ScopeStack;
 use crate::ui_layout::{
-    collect_inline_ui_pages_from_stmts, extract_declarative_layout_from_method, is_ui_layout_expr,
-    parse_ui_layout_expr,
+    UiResolveEnv, collect_inline_ui_pages_from_stmts, extract_declarative_layout_from_method,
+    is_ui_layout_expr, parse_ui_layout_expr_with_env,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -179,6 +179,15 @@ pub fn extract_class_declarations(
     scope_stack: &mut ScopeStack,
     diagnostics: &mut Diagnostics,
 ) -> ExtractedDeclarations {
+    extract_class_declarations_with_module(class, &[], scope_stack, diagnostics)
+}
+
+pub fn extract_class_declarations_with_module(
+    class: &ast::ClassDef,
+    module_statements: &[ast::Stmt],
+    scope_stack: &mut ScopeStack,
+    diagnostics: &mut Diagnostics,
+) -> ExtractedDeclarations {
     let mut declarations = ExtractedDeclarations::default();
     let mut seen_controls = FxHashSet::default();
     let mut seen_properties = FxHashSet::default();
@@ -276,12 +285,19 @@ pub fn extract_class_declarations(
         }
     }
 
+    let ui_env = UiResolveEnv::from_class_and_module(
+        &class.body,
+        module_statements,
+        &declarations.properties,
+    );
+
     // Second pass: resolve declarative UI.* trees now that all controls are registered
     for ui_expr in &pending_ui_exprs {
-        let solved_pages = parse_ui_layout_expr(
+        let solved_pages = parse_ui_layout_expr_with_env(
             &class.name,
             ui_expr,
             &declarations.controls,
+            &ui_env,
             diagnostics,
             &mut declarations.ui_control_resolutions,
         );
@@ -294,10 +310,12 @@ pub fn extract_class_declarations(
             && f.name == "get_control_layout"
         {
             let mut local_ui_vars = FxHashMap::default();
+            let mut method_ui_env = ui_env.clone();
             let inline_pages = collect_inline_ui_pages_from_stmts(
                 &class.name,
                 &f.body,
                 &declarations.controls,
+                &mut method_ui_env,
                 diagnostics,
                 &mut declarations.ui_control_resolutions,
                 &mut local_ui_vars,
