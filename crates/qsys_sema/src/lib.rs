@@ -101,6 +101,7 @@ pub(crate) fn type_from_annotation(ann: Option<&str>, env: &RuntimeEnv) -> Type 
         Some("int") | Some("Integer") => Type::Int,
         Some("float") | Some("Double") => Type::Float,
         Some("bool") | Some("Boolean") => Type::Bool,
+        Some("tuple") | Some("Tuple") => Type::Tuple(Vec::new()),
         Some("None") => Type::None,
         Some("ControlHandle") => Type::ControlHandle,
         Some("PropertyHandle") => Type::PropertyHandle,
@@ -351,6 +352,20 @@ pub fn analyze_lossy_with_env(
 
                         scope_stack.pop_scope();
 
+                        let mut ret_ty = type_from_annotation(f.return_type.as_deref(), &env);
+                        if ret_ty == Type::Any
+                            && let Some(ret_expr) = analyzer::find_first_return_expr(&f.body)
+                            && let Some(inferred) = type_map.get_type(ret_expr.span)
+                            && *inferred != Type::Any
+                        {
+                            ret_ty = inferred.clone();
+                        }
+                        type_map.insert_class_member_type(
+                            class.name.clone(),
+                            f.name.clone(),
+                            ret_ty,
+                        );
+
                         methods.push(ResolvedMethod {
                             id: method_id,
                             name: f.name.clone(),
@@ -528,6 +543,20 @@ pub fn analyze_lossy_with_env(
                         analyzer.analyze_statements(&f.body);
 
                         scope_stack.pop_scope();
+
+                        let mut ret_ty = type_from_annotation(f.return_type.as_deref(), &env);
+                        if ret_ty == Type::Any
+                            && let Some(ret_expr) = analyzer::find_first_return_expr(&f.body)
+                            && let Some(inferred) = type_map.get_type(ret_expr.span)
+                            && *inferred != Type::Any
+                        {
+                            ret_ty = inferred.clone();
+                        }
+                        type_map.insert_class_member_type(
+                            class.name.clone(),
+                            f.name.clone(),
+                            ret_ty,
+                        );
 
                         methods.push(ResolvedMethod {
                             id: method_id,

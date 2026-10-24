@@ -23,6 +23,7 @@ pub enum Type {
     None,
 
     List(Box<Type>),
+    Tuple(Vec<Type>),
     Dict(Box<Type>, Box<Type>),
 
     ControlHandle,
@@ -86,7 +87,9 @@ impl Type {
 
             Self::Int | Self::Float => TruthinessStrategy::NumericNotZero,
             Self::String => TruthinessStrategy::StringNonEmpty,
-            Self::List(_) | Self::Dict(_, _) => TruthinessStrategy::CollectionNonEmpty,
+            Self::List(_) | Self::Tuple(_) | Self::Dict(_, _) => {
+                TruthinessStrategy::CollectionNonEmpty
+            }
             Self::None => TruthinessStrategy::AlwaysFalse,
             Self::Any | Self::PropertyHandle | Self::UserClass { .. } => {
                 TruthinessStrategy::Dynamic

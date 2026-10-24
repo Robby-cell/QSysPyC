@@ -1035,3 +1035,69 @@ x = h.Foo().value + Foo().value
         "Aliased import and from-import must bind to the module namespace table:\n{from_lua}"
     );
 }
+
+#[test]
+fn test_tuple_and_list_destructuring() {
+    let src = r#"
+def func_that_returns_2_vals():
+    return 10, "hello"
+
+class Helper:
+    def pair(self):
+        return 7, "ok"
+
+class MyPlugin(QSysPlugin):
+    OutNum = Control.Float(name="OutNum")
+    OutText = Control.Text(name="OutText")
+
+    def get_pair(self):
+        return 3.5, "world"
+
+    def runtime(self):
+        a, b = func_that_returns_2_vals()
+        c, d = self.get_pair()
+        h = Helper()
+        p, q = h.pair()
+        x, y = 1, 2
+        [m, n] = [3, 4]
+        x, y = y, x
+        pair = (5, 6)
+        u, v = pair
+        self.OutNum.Value = a + c + p + x + y + m + n + u + v
+        self.OutText.String = b + " " + d + " " + q
+"#;
+    let lua = compile_to_lua(src);
+
+    assert!(
+        lua.contains("local a, b = func_that_returns_2_vals()"),
+        "Tuple destructuring of function call must emit `local a, b = func_that_returns_2_vals()`:\n{lua}"
+    );
+    assert!(
+        lua.contains("local c, d = MyPlugin_get_pair(nil)"),
+        "Tuple destructuring of plugin method call must emit `local c, d = MyPlugin_get_pair(nil)`:\n{lua}"
+    );
+    assert!(
+        lua.contains("local p, q = h:pair()"),
+        "Tuple destructuring of custom class method call must emit `local p, q = h:pair()`:\n{lua}"
+    );
+    assert!(
+        lua.contains("local x, y = 1, 2"),
+        "Tuple literal destructuring must emit `local x, y = 1, 2`:\n{lua}"
+    );
+    assert!(
+        lua.contains("local m, n = 3, 4"),
+        "List literal destructuring must emit `local m, n = 3, 4`:\n{lua}"
+    );
+    assert!(
+        lua.contains("x, y = y, x"),
+        "Reassigning existing locals via tuple swap must emit `x, y = y, x`:\n{lua}"
+    );
+    assert!(
+        lua.contains("local u, v = table.unpack(pair)"),
+        "Unpacking a tuple/list variable must emit `local u, v = table.unpack(pair)`:\n{lua}"
+    );
+    assert!(
+        lua.contains("Controls[\"OutText\"].String = ((((b .. \" \") .. d) .. \" \") .. q)"),
+        "Destructured string elements `b`, `d`, `q` must have inferred `Type::String` so `+` lowers to `..`:\n{lua}"
+    );
+}

@@ -317,23 +317,30 @@ impl<'a> StmtLowerer<'a> {
                     }
                 }
 
-                let target_ir = match &target.kind {
-                    ast::ExprKind::Subscript {
-                        value: sub_val,
-                        index: sub_idx,
-                    } => {
-                        let val_ty = self.type_map.get_type(sub_val.span);
-                        let is_zero_based =
-                            matches!(val_ty, Some(Type::List(_) | Type::ControlHandle));
-                        IRExpr::Index {
-                            base: Box::new(self.lower_expr(sub_val)),
-                            index: Box::new(self.lower_expr(sub_idx)),
-                            is_zero_based,
+                let target_ir = self.lower_assign_target(target);
+                let value_ir = if matches!(
+                    target.kind,
+                    ast::ExprKind::Tuple(_) | ast::ExprKind::List(_)
+                ) {
+                    if let ast::ExprKind::Tuple(items) | ast::ExprKind::List(items) = &value.kind {
+                        IRExpr::Tuple(items.iter().map(|i| self.lower_expr(i)).collect())
+                    } else if matches!(value.kind, ast::ExprKind::Call { .. })
+                        && !matches!(self.type_map.get_type(value.span), Some(Type::List(_)))
+                    {
+                        self.lower_expr(value)
+                    } else {
+                        IRExpr::Call {
+                            callee: Box::new(IRExpr::Attribute {
+                                object: Box::new(IRExpr::Global("table".to_string())),
+                                attr: "unpack".to_string(),
+                            }),
+                            args: vec![self.lower_expr(value)],
+                            kwargs: Vec::new(),
                         }
                     }
-                    _ => self.lower_expr(target),
+                } else {
+                    self.lower_expr(value)
                 };
-                let value_ir = self.lower_expr(value);
                 Some(IRStmt::Assign {
                     target: target_ir,
                     value: value_ir,
@@ -505,11 +512,7 @@ impl<'a> StmtLowerer<'a> {
                             }
                         }
                         ast::StmtKind::Assign { target, .. } => {
-                            if let ast::ExprKind::Ident(var_name) = &target.kind
-                                && !exports.contains(var_name)
-                            {
-                                exports.push(var_name.clone());
-                            }
+                            collect_exported_target_names(target, &mut exports);
                         }
                         _ => {}
                     }
@@ -911,7 +914,7 @@ impl<'a> StmtLowerer<'a> {
                 let is_zero_based = match (val_ty, idx_ty) {
                     (Some(Type::Dict(_, _)), _) => false,
                     (_, Some(Type::String)) => false,
-                    (Some(Type::List(_) | Type::ControlHandle), _) => true,
+                    (Some(Type::List(_) | Type::Tuple(_) | Type::ControlHandle), _) => true,
                     (Some(Type::UserInstance { .. }), _) => false,
                     _ => false,
                 };
@@ -924,6 +927,30 @@ impl<'a> StmtLowerer<'a> {
             }
 
             ast::ExprKind::Error => IRExpr::Nil,
+        }
+    }
+
+    fn lower_assign_target(&self, target: &ast::Expr) -> IRExpr {
+        match &target.kind {
+            ast::ExprKind::Subscript {
+                value: sub_val,
+                index: sub_idx,
+            } => {
+                let val_ty = self.type_map.get_type(sub_val.span);
+                let is_zero_based = matches!(
+                    val_ty,
+                    Some(Type::List(_) | Type::Tuple(_) | Type::ControlHandle)
+                );
+                IRExpr::Index {
+                    base: Box::new(self.lower_expr(sub_val)),
+                    index: Box::new(self.lower_expr(sub_idx)),
+                    is_zero_based,
+                }
+            }
+            ast::ExprKind::Tuple(items) | ast::ExprKind::List(items) => {
+                IRExpr::Tuple(items.iter().map(|i| self.lower_assign_target(i)).collect())
+            }
+            _ => self.lower_expr(target),
         }
     }
 
@@ -1172,6 +1199,22 @@ fn extract_raw_lua(expr: &ast::Expr) -> Option<String> {
         return Some(s.clone());
     }
     None
+}
+
+fn collect_exported_target_names(target: &ast::Expr, exports: &mut Vec<String>) {
+    match &target.kind {
+        ast::ExprKind::Ident(var_name) => {
+            if !exports.contains(var_name) {
+                exports.push(var_name.clone());
+            }
+        }
+        ast::ExprKind::Tuple(items) | ast::ExprKind::List(items) => {
+            for item in items {
+                collect_exported_target_names(item, exports);
+            }
+        }
+        _ => {}
+    }
 }
 
 #[cfg(test)]

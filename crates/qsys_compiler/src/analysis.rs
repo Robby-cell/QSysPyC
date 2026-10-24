@@ -952,23 +952,36 @@ fn collect_stmt_inlay_hints(
                         | ast::ExprKind::String(_)
                         | ast::ExprKind::Bool(_)
                 );
-                if let ast::ExprKind::Ident(_) = &target.kind
-                    && let Some(ty) = model.type_map.get_type(target.span)
-                    && (matches!(
-                        ty,
-                        Type::Native { .. }
-                            | Type::ControlHandle
-                            | Type::PropertyHandle
-                            | Type::UserInstance { .. }
-                    ) || !is_obvious_literal)
-                    && let Some(ty_str) = format_type_display(ty)
-                {
-                    let (line, col) = file.location(target.span.end);
-                    hints.push(LspInlayHint {
-                        line,
-                        col,
-                        label: format!(": {ty_str}"),
-                    });
+                let mut target_exprs = Vec::new();
+                match &target.kind {
+                    ast::ExprKind::Ident(_) => target_exprs.push(target),
+                    ast::ExprKind::Tuple(items) | ast::ExprKind::List(items) => {
+                        for item in items {
+                            if matches!(item.kind, ast::ExprKind::Ident(_)) {
+                                target_exprs.push(item);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                for tgt in target_exprs {
+                    if let Some(ty) = model.type_map.get_type(tgt.span)
+                        && (matches!(
+                            ty,
+                            Type::Native { .. }
+                                | Type::ControlHandle
+                                | Type::PropertyHandle
+                                | Type::UserInstance { .. }
+                        ) || !is_obvious_literal)
+                        && let Some(ty_str) = format_type_display(ty)
+                    {
+                        let (line, col) = file.location(tgt.span.end);
+                        hints.push(LspInlayHint {
+                            line,
+                            col,
+                            label: format!(": {ty_str}"),
+                        });
+                    }
                 }
             }
             ast::StmtKind::If {
@@ -1127,6 +1140,17 @@ fn format_type_display(ty: &Type) -> Option<String> {
             "list[{}]",
             format_type_display(inner).unwrap_or_else(|| "Any".to_string())
         )),
+        Type::Tuple(elems) => {
+            if elems.is_empty() {
+                Some("tuple".to_string())
+            } else {
+                let parts: Vec<String> = elems
+                    .iter()
+                    .map(|e| format_type_display(e).unwrap_or_else(|| "Any".to_string()))
+                    .collect();
+                Some(format!("tuple[{}]", parts.join(", ")))
+            }
+        }
         Type::Dict(k, v) => Some(format!(
             "dict[{}, {}]",
             format_type_display(k).unwrap_or_else(|| "Any".to_string()),

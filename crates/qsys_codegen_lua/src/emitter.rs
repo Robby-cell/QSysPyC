@@ -78,15 +78,18 @@ impl<'a> LuaEmitter<'a> {
         // 2. Emit pure constant assignments (`CONST = 42`) before classes and functions
         let mut emitted_const_indices = HashSet::new();
         for (idx, stmt) in stmts.iter().enumerate() {
-            if let IRStmt::Assign {
-                target: IRExpr::Local(_),
-                value,
-                ..
-            } = stmt
-                && is_pure_const_expr(value)
-            {
-                self.emit_stmt(stmt);
-                emitted_const_indices.insert(idx);
+            if let IRStmt::Assign { target, value, .. } = stmt {
+                let is_local_target = match target {
+                    IRExpr::Local(_) => true,
+                    IRExpr::Tuple(items) => {
+                        !items.is_empty() && items.iter().all(|i| matches!(i, IRExpr::Local(_)))
+                    }
+                    _ => false,
+                };
+                if is_local_target && is_pure_const_expr(value) {
+                    self.emit_stmt(stmt);
+                    emitted_const_indices.insert(idx);
+                }
             }
         }
 
@@ -129,22 +132,33 @@ impl<'a> LuaEmitter<'a> {
             if emitted_const_indices.contains(&idx) {
                 continue;
             }
-            if let IRStmt::Assign {
-                target: IRExpr::Local(sym_id),
-                ..
-            } = stmt
-                && !self.ctx.declared_locals.contains(sym_id)
-            {
-                let referenced_in_decl = sorted_classes
-                    .iter()
-                    .any(|c| class_references_local(c, *sym_id))
-                    || functions
-                        .iter()
-                        .any(|f| stmts_reference_local(&f.body, *sym_id));
-                if referenced_in_decl {
-                    let var_name = self.ctx.get_symbol_name(*sym_id);
-                    self.write_line(&format!("local {var_name}"));
-                    self.ctx.declared_locals.insert(*sym_id);
+            if let IRStmt::Assign { target, .. } = stmt {
+                let mut sym_ids = Vec::new();
+                match target {
+                    IRExpr::Local(sym_id) => sym_ids.push(*sym_id),
+                    IRExpr::Tuple(items) => {
+                        for item in items {
+                            if let IRExpr::Local(sym_id) = item {
+                                sym_ids.push(*sym_id);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                for sym_id in sym_ids {
+                    if !self.ctx.declared_locals.contains(&sym_id) {
+                        let referenced_in_decl = sorted_classes
+                            .iter()
+                            .any(|c| class_references_local(c, sym_id))
+                            || functions
+                                .iter()
+                                .any(|f| stmts_reference_local(&f.body, sym_id));
+                        if referenced_in_decl {
+                            let var_name = self.ctx.get_symbol_name(sym_id);
+                            self.write_line(&format!("local {var_name}"));
+                            self.ctx.declared_locals.insert(sym_id);
+                        }
+                    }
                 }
             }
         }
@@ -193,6 +207,48 @@ impl<'a> LuaEmitter<'a> {
                             .push_str(&format!("local {var_name} = {val_str}\n"));
                     } else {
                         self.buffer.push_str(&format!("{var_name} = {val_str}\n"));
+                    }
+                } else if let IRExpr::Tuple(targets) = target {
+                    let val_str = if let IRExpr::Tuple(vals) = value {
+                        vals.iter()
+                            .map(|v| self.emit_expr(v))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    } else {
+                        self.emit_expr(value)
+                    };
+                    let all_new_locals = !targets.is_empty()
+                        && targets.iter().all(
+                            |t| matches!(t, IRExpr::Local(id) if !self.ctx.declared_locals.contains(id)),
+                        );
+                    if all_new_locals {
+                        let names: Vec<String> = targets
+                            .iter()
+                            .filter_map(|t| {
+                                if let IRExpr::Local(id) = t {
+                                    self.ctx.declared_locals.insert(*id);
+                                    Some(self.ctx.get_symbol_name(*id))
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect();
+                        self.write_line(&format!("local {} = {}", names.join(", "), val_str));
+                    } else {
+                        for t in targets {
+                            if let IRExpr::Local(id) = t
+                                && self.ctx.declared_locals.insert(*id)
+                            {
+                                let var_name = self.ctx.get_symbol_name(*id);
+                                self.write_line(&format!("local {var_name}"));
+                            }
+                        }
+                        let lhs = targets
+                            .iter()
+                            .map(|t| self.emit_expr(t))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        self.write_line(&format!("{lhs} = {val_str}"));
                     }
                 } else if let IRExpr::Attribute { object, attr } = target
                     && ControlMember::from_ident(attr).is_some_and(|m| m.is_generic_accessor())
