@@ -40,6 +40,7 @@ pub enum StmtKind {
     Assign {
         target: Expr,
         value: Expr,
+        type_annotation: Option<String>,
     },
     AugAssign {
         target: Expr,
@@ -94,6 +95,7 @@ pub struct Decorator {
 pub struct Param {
     pub name: String,
     pub type_annotation: Option<String>,
+    pub default: Option<Box<Expr>>,
     pub span: Span,
 }
 

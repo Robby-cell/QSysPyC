@@ -129,11 +129,26 @@ impl<'a> ExprAnalyzer<'a> {
         }
         if matches!(self.scope_stack.current_scope().kind, ScopeKind::Module) {
             for stmt in stmts {
-                if let ast::StmtKind::Assign { target, value } = &stmt.kind {
-                    let quick_ty = self.peek_expr_type(value);
+                if let ast::StmtKind::Assign {
+                    target,
+                    value,
+                    type_annotation,
+                } = &stmt.kind
+                {
+                    let ann_ty = crate::type_from_annotation_with_scope(
+                        type_annotation.as_deref(),
+                        self.env,
+                        self.scope_stack,
+                    );
+                    let quick_ty = if !matches!(ann_ty, Type::Any | Type::None) {
+                        ann_ty
+                    } else {
+                        self.peek_expr_type(value)
+                    };
                     self.pre_register_assign_target(target, quick_ty);
                 }
             }
+            self.pre_upgrade_outer_vars(stmts);
         }
 
         // Pass 3: Analyze ClassDef bodies first so all class/instance attributes and method return types are populated
@@ -188,6 +203,54 @@ impl<'a> ExprAnalyzer<'a> {
                 }
             }
             _ => {}
+        }
+    }
+
+    pub fn pre_upgrade_outer_vars(&mut self, stmts: &[ast::Stmt]) {
+        for stmt in stmts {
+            match &stmt.kind {
+                ast::StmtKind::Assign {
+                    target,
+                    value,
+                    type_annotation,
+                } => {
+                    if let ast::ExprKind::Ident(name) = &target.kind
+                        && let Some(sym) = self.scope_stack.lookup(name)
+                        && let SymbolKind::Variable { id, ty } = &sym.kind
+                        && matches!(ty, Type::None | Type::Any)
+                    {
+                        let ann_ty = crate::type_from_annotation_with_scope(
+                            type_annotation.as_deref(),
+                            self.env,
+                            self.scope_stack,
+                        );
+                        let new_ty = if !matches!(ann_ty, Type::Any | Type::None) {
+                            ann_ty
+                        } else {
+                            self.peek_expr_type(value)
+                        };
+                        if !matches!(new_ty, Type::Any | Type::None) {
+                            let sym_id = *id;
+                            self.scope_stack.update_variable_type(sym_id, new_ty);
+                        }
+                    }
+                }
+                ast::StmtKind::FunctionDef(f) => {
+                    self.pre_upgrade_outer_vars(&f.body);
+                }
+                ast::StmtKind::If {
+                    then_branch,
+                    else_branch,
+                    ..
+                } => {
+                    self.pre_upgrade_outer_vars(then_branch);
+                    self.pre_upgrade_outer_vars(else_branch);
+                }
+                ast::StmtKind::While { body, .. } | ast::StmtKind::For { body, .. } => {
+                    self.pre_upgrade_outer_vars(body);
+                }
+                _ => {}
+            }
         }
     }
 
@@ -289,8 +352,24 @@ impl<'a> ExprAnalyzer<'a> {
         for body_stmt in &c.body {
             match &body_stmt.kind {
                 ast::StmtKind::FunctionDef(f) => {
-                    let mut ret_ty =
-                        crate::type_from_annotation(f.return_type.as_deref(), self.env);
+                    let skip_self = usize::from(f.params.first().is_some_and(|p| p.name == "self"));
+                    let sig_params = f
+                        .params
+                        .iter()
+                        .skip(skip_self)
+                        .map(|p| (p.name.clone(), p.default.as_deref().cloned()))
+                        .collect();
+                    self.type_map.insert_class_method_params(
+                        c.name.clone(),
+                        f.name.clone(),
+                        sig_params,
+                    );
+
+                    let mut ret_ty = crate::type_from_annotation_with_scope(
+                        f.return_type.as_deref(),
+                        self.env,
+                        self.scope_stack,
+                    );
                     if ret_ty == Type::Any
                         && let Some(ret_expr) = find_first_return_expr(&f.body)
                     {
@@ -301,10 +380,70 @@ impl<'a> ExprAnalyzer<'a> {
                     }
                     self.type_map
                         .insert_class_member_type(c.name.clone(), f.name.clone(), ret_ty);
+
+                    for method_stmt in &f.body {
+                        if let ast::StmtKind::Assign {
+                            target,
+                            value,
+                            type_annotation,
+                        } = &method_stmt.kind
+                            && let ast::ExprKind::Attribute {
+                                value: obj_val,
+                                attr,
+                            } = &target.kind
+                            && matches!(&obj_val.kind, ast::ExprKind::Ident(id) if id == "self")
+                        {
+                            let ann_ty = crate::type_from_annotation_with_scope(
+                                type_annotation.as_deref(),
+                                self.env,
+                                self.scope_stack,
+                            );
+                            let attr_ty = if !matches!(ann_ty, Type::Any | Type::None) {
+                                ann_ty
+                            } else if let ast::ExprKind::Ident(rhs_id) = &value.kind
+                                && let Some(param) = f.params.iter().find(|p| p.name == *rhs_id)
+                            {
+                                let p_ty = crate::type_from_annotation_with_scope(
+                                    param.type_annotation.as_deref(),
+                                    self.env,
+                                    self.scope_stack,
+                                );
+                                if !matches!(p_ty, Type::Any | Type::None) {
+                                    p_ty
+                                } else if let Some(ref def_expr) = param.default {
+                                    self.peek_expr_type(def_expr)
+                                } else {
+                                    self.peek_expr_type(value)
+                                }
+                            } else {
+                                self.peek_expr_type(value)
+                            };
+                            if !matches!(attr_ty, Type::Any | Type::None) {
+                                self.type_map.insert_class_member_type(
+                                    c.name.clone(),
+                                    attr.clone(),
+                                    attr_ty,
+                                );
+                            }
+                        }
+                    }
                 }
-                ast::StmtKind::Assign { target, value } => {
+                ast::StmtKind::Assign {
+                    target,
+                    value,
+                    type_annotation,
+                } => {
                     if let ast::ExprKind::Ident(attr_name) = &target.kind {
-                        let attr_ty = self.peek_expr_type(value);
+                        let ann_ty = crate::type_from_annotation_with_scope(
+                            type_annotation.as_deref(),
+                            self.env,
+                            self.scope_stack,
+                        );
+                        let attr_ty = if !matches!(ann_ty, Type::Any | Type::None) {
+                            ann_ty
+                        } else {
+                            self.peek_expr_type(value)
+                        };
                         self.type_map.insert_class_member_type(
                             c.name.clone(),
                             attr_name.clone(),
@@ -323,6 +462,7 @@ impl<'a> ExprAnalyzer<'a> {
         }
         let func_id = self.scope_stack.alloc_function_id();
         let sym_id = self.scope_stack.alloc_symbol_id();
+        let has_self = f.params.first().is_some_and(|p| p.name == "self");
 
         self.scope_stack.define(Symbol::new(
             sym_id,
@@ -330,14 +470,27 @@ impl<'a> ExprAnalyzer<'a> {
             SymbolKind::Method {
                 id: func_id,
                 param_count: f.params.len(),
-                has_self: f.params.first().is_some_and(|p| p.name == "self"),
+                has_self,
             },
             f.span,
         ));
         self.type_map
             .insert_resolution(f.span, ResolvedTarget::Function(func_id));
 
-        let mut ret_ty = crate::type_from_annotation(f.return_type.as_deref(), self.env);
+        let sig_params = f
+            .params
+            .iter()
+            .skip(usize::from(has_self))
+            .map(|p| (p.name.clone(), p.default.as_deref().cloned()))
+            .collect();
+        self.type_map
+            .insert_function_params(f.name.clone(), sig_params);
+
+        let mut ret_ty = crate::type_from_annotation_with_scope(
+            f.return_type.as_deref(),
+            self.env,
+            self.scope_stack,
+        );
         if ret_ty == Type::Any
             && let Some(ret_expr) = find_first_return_expr(&f.body)
         {
@@ -359,39 +512,58 @@ impl<'a> ExprAnalyzer<'a> {
                     ScopeKind::Class { name } => Some(name.clone()),
                     _ => None,
                 };
-                let sym_id = if let Some(existing) =
+                let (sym_id, prev_ty, is_outer_var) = if let Some(existing) =
                     self.scope_stack.current_scope().symbols.get(name)
                 {
-                    match existing.kind {
-                        SymbolKind::Variable { id, .. } | SymbolKind::Parameter { id, .. } => id,
-                        _ => self.scope_stack.alloc_symbol_id(),
+                    match &existing.kind {
+                        SymbolKind::Variable { id, ty } | SymbolKind::Parameter { id, ty, .. } => {
+                            (*id, Some(ty.clone()), false)
+                        }
+                        _ => (self.scope_stack.alloc_symbol_id(), None, false),
                     }
                 } else if enclosing_class.is_none()
                     && let Some(existing) = self.scope_stack.lookup(name)
                 {
-                    match existing.kind {
-                        SymbolKind::Variable { id, .. } | SymbolKind::Parameter { id, .. } => id,
-                        _ => self.scope_stack.alloc_symbol_id(),
+                    match &existing.kind {
+                        SymbolKind::Variable { id, ty } | SymbolKind::Parameter { id, ty, .. } => {
+                            (*id, Some(ty.clone()), true)
+                        }
+                        _ => (self.scope_stack.alloc_symbol_id(), None, false),
                     }
                 } else {
-                    self.scope_stack.alloc_symbol_id()
+                    (self.scope_stack.alloc_symbol_id(), None, false)
                 };
+                let effective_ty = if matches!(val_ty, Type::None | Type::Any)
+                    && let Some(ref prev) = prev_ty
+                    && !matches!(prev, Type::None | Type::Any)
+                {
+                    prev.clone()
+                } else {
+                    val_ty
+                };
+                if is_outer_var && !matches!(effective_ty, Type::None | Type::Any) {
+                    self.scope_stack
+                        .update_variable_type(sym_id, effective_ty.clone());
+                }
                 if let Some(cls_name) = enclosing_class {
-                    self.type_map
-                        .insert_class_member_type(cls_name, name.clone(), val_ty.clone());
+                    self.type_map.insert_class_member_type(
+                        cls_name,
+                        name.clone(),
+                        effective_ty.clone(),
+                    );
                 }
                 self.scope_stack.define(Symbol::new(
                     sym_id,
                     name.clone(),
                     SymbolKind::Variable {
                         id: sym_id,
-                        ty: val_ty.clone(),
+                        ty: effective_ty.clone(),
                     },
                     target.span,
                 ));
                 self.type_map
                     .insert_resolution(target.span, ResolvedTarget::Local(sym_id));
-                self.type_map.insert_type(target.span, val_ty);
+                self.type_map.insert_type(target.span, effective_ty);
                 self.type_map.insert_symbol_name(sym_id, name.clone());
             }
             ast::ExprKind::Subscript {
@@ -441,9 +613,23 @@ impl<'a> ExprAnalyzer<'a> {
 
     pub fn analyze_stmt(&mut self, stmt: &ast::Stmt) {
         match &stmt.kind {
-            ast::StmtKind::Assign { target, value } => {
+            ast::StmtKind::Assign {
+                target,
+                value,
+                type_annotation,
+            } => {
                 let val_ty = self.infer_expr(value);
-                self.analyze_assign_target(target, val_ty);
+                let ann_ty = crate::type_from_annotation_with_scope(
+                    type_annotation.as_deref(),
+                    self.env,
+                    self.scope_stack,
+                );
+                let effective_ty = if !matches!(ann_ty, Type::Any | Type::None) {
+                    ann_ty
+                } else {
+                    val_ty
+                };
+                self.analyze_assign_target(target, effective_ty);
             }
 
             ast::StmtKind::AugAssign { target, value, .. } => {
@@ -547,13 +733,32 @@ impl<'a> ExprAnalyzer<'a> {
                 };
                 let _ = func_id;
 
+                let has_self = f.params.first().is_some_and(|p| p.name == "self");
+                let sig_params = f
+                    .params
+                    .iter()
+                    .skip(usize::from(has_self))
+                    .map(|p| (p.name.clone(), p.default.as_deref().cloned()))
+                    .collect();
+                if let Some(ref cls_name) = enclosing_class {
+                    self.type_map.insert_class_method_params(
+                        cls_name.clone(),
+                        f.name.clone(),
+                        sig_params,
+                    );
+                } else {
+                    self.type_map
+                        .insert_function_params(f.name.clone(), sig_params);
+                }
+
                 self.scope_stack.push_scope(ScopeKind::Function {
                     name: f.name.clone(),
                 });
 
                 for (idx, param) in f.params.iter().enumerate() {
+                    let default_ty = param.default.as_ref().map(|d| self.infer_expr(d));
                     let param_sym_id = self.scope_stack.alloc_symbol_id();
-                    let param_ty = if idx == 0 && param.name == "self" {
+                    let mut param_ty = if idx == 0 && param.name == "self" {
                         if let Some(ref cls_name) = enclosing_class {
                             Type::UserInstance {
                                 name: cls_name.clone(),
@@ -562,8 +767,18 @@ impl<'a> ExprAnalyzer<'a> {
                             Type::Any
                         }
                     } else {
-                        crate::type_from_annotation(param.type_annotation.as_deref(), self.env)
+                        crate::type_from_annotation_with_scope(
+                            param.type_annotation.as_deref(),
+                            self.env,
+                            self.scope_stack,
+                        )
                     };
+                    if param_ty == Type::Any
+                        && let Some(ref dt) = default_ty
+                        && !matches!(dt, Type::Any | Type::None)
+                    {
+                        param_ty = dt.clone();
+                    }
                     self.type_map
                         .insert_symbol_name(param_sym_id, param.name.clone());
                     self.type_map
@@ -593,7 +808,11 @@ impl<'a> ExprAnalyzer<'a> {
                 self.context = outer_context;
                 self.scope_stack.pop_scope();
 
-                let mut ret_ty = crate::type_from_annotation(f.return_type.as_deref(), self.env);
+                let mut ret_ty = crate::type_from_annotation_with_scope(
+                    f.return_type.as_deref(),
+                    self.env,
+                    self.scope_stack,
+                );
                 if ret_ty == Type::Any
                     && let Some(ret_expr) = find_first_return_expr(&f.body)
                     && let Some(inferred) = self.type_map.get_type(ret_expr.span)
@@ -941,7 +1160,9 @@ impl<'a> ExprAnalyzer<'a> {
                         | Some(ControlMember::IsDisabled)
                         | Some(ControlMember::IsInvisible) => Type::Bool,
                         Some(ControlMember::Values) => Type::List(Box::new(Type::Float)),
-                        Some(ControlMember::Strings) => Type::List(Box::new(Type::String)),
+                        Some(ControlMember::Strings) | Some(ControlMember::Choices) => {
+                            Type::List(Box::new(Type::String))
+                        }
                         Some(ControlMember::Data)
                         | Some(ControlMember::Generic)
                         | Some(ControlMember::Any)
@@ -1087,9 +1308,16 @@ impl<'a> ExprAnalyzer<'a> {
 
             ast::ExprKind::Subscript { value, index } => {
                 let val_ty = self.infer_expr(value);
-                let _ = self.infer_expr(index);
+                let idx_ty = self.infer_expr(index);
                 match val_ty {
-                    Type::ControlHandle => Type::ControlHandle,
+                    Type::ControlHandle => {
+                        if idx_ty == Type::String || matches!(index.kind, ast::ExprKind::String(_))
+                        {
+                            Type::Any
+                        } else {
+                            Type::ControlHandle
+                        }
+                    }
                     Type::List(elem) => *elem,
                     Type::Tuple(elems) => {
                         if let ast::ExprKind::Int(i) = index.kind
@@ -1309,6 +1537,9 @@ impl<'a> ExprAnalyzer<'a> {
                     name: "<lambda>".to_string(),
                 });
                 for (idx, param) in params.iter().enumerate() {
+                    if let Some(ref def_expr) = param.default {
+                        let _ = self.infer_expr(def_expr);
+                    }
                     let param_sym = self.scope_stack.alloc_symbol_id();
                     self.type_map
                         .insert_symbol_name(param_sym, param.name.clone());

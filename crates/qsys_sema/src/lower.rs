@@ -29,9 +29,10 @@ pub fn lower_to_ir(model: &SemanticModel) -> IRProgram {
                         params: m
                             .params
                             .iter()
-                            .map(|(_, s)| ast::Param {
+                            .map(|(_, s, d)| ast::Param {
                                 name: s.clone(),
                                 type_annotation: None,
+                                default: d.clone().map(Box::new),
                                 span: m.span,
                             })
                             .collect(),
@@ -280,7 +281,7 @@ impl<'a> StmtLowerer<'a> {
         &mut self,
         id: FunctionId,
         name: &str,
-        params: &[(SymbolId, String)],
+        params: &[(SymbolId, String, Option<ast::Expr>)],
         body: &[ast::Stmt],
         span: qsys_diagnostics::Span,
     ) -> IRFunction {
@@ -289,9 +290,10 @@ impl<'a> StmtLowerer<'a> {
             name: name.to_string(),
             params: params
                 .iter()
-                .map(|(sid, sname)| IRParam {
+                .map(|(sid, sname, def_expr)| IRParam {
                     id: *sid,
                     name: sname.clone(),
+                    default: def_expr.as_ref().map(|d| self.lower_expr(d)),
                 })
                 .collect(),
             body: self.lower_statements(body),
@@ -354,7 +356,7 @@ impl<'a> StmtLowerer<'a> {
         let span = stmt.span;
 
         match &stmt.kind {
-            ast::StmtKind::Assign { target, value } => {
+            ast::StmtKind::Assign { target, value, .. } => {
                 let sub_val = substitute_ui_vars(value, &self.local_ui_vars);
                 if is_ui_layout_expr(&sub_val) {
                     if is_layout_target(target) {
@@ -602,6 +604,7 @@ impl<'a> StmtLowerer<'a> {
                         IRParam {
                             name: p.name.clone(),
                             id: sym_id,
+                            default: p.default.as_ref().map(|d| self.lower_expr(d)),
                         }
                     })
                     .collect();
@@ -659,6 +662,7 @@ impl<'a> StmtLowerer<'a> {
                         IRParam {
                             name: p.name.clone(),
                             id: sym_id,
+                            default: p.default.as_ref().map(|d| self.lower_expr(d)),
                         }
                     })
                     .collect();
@@ -775,12 +779,9 @@ impl<'a> StmtLowerer<'a> {
                 if let Some(raw_code) = extract_raw_lua(expr) {
                     IRExpr::RawLua(raw_code)
                 } else {
-                    let mut args_ir: Vec<IRExpr> =
-                        args.iter().map(|arg| self.lower_expr(arg)).collect();
-                    let kwargs_ir: Vec<(String, IRExpr)> = kwargs
-                        .iter()
-                        .map(|(k, v)| (k.clone(), self.lower_expr(v)))
-                        .collect();
+                    let (sig_params, is_user_callable) = self.lookup_callable_params(callee);
+                    let (mut args_ir, kwargs_ir) =
+                        self.resolve_call_arguments(args, kwargs, sig_params, is_user_callable);
 
                     let callee_ty = self.type_map.get_type(callee.span);
 
@@ -982,18 +983,18 @@ impl<'a> StmtLowerer<'a> {
                 attr: attr.clone(),
             },
 
-            // Subscript Indexing (Dictionaries do NOT get +1 offset)
+            // Subscript Indexing (Dictionaries and string keys do NOT get +1 offset)
             ast::ExprKind::Subscript { value, index } => {
                 let val_ty = self.type_map.get_type(value.span);
                 let idx_ty = self.type_map.get_type(index.span);
+                let is_str_idx = matches!(index.kind, ast::ExprKind::String(_))
+                    || matches!(idx_ty, Some(Type::String));
 
-                let is_zero_based = match (val_ty, idx_ty) {
-                    (Some(Type::Dict(_, _)), _) => false,
-                    (_, Some(Type::String)) => false,
-                    (Some(Type::List(_) | Type::Tuple(_) | Type::ControlHandle), _) => true,
-                    (Some(Type::UserInstance { .. }), _) => false,
-                    _ => false,
-                };
+                let is_zero_based = !is_str_idx
+                    && matches!(
+                        val_ty,
+                        Some(Type::List(_) | Type::Tuple(_) | Type::ControlHandle)
+                    );
 
                 IRExpr::Index {
                     base: Box::new(self.lower_expr(value)),
@@ -1006,6 +1007,111 @@ impl<'a> StmtLowerer<'a> {
         }
     }
 
+    fn lookup_callable_params(
+        &self,
+        callee: &ast::Expr,
+    ) -> (Option<&[(String, Option<ast::Expr>)]>, bool) {
+        if let Some(Type::UserClass { name }) = self.type_map.get_type(callee.span) {
+            return (self.type_map.get_class_method_params(name, "__init__"), true);
+        }
+        match &callee.kind {
+            ast::ExprKind::Attribute { value, attr } => {
+                if let ast::ExprKind::Call {
+                    callee: super_callee,
+                    args: super_args,
+                    ..
+                } = &value.kind
+                    && super_args.is_empty()
+                    && matches!(&super_callee.kind, ast::ExprKind::Ident(id) if id == "super")
+                    && let Some(ref base_name) = self.current_class_base
+                {
+                    return (
+                        self.type_map.get_class_method_params(base_name, attr),
+                        true,
+                    );
+                }
+                match self.type_map.get_type(value.span) {
+                    Some(
+                        Type::UserInstance { name }
+                        | Type::ClassInstance { name }
+                        | Type::UserClass { name },
+                    ) => (self.type_map.get_class_method_params(name, attr), true),
+                    Some(Type::UserModule { .. }) => {
+                        let sig = self
+                            .type_map
+                            .get_class_method_params(attr, "__init__")
+                            .or_else(|| self.type_map.get_function_params(attr));
+                        (sig, true)
+                    }
+                    _ => (None, false),
+                }
+            }
+            ast::ExprKind::Ident(fn_name) => {
+                let sig = self.type_map.get_function_params(fn_name);
+                let is_user_fn = sig.is_some()
+                    || matches!(
+                        self.type_map.get_resolution(callee.span),
+                        Some(ResolvedTarget::Function(_))
+                    );
+                (sig, is_user_fn)
+            }
+            _ => (None, false),
+        }
+    }
+
+    fn resolve_call_arguments(
+        &self,
+        args: &[ast::Expr],
+        kwargs: &[(String, ast::Expr)],
+        sig_params: Option<&[(String, Option<ast::Expr>)]>,
+        is_user_callable: bool,
+    ) -> (Vec<IRExpr>, Vec<(String, IRExpr)>) {
+        let mut args_ir: Vec<IRExpr> = args.iter().map(|arg| self.lower_expr(arg)).collect();
+        if kwargs.is_empty() {
+            return (args_ir, Vec::new());
+        }
+        if let Some(sig) = sig_params {
+            let mut slots: Vec<Option<IRExpr>> = vec![None; sig.len().max(args_ir.len())];
+            for (i, arg_ir) in args_ir.into_iter().enumerate() {
+                slots[i] = Some(arg_ir);
+            }
+            let mut extra = Vec::new();
+            for (kw_name, kw_val) in kwargs {
+                let lowered = self.lower_expr(kw_val);
+                if let Some(idx) = sig.iter().position(|(p_name, _)| p_name == kw_name) {
+                    slots[idx] = Some(lowered);
+                } else {
+                    extra.push(lowered);
+                }
+            }
+            let mut out = Vec::new();
+            if let Some(last) = slots.iter().rposition(Option::is_some) {
+                for (i, slot) in slots.into_iter().take(last + 1).enumerate() {
+                    if let Some(val) = slot {
+                        out.push(val);
+                    } else if let Some((_, Some(def_expr))) = sig.get(i) {
+                        out.push(self.lower_expr(def_expr));
+                    } else {
+                        out.push(IRExpr::Nil);
+                    }
+                }
+            }
+            out.extend(extra);
+            return (out, Vec::new());
+        }
+        if is_user_callable {
+            for (_, kw_val) in kwargs {
+                args_ir.push(self.lower_expr(kw_val));
+            }
+            return (args_ir, Vec::new());
+        }
+        let kwargs_ir = kwargs
+            .iter()
+            .map(|(k, v)| (k.clone(), self.lower_expr(v)))
+            .collect();
+        (args_ir, kwargs_ir)
+    }
+
     fn lower_assign_target(&self, target: &ast::Expr) -> IRExpr {
         match &target.kind {
             ast::ExprKind::Subscript {
@@ -1013,10 +1119,14 @@ impl<'a> StmtLowerer<'a> {
                 index: sub_idx,
             } => {
                 let val_ty = self.type_map.get_type(sub_val.span);
-                let is_zero_based = matches!(
-                    val_ty,
-                    Some(Type::List(_) | Type::Tuple(_) | Type::ControlHandle)
-                );
+                let idx_ty = self.type_map.get_type(sub_idx.span);
+                let is_str_idx = matches!(sub_idx.kind, ast::ExprKind::String(_))
+                    || matches!(idx_ty, Some(Type::String));
+                let is_zero_based = !is_str_idx
+                    && matches!(
+                        val_ty,
+                        Some(Type::List(_) | Type::Tuple(_) | Type::ControlHandle)
+                    );
                 IRExpr::Index {
                     base: Box::new(self.lower_expr(sub_val)),
                     index: Box::new(self.lower_expr(sub_idx)),
@@ -1053,7 +1163,7 @@ impl<'a> StmtLowerer<'a> {
                         methods.push(lowered_fn);
                     }
                 }
-                ast::StmtKind::Assign { target, value } => {
+                ast::StmtKind::Assign { target, value, .. } => {
                     if let ast::ExprKind::Ident(attr_name) = &target.kind {
                         class_vars.push((attr_name.clone(), self.lower_expr(value)));
                     }
@@ -1118,7 +1228,7 @@ impl<'a> StmtLowerer<'a> {
                         _ => None,
                     })
                     .unwrap_or(SymbolId(0));
-                (sym_id, p.name.clone())
+                (sym_id, p.name.clone(), p.default.as_deref().cloned())
             })
             .collect();
 

@@ -127,12 +127,15 @@ impl<'a> Lowerer<'a> {
                     .iter()
                     .map(|arg| Param {
                         name: arg.parameter.name.to_string(),
-                        type_annotation: arg.parameter.annotation.as_ref().map(|a| {
-                            match a.as_ref() {
-                                ruff::Expr::Name(n) => n.id.to_string(),
-                                _ => "Any".to_string(),
-                            }
-                        }),
+                        type_annotation: arg
+                            .parameter
+                            .annotation
+                            .as_ref()
+                            .map(|a| lower_type_annotation(a)),
+                        default: arg
+                            .default
+                            .as_ref()
+                            .map(|d| Box::new(self.lower_expr(d))),
                         span: text_range_to_span(arg.range()),
                     })
                     .collect();
@@ -146,21 +149,7 @@ impl<'a> Lowerer<'a> {
                     })
                     .collect();
 
-                let return_type = f.returns.as_ref().map(|r| match r.as_ref() {
-                    ruff::Expr::Name(n) => n.id.to_string(),
-                    ruff::Expr::Tuple(t) => {
-                        let elems: Vec<String> = t
-                            .elts
-                            .iter()
-                            .map(|e| match e {
-                                ruff::Expr::Name(n) => n.id.to_string(),
-                                _ => "Any".to_string(),
-                            })
-                            .collect();
-                        format!("({})", elems.join(", "))
-                    }
-                    _ => "Any".to_string(),
-                });
+                let return_type = f.returns.as_ref().map(|r| lower_type_annotation(r));
 
                 let body = self.lower_suite(&f.body);
 
@@ -186,16 +175,33 @@ impl<'a> Lowerer<'a> {
                 if let Some(first_target) = a.targets.first() {
                     let target = self.lower_expr(first_target);
                     let value = self.lower_expr(&a.value);
-                    out.push(Stmt::new(StmtKind::Assign { target, value }, span));
+                    out.push(Stmt::new(
+                        StmtKind::Assign {
+                            target,
+                            value,
+                            type_annotation: None,
+                        },
+                        span,
+                    ));
                 }
             }
 
             ruff::Stmt::AnnAssign(a) => {
-                if let Some(val) = &a.value {
-                    let target = self.lower_expr(&a.target);
-                    let value = self.lower_expr(val);
-                    out.push(Stmt::new(StmtKind::Assign { target, value }, span));
-                }
+                let target = self.lower_expr(&a.target);
+                let value = a
+                    .value
+                    .as_ref()
+                    .map(|val| self.lower_expr(val))
+                    .unwrap_or_else(|| Expr::new(ExprKind::None, span));
+                let type_annotation = Some(lower_type_annotation(&a.annotation));
+                out.push(Stmt::new(
+                    StmtKind::Assign {
+                        target,
+                        value,
+                        type_annotation,
+                    },
+                    span,
+                ));
             }
 
             ruff::Stmt::AugAssign(a) => {
@@ -289,7 +295,9 @@ impl<'a> Lowerer<'a> {
                 out.push(Stmt::new(StmtKind::Expr(expr), span));
             }
 
-            ruff::Stmt::Pass(_) => out.push(Stmt::new(StmtKind::Pass, span)),
+            ruff::Stmt::Pass(_) | ruff::Stmt::Global(_) | ruff::Stmt::Nonlocal(_) => {
+                out.push(Stmt::new(StmtKind::Pass, span));
+            }
 
             ruff::Stmt::Break(_) => out.push(Stmt::new(StmtKind::Break, span)),
 
@@ -520,6 +528,10 @@ impl<'a> Lowerer<'a> {
                             .map(|arg| Param {
                                 name: arg.parameter.name.to_string(),
                                 type_annotation: None,
+                                default: arg
+                                    .default
+                                    .as_ref()
+                                    .map(|d| Box::new(self.lower_expr(d))),
                                 span: text_range_to_span(arg.range()),
                             })
                             .collect()
@@ -813,4 +825,43 @@ fn substitute_expr_ident(expr: &Expr, target: &str, replacement: &Expr) -> Expr 
         }
     };
     Expr::new(kind, expr.span)
+}
+
+fn lower_type_annotation(expr: &ruff::Expr) -> String {
+    match expr {
+        ruff::Expr::Name(n) => n.id.to_string(),
+        ruff::Expr::Attribute(a) => {
+            if let ruff::Expr::Name(base) = a.value.as_ref() {
+                format!("{}.{}", base.id, a.attr)
+            } else {
+                a.attr.to_string()
+            }
+        }
+        ruff::Expr::Subscript(s) => {
+            if let ruff::Expr::Name(base) = s.value.as_ref() {
+                if base.id.as_str() == "Optional" {
+                    return lower_type_annotation(&s.slice);
+                }
+                if base.id.as_str() == "list" || base.id.as_str() == "List" {
+                    return "list".to_string();
+                }
+            }
+            "Any".to_string()
+        }
+        ruff::Expr::BinOp(b) => {
+            let left = lower_type_annotation(&b.left);
+            let right = lower_type_annotation(&b.right);
+            if left == "None" {
+                right
+            } else {
+                left
+            }
+        }
+        ruff::Expr::Tuple(t) => {
+            let elems: Vec<String> = t.elts.iter().map(lower_type_annotation).collect();
+            format!("({})", elems.join(", "))
+        }
+        ruff::Expr::NoneLiteral(_) => "None".to_string(),
+        _ => "Any".to_string(),
+    }
 }

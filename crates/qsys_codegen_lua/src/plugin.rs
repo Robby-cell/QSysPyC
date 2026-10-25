@@ -955,6 +955,7 @@ fn emit_method(
         ));
     }
     emitter.indent();
+    emitter.emit_param_defaults(&method.params);
     emitter.emit_statements(&method.body);
     emitter.dedent();
     emitter.write_line("end\n");

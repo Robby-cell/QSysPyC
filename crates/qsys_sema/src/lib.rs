@@ -90,7 +90,7 @@ pub struct ScriptSemantic {
 pub struct ResolvedMethod {
     pub id: FunctionId,
     pub name: String,
-    pub params: Vec<(SymbolId, String)>,
+    pub params: Vec<(SymbolId, String, Option<ast::Expr>)>,
     pub body: Vec<ast::Stmt>,
     pub span: Span,
 }
@@ -101,6 +101,8 @@ pub(crate) fn type_from_annotation(ann: Option<&str>, env: &RuntimeEnv) -> Type 
         Some("int") | Some("Integer") => Type::Int,
         Some("float") | Some("Double") => Type::Float,
         Some("bool") | Some("Boolean") => Type::Bool,
+        Some("list") | Some("List") => Type::List(Box::new(Type::Any)),
+        Some("dict") | Some("Dict") => Type::Dict(Box::new(Type::Any), Box::new(Type::Any)),
         Some("tuple") | Some("Tuple") => Type::Tuple(Vec::new()),
         Some("None") => Type::None,
         Some("ControlHandle") => Type::ControlHandle,
@@ -118,6 +120,44 @@ pub(crate) fn type_from_annotation(ann: Option<&str>, env: &RuntimeEnv) -> Type 
         },
         _ => Type::Any,
     }
+}
+
+pub(crate) fn type_from_annotation_with_scope(
+    ann: Option<&str>,
+    env: &RuntimeEnv,
+    scope_stack: &ScopeStack,
+) -> Type {
+    let base = type_from_annotation(ann, env);
+    if base != Type::Any {
+        return base;
+    }
+    if let Some(name) = ann {
+        if let Some(s) = name.strip_prefix('(').and_then(|s| s.strip_suffix(')')) {
+            let elems = s
+                .split(',')
+                .map(|part| type_from_annotation_with_scope(Some(part.trim()), env, scope_stack))
+                .collect();
+            return Type::Tuple(elems);
+        }
+        if let Some(sym) = scope_stack.lookup(name) {
+            if let SymbolKind::Class { name: cls_name, .. }
+            | SymbolKind::UserClass { name: cls_name } = &sym.kind
+            {
+                return Type::UserInstance {
+                    name: cls_name.clone(),
+                };
+            }
+        } else if let Some((_, attr)) = name.split_once('.')
+            && let Some(sym) = scope_stack.lookup(attr)
+            && let SymbolKind::Class { name: cls_name, .. }
+            | SymbolKind::UserClass { name: cls_name } = &sym.kind
+        {
+            return Type::UserInstance {
+                name: cls_name.clone(),
+            };
+        }
+    }
+    Type::Any
 }
 
 /// Fault-tolerant semantic analysis that always returns a `SemanticModel` alongside any diagnostics.
@@ -259,16 +299,28 @@ pub fn analyze_lossy_with_env(
                 if let ast::StmtKind::FunctionDef(f) = &stmt.kind {
                     let method_id = scope_stack.alloc_function_id();
                     let sym_id = scope_stack.alloc_symbol_id();
+                    let has_self = f.params.first().is_some_and(|p| p.name == "self");
                     scope_stack.define(Symbol::new(
                         sym_id,
                         f.name.clone(),
                         SymbolKind::Method {
                             id: method_id,
                             param_count: f.params.len(),
-                            has_self: f.params.first().is_some_and(|p| p.name == "self"),
+                            has_self,
                         },
                         f.span,
                     ));
+                    let sig_params = f
+                        .params
+                        .iter()
+                        .skip(usize::from(has_self))
+                        .map(|p| (p.name.clone(), p.default.as_deref().cloned()))
+                        .collect();
+                    type_map.insert_class_method_params(
+                        class.name.clone(),
+                        f.name.clone(),
+                        sig_params,
+                    );
                     method_ids.insert(f.name.clone(), method_id);
                 }
             }
@@ -276,6 +328,9 @@ pub fn analyze_lossy_with_env(
             let mut event_bindings = Vec::new();
             let mut methods = Vec::new();
             let mut init_statements = Vec::new();
+
+            ExprAnalyzer::new(&mut scope_stack, &mut type_map, &mut diagnostics, &env)
+                .pre_upgrade_outer_vars(&decls.remaining_statements);
 
             // 4. PASS 2: Analyze method bodies and event decorators
             for stmt in &decls.remaining_statements {
@@ -318,9 +373,25 @@ pub fn analyze_lossy_with_env(
                         let mut resolved_params = Vec::new();
                         let skip_count =
                             usize::from(f.params.first().is_some_and(|p| p.name == "self"));
+                        let method_context = if is_design_time_method(&f.name) {
+                            ExecutionContext::DesignTime
+                        } else {
+                            ExecutionContext::Runtime
+                        };
 
                         for (idx, param) in f.params.iter().enumerate().skip(skip_count) {
-                            let param_ty = if is_event_handler && idx == 1 {
+                            let default_ty = param.default.as_ref().map(|def_expr| {
+                                let mut def_analyzer = ExprAnalyzer::new(
+                                    &mut scope_stack,
+                                    &mut type_map,
+                                    &mut diagnostics,
+                                    &env,
+                                )
+                                .with_context(method_context);
+                                def_analyzer.infer_expr(def_expr)
+                            });
+
+                            let mut param_ty = if is_event_handler && idx == 1 {
                                 Type::ControlHandle
                             } else if is_event_handler
                                 && idx == 2
@@ -328,8 +399,18 @@ pub fn analyze_lossy_with_env(
                             {
                                 Type::Int
                             } else {
-                                type_from_annotation(param.type_annotation.as_deref(), &env)
+                                type_from_annotation_with_scope(
+                                    param.type_annotation.as_deref(),
+                                    &env,
+                                    &scope_stack,
+                                )
                             };
+                            if param_ty == Type::Any
+                                && let Some(ref dt) = default_ty
+                                && !matches!(dt, Type::Any | Type::None)
+                            {
+                                param_ty = dt.clone();
+                            }
 
                             let param_sym = scope_stack.alloc_symbol_id();
                             type_map.insert_symbol_name(param_sym, param.name.clone());
@@ -346,14 +427,13 @@ pub fn analyze_lossy_with_env(
                             type_map
                                 .insert_resolution(param.span, ResolvedTarget::Local(param_sym));
                             type_map.insert_type(param.span, param_ty);
-                            resolved_params.push((param_sym, param.name.clone()));
+                            resolved_params.push((
+                                param_sym,
+                                param.name.clone(),
+                                param.default.as_deref().cloned(),
+                            ));
                         }
 
-                        let method_context = if is_design_time_method(&f.name) {
-                            ExecutionContext::DesignTime
-                        } else {
-                            ExecutionContext::Runtime
-                        };
                         let mut analyzer = ExprAnalyzer::new(
                             &mut scope_stack,
                             &mut type_map,
@@ -365,7 +445,11 @@ pub fn analyze_lossy_with_env(
 
                         scope_stack.pop_scope();
 
-                        let mut ret_ty = type_from_annotation(f.return_type.as_deref(), &env);
+                        let mut ret_ty = type_from_annotation_with_scope(
+                            f.return_type.as_deref(),
+                            &env,
+                            &scope_stack,
+                        );
                         if ret_ty == Type::Any
                             && let Some(ret_expr) = analyzer::find_first_return_expr(&f.body)
                             && let Some(inferred) = type_map.get_type(ret_expr.span)
@@ -462,16 +546,28 @@ pub fn analyze_lossy_with_env(
                 if let ast::StmtKind::FunctionDef(f) = &stmt.kind {
                     let method_id = scope_stack.alloc_function_id();
                     let sym_id = scope_stack.alloc_symbol_id();
+                    let has_self = f.params.first().is_some_and(|p| p.name == "self");
                     scope_stack.define(Symbol::new(
                         sym_id,
                         f.name.clone(),
                         SymbolKind::Method {
                             id: method_id,
                             param_count: f.params.len(),
-                            has_self: f.params.first().is_some_and(|p| p.name == "self"),
+                            has_self,
                         },
                         f.span,
                     ));
+                    let sig_params = f
+                        .params
+                        .iter()
+                        .skip(usize::from(has_self))
+                        .map(|p| (p.name.clone(), p.default.as_deref().cloned()))
+                        .collect();
+                    type_map.insert_class_method_params(
+                        class.name.clone(),
+                        f.name.clone(),
+                        sig_params,
+                    );
                     method_ids.insert(f.name.clone(), method_id);
                 }
             }
@@ -479,6 +575,9 @@ pub fn analyze_lossy_with_env(
             let mut event_bindings = Vec::new();
             let mut methods = Vec::new();
             let mut init_statements = Vec::new();
+
+            ExprAnalyzer::new(&mut scope_stack, &mut type_map, &mut diagnostics, &env)
+                .pre_upgrade_outer_vars(&decls.remaining_statements);
 
             for stmt in &decls.remaining_statements {
                 match &stmt.kind {
@@ -522,7 +621,18 @@ pub fn analyze_lossy_with_env(
                             usize::from(f.params.first().is_some_and(|p| p.name == "self"));
 
                         for (idx, param) in f.params.iter().enumerate().skip(skip_count) {
-                            let param_ty = if is_event_handler && idx == 1 {
+                            let default_ty = param.default.as_ref().map(|def_expr| {
+                                let mut def_analyzer = ExprAnalyzer::new(
+                                    &mut scope_stack,
+                                    &mut type_map,
+                                    &mut diagnostics,
+                                    &env,
+                                )
+                                .with_context(ExecutionContext::Runtime);
+                                def_analyzer.infer_expr(def_expr)
+                            });
+
+                            let mut param_ty = if is_event_handler && idx == 1 {
                                 Type::ControlHandle
                             } else if is_event_handler
                                 && idx == 2
@@ -530,8 +640,18 @@ pub fn analyze_lossy_with_env(
                             {
                                 Type::Int
                             } else {
-                                type_from_annotation(param.type_annotation.as_deref(), &env)
+                                type_from_annotation_with_scope(
+                                    param.type_annotation.as_deref(),
+                                    &env,
+                                    &scope_stack,
+                                )
                             };
+                            if param_ty == Type::Any
+                                && let Some(ref dt) = default_ty
+                                && !matches!(dt, Type::Any | Type::None)
+                            {
+                                param_ty = dt.clone();
+                            }
 
                             let param_sym = scope_stack.alloc_symbol_id();
                             type_map.insert_symbol_name(param_sym, param.name.clone());
@@ -548,7 +668,11 @@ pub fn analyze_lossy_with_env(
                             type_map
                                 .insert_resolution(param.span, ResolvedTarget::Local(param_sym));
                             type_map.insert_type(param.span, param_ty);
-                            resolved_params.push((param_sym, param.name.clone()));
+                            resolved_params.push((
+                                param_sym,
+                                param.name.clone(),
+                                param.default.as_deref().cloned(),
+                            ));
                         }
 
                         let mut analyzer = ExprAnalyzer::new(
@@ -562,7 +686,11 @@ pub fn analyze_lossy_with_env(
 
                         scope_stack.pop_scope();
 
-                        let mut ret_ty = type_from_annotation(f.return_type.as_deref(), &env);
+                        let mut ret_ty = type_from_annotation_with_scope(
+                            f.return_type.as_deref(),
+                            &env,
+                            &scope_stack,
+                        );
                         if ret_ty == Type::Any
                             && let Some(ret_expr) = analyzer::find_first_return_expr(&f.body)
                             && let Some(inferred) = type_map.get_type(ret_expr.span)
@@ -655,7 +783,7 @@ pub fn analyze_lossy_with_env(
                                     _ => None,
                                 })
                                 .unwrap_or(SymbolId(0));
-                            (sym_id, p.name.clone())
+                            (sym_id, p.name.clone(), p.default.as_deref().cloned())
                         })
                         .collect();
                     methods.push(ResolvedMethod {

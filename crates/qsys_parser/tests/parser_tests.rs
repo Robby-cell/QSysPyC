@@ -221,7 +221,7 @@ fn test_parse_binary_and_unary_expressions() {
     let module = parse_str(src).expect("Arithmetic should parse");
 
     match &module.statements[0].kind {
-        StmtKind::Assign { target, value } => {
+        StmtKind::Assign { target, value, .. } => {
             assert!(matches!(target.kind, ExprKind::Ident(ref id) if id == "x"));
             match &value.kind {
                 ExprKind::Binary { op, right, .. } => {

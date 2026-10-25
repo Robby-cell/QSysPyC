@@ -174,6 +174,19 @@ impl ScopeStack {
     }
 
     /// Collects all symbol names visible from the current innermost scope up to the root.
+    pub fn update_variable_type(&mut self, target_id: SymbolId, new_ty: Type) {
+        for scope in self.scopes.iter_mut().rev() {
+            for symbol in scope.symbols.values_mut() {
+                if symbol.id == target_id
+                    && let SymbolKind::Variable { ty, .. } = &mut symbol.kind
+                {
+                    *ty = new_ty;
+                    return;
+                }
+            }
+        }
+    }
+
     pub fn all_visible_names(&self) -> Vec<String> {
         let mut names = Vec::new();
         for scope in self.scopes.iter().rev() {

@@ -183,7 +183,7 @@ impl Analyzer {
                 let params_str = method
                     .params
                     .iter()
-                    .map(|(_, n)| n.as_str())
+                    .map(|(_, n, _)| n.as_str())
                     .collect::<Vec<_>>()
                     .join(", ");
                 return Some(LspHover {
@@ -457,7 +457,7 @@ impl Analyzer {
                         let params_str = method
                             .params
                             .iter()
-                            .map(|(_, n)| n.as_str())
+                            .map(|(_, n, _)| n.as_str())
                             .collect::<Vec<_>>()
                             .join(", ");
                         let call_snippet = if method.params.is_empty() {
@@ -854,7 +854,7 @@ impl Analyzer {
                     let params: Vec<LspParameterInfo> = m
                         .params
                         .iter()
-                        .map(|(_, name)| LspParameterInfo {
+                        .map(|(_, name, _)| LspParameterInfo {
                             label: name.clone(),
                             documentation: format!("Parameter `{name}` of `{method_name}`."),
                         })
@@ -944,7 +944,14 @@ fn collect_stmt_inlay_hints(
 ) {
     for stmt in stmts {
         match &stmt.kind {
-            ast::StmtKind::Assign { target, value } => {
+            ast::StmtKind::Assign {
+                target,
+                value,
+                type_annotation,
+            } => {
+                if type_annotation.is_some() {
+                    continue;
+                }
                 let is_obvious_literal = matches!(
                     value.kind,
                     ast::ExprKind::Int(_)
@@ -1071,11 +1078,21 @@ fn find_assigned_type_in_module(
 ) -> Option<Type> {
     for stmt in stmts {
         match &stmt.kind {
-            ast::StmtKind::Assign { target, value } => {
+            ast::StmtKind::Assign {
+                target,
+                value,
+                type_annotation,
+            } => {
                 if let ast::ExprKind::Ident(name) = &target.kind
                     && name == var_name
-                    && let ast::ExprKind::Call { callee, .. } = &value.kind
                 {
+                    if let Some(ann) = type_annotation
+                        && ann.chars().next().is_some_and(char::is_uppercase)
+                        && !matches!(ann.as_str(), "Any" | "None" | "ControlHandle" | "PropertyHandle")
+                    {
+                        return Some(Type::UserInstance { name: ann.clone() });
+                    }
+                    if let ast::ExprKind::Call { callee, .. } = &value.kind {
                     if let ast::ExprKind::Attribute { value: recv, attr } = &callee.kind
                         && let ast::ExprKind::Ident(global_name) = &recv.kind
                     {
@@ -1098,6 +1115,7 @@ fn find_assigned_type_in_module(
                         return Some(Type::UserInstance {
                             name: cls_name.clone(),
                         });
+                    }
                     }
                 }
             }
@@ -1737,6 +1755,10 @@ fn control_member_doc(name: &str) -> (&'static str, &'static str) {
         "Strings" => (
             "list[str]",
             "Array of text strings for multi-channel controls.",
+        ),
+        "Choices" => (
+            "list[str]",
+            "List of selectable string options for combo box or list box controls.",
         ),
         "EventHandler" => (
             "Callable[..., Any]",

@@ -499,6 +499,18 @@ impl<'a> LuaEmitter<'a> {
         }
     }
 
+    pub fn emit_param_defaults(&mut self, params: &[IRParam]) {
+        for param in params {
+            if let Some(ref def_expr) = param.default {
+                let def_str = self.emit_expr(def_expr);
+                self.write_line(&format!(
+                    "if {} == nil then {} = {def_str} end",
+                    param.name, param.name
+                ));
+            }
+        }
+    }
+
     pub fn emit_function_def(&mut self, f: &IRFunction, already_declared: bool) {
         self.ctx.functions.insert(f.id, f.name.clone());
         for param in &f.params {
@@ -515,6 +527,7 @@ impl<'a> LuaEmitter<'a> {
             self.write_line(&format!("local function {}({})", f.name, param_str));
         }
         self.indent();
+        self.emit_param_defaults(&f.params);
         self.emit_statements(&f.body);
         self.dedent();
         self.write_line("end\n");
@@ -803,7 +816,8 @@ impl<'a> LuaEmitter<'a> {
                 index,
                 is_zero_based,
             } => {
-                if *is_zero_based
+                let zero_based = *is_zero_based && !matches!(index.as_ref(), IRExpr::String(_));
+                if zero_based
                     && let IRExpr::Control(ctl_id) = base.as_ref()
                     && let Some(def) = self.ctx.controls.get(ctl_id).cloned()
                     && let Some(ref prop_name) = def.count_property
@@ -816,7 +830,7 @@ impl<'a> LuaEmitter<'a> {
                 }
 
                 let base_str = self.emit_expr(base);
-                if *is_zero_based {
+                if zero_based {
                     let idx_1 = self.format_one_based_index(index);
                     format!("{base_str}[{idx_1}]")
                 } else {
@@ -877,6 +891,7 @@ impl<'a> LuaEmitter<'a> {
         if cls.emit_init_method {
             self.write_line(&format!("self:__init({ctor_params})"));
         } else if let Some(ref ctor) = cls.constructor {
+            self.emit_param_defaults(&ctor.params);
             self.emit_statements(&ctor.body);
         }
         self.write_line("return self");
@@ -887,6 +902,7 @@ impl<'a> LuaEmitter<'a> {
             self.write_line(&format!("function {name}:__init({ctor_params})"));
             self.indent();
             if let Some(ref ctor) = cls.constructor {
+                self.emit_param_defaults(&ctor.params);
                 self.emit_statements(&ctor.body);
             }
             self.dedent();
@@ -912,6 +928,7 @@ impl<'a> LuaEmitter<'a> {
             };
             self.write_line(&format!("function {name}:{lua_method_name}({params})"));
             self.indent();
+            self.emit_param_defaults(&method.params);
             self.emit_statements(&method.body);
             self.dedent();
             self.write_line("end\n");

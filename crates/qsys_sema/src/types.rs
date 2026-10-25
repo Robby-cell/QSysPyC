@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 
 use qsys_diagnostics::Span;
 use qsys_ir::{ControlId, FunctionId, PropertyId, SymbolId};
+use qsys_parser::ast::Expr as AstExpr;
 use qsys_runtime::TypeRef;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -119,6 +120,8 @@ pub struct TypeMap {
     module_member_types: FxHashMap<(String, String), Type>,
     known_modules: FxHashSet<String>,
     function_return_types: FxHashMap<String, Type>,
+    function_params: FxHashMap<String, Vec<(String, Option<AstExpr>)>>,
+    class_method_params: FxHashMap<(String, String), Vec<(String, Option<AstExpr>)>>,
 }
 
 impl TypeMap {
@@ -199,6 +202,50 @@ impl TypeMap {
 
     pub fn get_function_return_type(&self, fn_name: &str) -> Option<&Type> {
         self.function_return_types.get(fn_name)
+    }
+
+    pub fn insert_function_params(
+        &mut self,
+        fn_name: impl Into<String>,
+        params: Vec<(String, Option<AstExpr>)>,
+    ) {
+        self.function_params.insert(fn_name.into(), params);
+    }
+
+    pub fn get_function_params(&self, fn_name: &str) -> Option<&[(String, Option<AstExpr>)]> {
+        self.function_params.get(fn_name).map(Vec::as_slice)
+    }
+
+    pub fn insert_class_method_params(
+        &mut self,
+        class_name: impl Into<String>,
+        method_name: impl Into<String>,
+        params: Vec<(String, Option<AstExpr>)>,
+    ) {
+        self.class_method_params
+            .insert((class_name.into(), method_name.into()), params);
+    }
+
+    pub fn get_class_method_params(
+        &self,
+        class_name: &str,
+        method_name: &str,
+    ) -> Option<&[(String, Option<AstExpr>)]> {
+        let mut current = class_name;
+        for _ in 0..16 {
+            if let Some(params) = self
+                .class_method_params
+                .get(&(current.to_string(), method_name.to_string()))
+            {
+                return Some(params.as_slice());
+            }
+            if let Some(base) = self.class_bases.get(current) {
+                current = base;
+            } else {
+                break;
+            }
+        }
+        None
     }
 
     pub fn register_module(&mut self, mod_name: impl Into<String>) {

@@ -1230,3 +1230,102 @@ class Funnel(QSysPlugin):
         panic!("Expected IRProgram::Plugin");
     }
 }
+
+#[test]
+fn test_debugger_class_typed_none_defaults_kwargs_and_choices() {
+    let src = r#"
+from qsys import Control, ControlHandle, QSysPlugin
+
+class Debugger:
+    def __init__(self, disp: ControlHandle, clear: ControlHandle, limit: int = 10) -> None:
+        self.history = []
+        self.disp_ctl = disp
+        self.clear_ctl = clear
+        self.limit = limit
+
+        self.disp_ctl.Choices = self.history
+        self.clear_ctl.EventHandler = lambda ctl: self.clear()
+
+    def add_to_history(self, message: str, prefix: str = "LOG") -> None:
+        self.history.insert(0, prefix + ": " + message)
+
+        while len(self.history) > self.limit:
+            self.history.pop()
+
+        self.disp_ctl.Choices = self.history
+        self.disp_ctl["Choices"] = self.history
+        self.disp_ctl.String = message
+
+    def clear(self) -> None:
+        self.history = []
+        self.disp_ctl.Choices = self.history
+        self.disp_ctl.String = ""
+
+debugger: Debugger = None
+
+class MyPlugin(QSysPlugin):
+    Disp = Control.Text(name="Disp")
+    Clear = Control.Button(name="Clear")
+    Trig = Control.Button(name="Trig")
+
+    @Trig.EventHandler
+    def on_trig(self, ctl: ControlHandle) -> None:
+        debugger.add_to_history("Triggered", prefix="EVT")
+
+    def runtime(self) -> None:
+        debugger = Debugger(self.Disp, self.Clear, limit=25)
+        debugger.add_to_history("Started")
+"#;
+
+    let lua = compile_to_lua(src);
+
+    // 1. Default parameter values emit `if <param> == nil then <param> = <default> end`
+    assert!(
+        lua.contains("function Debugger.new(disp, clear, limit)")
+            && lua.contains("if limit == nil then limit = 10 end"),
+        "Constructor default parameter `limit: int = 10` must emit nil guard:\n{lua}"
+    );
+    assert!(
+        lua.contains("function Debugger:add_to_history(message, prefix)")
+            && lua.contains("if prefix == nil then prefix = \"LOG\" end"),
+        "Method default parameter `prefix: str = \"LOG\"` must emit nil guard:\n{lua}"
+    );
+
+    // 2. Keyword arguments to user constructors/methods bind positionally instead of `{ limit = 25 }`
+    assert!(
+        lua.contains("debugger = Debugger.new(Controls[\"Disp\"], Controls[\"Clear\"], 25)"),
+        "Keyword argument `limit=25` on constructor must resolve positionally:\n{lua}"
+    );
+    assert!(
+        lua.contains("debugger:add_to_history(\"Triggered\", \"EVT\")"),
+        "Keyword argument `prefix=\"EVT\"` and colon call on `debugger: Debugger = None` must work:\n{lua}"
+    );
+    assert!(
+        !lua.contains("{ limit =") && !lua.contains("{ prefix ="),
+        "User calls must not emit Lua table kwargs:\n{lua}"
+    );
+
+    // 3. `debugger: Debugger = None` preserves `Debugger` instance type across methods so calls use `:`
+    assert!(
+        lua.contains("debugger:add_to_history(\"Started\")"),
+        "`debugger.add_to_history` must dispatch with `:` instead of `.`:\n{lua}"
+    );
+    assert!(
+        !lua.contains("debugger.add_to_history("),
+        "`debugger.add_to_history` must not dispatch with `.`:\n{lua}"
+    );
+
+    // 4. `.Choices` and `["Choices"]` on `ControlHandle` emit cleanly without `+ 1`
+    assert!(
+        lua.contains("self.disp_ctl.Choices = self.history"),
+        "`self.disp_ctl.Choices` must be supported on ControlHandle:\n{lua}"
+    );
+    assert!(
+        lua.contains("self.disp_ctl[\"Choices\"] = self.history"),
+        "String subscript `self.disp_ctl[\"Choices\"]` must not add + 1:\n{lua}"
+    );
+    assert!(
+        !lua.contains("[\"Choices\" + 1]") && !lua.contains("[(\"Choices\") + 1]"),
+        "String subscript on ControlHandle must never emit + 1:\n{lua}"
+    );
+}

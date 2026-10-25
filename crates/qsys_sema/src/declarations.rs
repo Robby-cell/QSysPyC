@@ -198,7 +198,7 @@ pub fn extract_class_declarations_with_module(
 
     for stmt in &class.body {
         match &stmt.kind {
-            ast::StmtKind::Assign { target, value } => {
+            ast::StmtKind::Assign { target, value, .. } => {
                 let var_name = match &target.kind {
                     ast::ExprKind::Ident(name) => name.clone(),
                     _ => {

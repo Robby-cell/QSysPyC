@@ -52,6 +52,7 @@ pub fn emit_script(script: &IRScript, ctx: &mut CodegenContext) -> String {
             param_names.join(", ")
         ));
         emitter.indent();
+        emitter.emit_param_defaults(&func.params);
         emitter.emit_statements(&func.body);
         emitter.dedent();
         emitter.write_line("end\n");

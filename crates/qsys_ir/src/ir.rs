@@ -79,10 +79,11 @@ pub struct IREventBinding {
     pub span: Span,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IRParam {
     pub id: SymbolId,
     pub name: String,
+    pub default: Option<IRExpr>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

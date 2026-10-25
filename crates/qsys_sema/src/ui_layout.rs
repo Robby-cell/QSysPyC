@@ -51,7 +51,7 @@ impl<'a> UiResolveEnv<'a> {
                 ast::StmtKind::FunctionDef(f) => {
                     env.module_functions.insert(f.name.clone(), f.clone());
                 }
-                ast::StmtKind::Assign { target, value } => {
+                ast::StmtKind::Assign { target, value, .. } => {
                     if let ast::ExprKind::Ident(name) = &target.kind
                         && let Some(val) = eval_constant_with_env(value, &env.constants)
                             .or_else(|| eval_constant(value))
@@ -68,7 +68,7 @@ impl<'a> UiResolveEnv<'a> {
                 ast::StmtKind::FunctionDef(f) => {
                     env.class_methods.insert(f.name.clone(), f.clone());
                 }
-                ast::StmtKind::Assign { target, value } => {
+                ast::StmtKind::Assign { target, value, .. } => {
                     if let ast::ExprKind::Ident(name) = &target.kind
                         && let Some(val) = eval_constant_with_env(value, &env.constants)
                             .or_else(|| eval_constant(value))
@@ -283,7 +283,7 @@ pub fn extract_declarative_layout_from_method(body: &[ast::Stmt]) -> Option<ast:
                     top_ui_exprs.push(appended);
                 }
             }
-            ast::StmtKind::Assign { target, value } => {
+            ast::StmtKind::Assign { target, value, .. } => {
                 if is_empty_layout_init(target, value) {
                     continue;
                 }
@@ -344,7 +344,7 @@ pub fn collect_inline_ui_pages_from_stmts(
             ast::StmtKind::FunctionDef(f) => {
                 env.local_functions.insert(f.name.clone(), f.clone());
             }
-            ast::StmtKind::Assign { target, value } => {
+            ast::StmtKind::Assign { target, value, .. } => {
                 let sub_val = substitute_ui_vars(value, local_ui_vars);
                 if is_ui_layout_expr(&sub_val) {
                     if !is_layout_target(target)
@@ -1522,7 +1522,7 @@ impl<'a> UiParserCtx<'a> {
             match &stmt.kind {
                 ast::StmtKind::Pass => {}
                 ast::StmtKind::Expr(e) if matches!(e.kind, ast::ExprKind::String(_)) => {}
-                ast::StmtKind::Assign { target, value } => {
+                ast::StmtKind::Assign { target, value, .. } => {
                     let val = self.eval_preview_expr(value, vars, depth)?;
                     match &target.kind {
                         ast::ExprKind::Ident(name) => {
