@@ -239,7 +239,8 @@ pub fn analyze_lossy_with_env(
         };
         let mut module_analyzer =
             ExprAnalyzer::new(&mut scope_stack, &mut type_map, &mut diagnostics, &env)
-                .with_context(module_context);
+                .with_context(module_context)
+                .with_all_module_stmts(&parsed.module.statements);
         module_analyzer.analyze_statements(&module_statements);
     }
 

@@ -1036,7 +1036,7 @@ fn infer_receiver_type(
             for (&span, target) in model.type_map.resolutions() {
                 if *target == qsys_sema::ResolvedTarget::Local(sym_id)
                     && let Some(ty) = model.type_map.get_type(span)
-                    && *ty != Type::Any
+                    && !matches!(ty, Type::Any | Type::None)
                 {
                     return Some(ty.clone());
                 }
@@ -1088,34 +1088,37 @@ fn find_assigned_type_in_module(
                 {
                     if let Some(ann) = type_annotation
                         && ann.chars().next().is_some_and(char::is_uppercase)
-                        && !matches!(ann.as_str(), "Any" | "None" | "ControlHandle" | "PropertyHandle")
+                        && !matches!(
+                            ann.as_str(),
+                            "Any" | "None" | "ControlHandle" | "PropertyHandle"
+                        )
                     {
                         return Some(Type::UserInstance { name: ann.clone() });
                     }
                     if let ast::ExprKind::Call { callee, .. } = &value.kind {
-                    if let ast::ExprKind::Attribute { value: recv, attr } = &callee.kind
-                        && let ast::ExprKind::Ident(global_name) = &recv.kind
-                    {
-                        // `X.factory()` on a runtime global, e.g. `UdpSocket.New()`
-                        if let Some(Function {
-                            returns: Returns::Type(ret),
-                            ..
-                        }) = env
-                            .object_type_of_global(global_name)
-                            .and_then(|ty| ty.get_method(attr))
+                        if let ast::ExprKind::Attribute { value: recv, attr } = &callee.kind
+                            && let ast::ExprKind::Ident(global_name) = &recv.kind
                         {
-                            let ty = Type::from_ref(ret);
-                            if ty != Type::Any {
-                                return Some(ty);
+                            // `X.factory()` on a runtime global, e.g. `UdpSocket.New()`
+                            if let Some(Function {
+                                returns: Returns::Type(ret),
+                                ..
+                            }) = env
+                                .object_type_of_global(global_name)
+                                .and_then(|ty| ty.get_method(attr))
+                            {
+                                let ty = Type::from_ref(ret);
+                                if ty != Type::Any {
+                                    return Some(ty);
+                                }
                             }
+                        } else if let ast::ExprKind::Ident(cls_name) = &callee.kind
+                            && cls_name.chars().next().is_some_and(char::is_uppercase)
+                        {
+                            return Some(Type::UserInstance {
+                                name: cls_name.clone(),
+                            });
                         }
-                    } else if let ast::ExprKind::Ident(cls_name) = &callee.kind
-                        && cls_name.chars().next().is_some_and(char::is_uppercase)
-                    {
-                        return Some(Type::UserInstance {
-                            name: cls_name.clone(),
-                        });
-                    }
                     }
                 }
             }

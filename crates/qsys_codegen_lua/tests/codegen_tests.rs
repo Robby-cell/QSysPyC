@@ -1329,3 +1329,78 @@ class MyPlugin(QSysPlugin):
         "String subscript on ControlHandle must never emit + 1:\n{lua}"
     );
 }
+
+#[test]
+fn test_global_keyword_in_plugin_and_functions() {
+    let src = r#"
+from qsys import Control, ControlHandle, Property, QSysPlugin
+
+active_track = 0
+
+class Debugger:
+    def __init__(self, disp: ControlHandle) -> None:
+        self.disp = disp
+
+    def log(self, msg: str) -> None:
+        self.disp.String = msg
+
+def log_helper(msg: str) -> None:
+    debugger.log(msg)
+
+class Funnel(QSysPlugin):
+    InputsPerTrack = Property.Integer(name="Inputs Per Track", default=2, min=1, max=100)
+    Inputs = Control.Button(name="Inputs", count=4)
+    Disp = Control.Text(name="Disp")
+
+    def calculate_track_and_index(self, raw: int) -> (int, int):
+        cnt = self.InputsPerTrack.Value
+        return raw // cnt, raw % cnt
+
+    @Inputs.EventHandler
+    def on_inputs(self, ctl: ControlHandle, raw_idx: int) -> None:
+        global active_track, last_idx
+        active_track, last_idx = self.calculate_track_and_index(raw_idx)
+        active_track += 1
+        debugger.log("Triggered")
+        log_helper("Done")
+
+    def runtime(self) -> None:
+        global debugger
+        debugger = Debugger(self.Disp)
+"#;
+
+    let lua = compile_to_lua(src);
+
+    // 1. `active_track` is declared at module level; `debugger` and `last_idx` are declared via `global` inside methods
+    //    and must be hoisted as top-level `local ... = nil` before functions/methods.
+    assert!(
+        lua.contains("local active_track = 0"),
+        "Module-level `active_track = 0` must be emitted as `local active_track = 0`:\n{lua}"
+    );
+    assert!(
+        lua.contains("local last_idx = nil") && lua.contains("local debugger = nil"),
+        "Globals introduced only via `global` inside methods (`last_idx`, `debugger`) must be hoisted as top-level `local <name> = nil`:\n{lua}"
+    );
+
+    // 2. Inside `on_inputs`, `active_track, last_idx = ...` and `active_track += 1` must assign to the globals (no `local`)
+    assert!(
+        lua.contains("active_track, last_idx = Funnel_calculate_track_and_index(nil, raw_idx)")
+            && !lua.contains("local active_track, last_idx"),
+        "Tuple assignment to `global active_track, last_idx` must update module-level globals without `local`:\n{lua}"
+    );
+    assert!(
+        lua.contains("active_track = (active_track + 1)"),
+        "Augmented assignment on `global active_track` must update module-level global:\n{lua}"
+    );
+
+    // 3. `debugger` initialized via `global debugger` in `runtime(self)` must infer `Debugger` type in `on_inputs` and `log_helper`
+    assert!(
+        lua.contains("debugger = Debugger.new(Controls[\"Disp\"])")
+            && !lua.contains("local debugger = Debugger.new"),
+        "`debugger = Debugger(...)` inside `runtime` with `global debugger` must not redeclare `local`:\n{lua}"
+    );
+    assert!(
+        lua.contains("debugger:log(\"Triggered\")") && lua.contains("debugger:log(msg)"),
+        "Both `on_inputs` (defined before `runtime`) and `log_helper` (top-level function) must infer `debugger` as `Debugger` and use `:`:\n{lua}"
+    );
+}

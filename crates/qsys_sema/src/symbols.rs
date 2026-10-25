@@ -1,4 +1,4 @@
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use qsys_diagnostics::Span;
 use qsys_ir::{ControlId, FunctionId, PropertyId, SymbolId};
@@ -73,6 +73,7 @@ pub enum ScopeKind {
 pub struct Scope {
     pub kind: ScopeKind,
     pub symbols: FxHashMap<String, Symbol>,
+    pub explicit_globals: FxHashSet<String>,
 }
 
 impl Scope {
@@ -80,6 +81,7 @@ impl Scope {
         Self {
             kind,
             symbols: FxHashMap::default(),
+            explicit_globals: FxHashSet::default(),
         }
     }
 }
@@ -165,6 +167,11 @@ impl ScopeStack {
     }
 
     pub fn lookup(&self, name: &str) -> Option<&Symbol> {
+        if self.is_explicit_global(name)
+            && let Some(sym) = self.lookup_in_module(name)
+        {
+            return Some(sym);
+        }
         for scope in self.scopes.iter().rev() {
             if let Some(symbol) = scope.symbols.get(name) {
                 return Some(symbol);
@@ -173,15 +180,106 @@ impl ScopeStack {
         None
     }
 
-    /// Collects all symbol names visible from the current innermost scope up to the root.
+    pub fn is_explicit_global(&self, name: &str) -> bool {
+        for scope in self.scopes.iter().rev() {
+            if scope.explicit_globals.contains(name) {
+                return true;
+            }
+            if matches!(
+                scope.kind,
+                ScopeKind::Function { .. } | ScopeKind::Class { .. } | ScopeKind::Module
+            ) {
+                break;
+            }
+        }
+        false
+    }
+
+    pub fn lookup_in_module(&self, name: &str) -> Option<&Symbol> {
+        let mod_idx = self
+            .scopes
+            .iter()
+            .rposition(|s| matches!(s.kind, ScopeKind::Module))
+            .unwrap_or(0);
+        self.scopes[mod_idx].symbols.get(name)
+    }
+
+    pub fn define_or_lookup_global(&mut self, name: &str, span: Span) -> (SymbolId, Type) {
+        let in_fn_or_block = matches!(
+            self.current_scope().kind,
+            ScopeKind::Function { .. } | ScopeKind::Block
+        );
+        if in_fn_or_block {
+            self.current_scope_mut()
+                .explicit_globals
+                .insert(name.to_string());
+        }
+
+        let mod_idx = self
+            .scopes
+            .iter()
+            .rposition(|s| matches!(s.kind, ScopeKind::Module))
+            .unwrap_or(0);
+
+        let (sym_id, ty) = if let Some(existing) = self.scopes[mod_idx].symbols.get(name) {
+            match &existing.kind {
+                SymbolKind::Variable { id, ty } | SymbolKind::Parameter { id, ty, .. } => {
+                    (*id, ty.clone())
+                }
+                _ => (existing.id, Type::Any),
+            }
+        } else {
+            let sym_id = self.alloc_symbol_id();
+            self.scopes[mod_idx].symbols.insert(
+                name.to_string(),
+                Symbol::new(
+                    sym_id,
+                    name.to_string(),
+                    SymbolKind::Variable {
+                        id: sym_id,
+                        ty: Type::Any,
+                    },
+                    span,
+                ),
+            );
+            (sym_id, Type::Any)
+        };
+
+        if in_fn_or_block && self.scopes.len() - 1 != mod_idx {
+            self.current_scope_mut().symbols.insert(
+                name.to_string(),
+                Symbol::new(
+                    sym_id,
+                    name.to_string(),
+                    SymbolKind::Variable {
+                        id: sym_id,
+                        ty: ty.clone(),
+                    },
+                    span,
+                ),
+            );
+        }
+
+        (sym_id, ty)
+    }
+
+    pub fn lookup_nonlocal(&self, name: &str) -> Option<&Symbol> {
+        for scope in self.scopes.iter().rev().skip(1) {
+            if let Some(symbol) = scope.symbols.get(name) {
+                return Some(symbol);
+            }
+        }
+        None
+    }
+
+    /// Updates the variable type across all scopes containing `target_id`.
     pub fn update_variable_type(&mut self, target_id: SymbolId, new_ty: Type) {
         for scope in self.scopes.iter_mut().rev() {
             for symbol in scope.symbols.values_mut() {
                 if symbol.id == target_id
                     && let SymbolKind::Variable { ty, .. } = &mut symbol.kind
                 {
-                    *ty = new_ty;
-                    return;
+                    *ty = new_ty.clone();
                 }
             }
         }

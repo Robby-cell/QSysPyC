@@ -101,6 +101,8 @@ pub fn lower_to_ir(model: &SemanticModel) -> IRProgram {
                 .collect();
 
             let symbol_names = model.type_map.symbol_names().clone();
+            let mut top_level_stmts = lowerer.lower_statements(&p.module_statements);
+            prepend_unassigned_globals(&mut top_level_stmts, &lowerer.declared_globals);
 
             IRProgram::Plugin(Box::new(IRPlugin {
                 info: p.info.clone(),
@@ -113,7 +115,7 @@ pub fn lower_to_ir(model: &SemanticModel) -> IRProgram {
                 event_bindings,
                 init_body,
                 symbol_names,
-                top_level_stmts: lowerer.lower_statements(&p.module_statements),
+                top_level_stmts,
                 span: p.span,
             }))
         }
@@ -140,8 +142,9 @@ pub fn lower_to_ir(model: &SemanticModel) -> IRProgram {
                 .map(|m| lowerer.lower_function(m.id, &m.name, &m.params, &m.body, m.span))
                 .collect();
 
-            let top_level_stmts = lowerer.lower_statements(&c.module_statements);
+            let mut top_level_stmts = lowerer.lower_statements(&c.module_statements);
             let body = lowerer.lower_statements(&c.init_statements);
+            prepend_unassigned_globals(&mut top_level_stmts, &lowerer.declared_globals);
 
             let event_bindings = c
                 .event_bindings
@@ -204,7 +207,8 @@ pub fn lower_to_ir(model: &SemanticModel) -> IRProgram {
                 .iter()
                 .map(|m| lowerer.lower_function(m.id, &m.name, &m.params, &m.body, m.span))
                 .collect();
-            let body = lowerer.lower_statements(&s.statements);
+            let mut body = lowerer.lower_statements(&s.statements);
+            prepend_unassigned_globals(&mut body, &lowerer.declared_globals);
 
             IRProgram::Script(Box::new(IRScript {
                 name: "main".to_string(),
@@ -232,6 +236,7 @@ struct StmtLowerer<'a> {
     custom_classes: &'a [ast::ClassDef],
     current_class_base: Option<String>,
     local_ui_vars: FxHashMap<String, ast::Expr>,
+    declared_globals: Vec<(SymbolId, String, qsys_diagnostics::Span)>,
     ui_env: UiResolveEnv<'a>,
 }
 
@@ -253,6 +258,7 @@ impl<'a> StmtLowerer<'a> {
             custom_classes,
             current_class_base: None,
             local_ui_vars: FxHashMap::default(),
+            declared_globals: Vec::new(),
             ui_env,
         }
     }
@@ -522,7 +528,25 @@ impl<'a> StmtLowerer<'a> {
                 }
             }
 
-            ast::StmtKind::Pass | ast::StmtKind::ImportFrom { .. } => None,
+            ast::StmtKind::Global(names) => {
+                for (name, name_span) in names {
+                    if let Some(ResolvedTarget::Local(sym_id)) =
+                        self.type_map.get_resolution(*name_span)
+                        && !self
+                            .declared_globals
+                            .iter()
+                            .any(|(id, _, _)| *id == *sym_id)
+                    {
+                        self.declared_globals
+                            .push((*sym_id, name.clone(), *name_span));
+                    }
+                }
+                None
+            }
+
+            ast::StmtKind::Pass | ast::StmtKind::Nonlocal(_) | ast::StmtKind::ImportFrom { .. } => {
+                None
+            }
 
             ast::StmtKind::Import { module, alias } => {
                 if module == "qsys" || module.starts_with("qsys.") {
@@ -548,7 +572,11 @@ impl<'a> StmtLowerer<'a> {
             }
 
             ast::StmtKind::ModuleDef { name, body, .. } => {
-                let lowered_body = self.lower_statements(body);
+                let outer_globals = std::mem::take(&mut self.declared_globals);
+                let mut lowered_body = self.lower_statements(body);
+                let mod_globals = std::mem::replace(&mut self.declared_globals, outer_globals);
+                prepend_unassigned_globals(&mut lowered_body, &mod_globals);
+
                 let mut exports = Vec::new();
                 for s in body {
                     match &s.kind {
@@ -566,6 +594,11 @@ impl<'a> StmtLowerer<'a> {
                             collect_exported_target_names(target, &mut exports);
                         }
                         _ => {}
+                    }
+                }
+                for (_, g_name, _) in &mod_globals {
+                    if !exports.contains(g_name) {
+                        exports.push(g_name.clone());
                     }
                 }
                 Some(IRStmt::ModuleDef {
@@ -1007,12 +1040,16 @@ impl<'a> StmtLowerer<'a> {
         }
     }
 
+    #[allow(clippy::type_complexity)]
     fn lookup_callable_params(
         &self,
         callee: &ast::Expr,
     ) -> (Option<&[(String, Option<ast::Expr>)]>, bool) {
         if let Some(Type::UserClass { name }) = self.type_map.get_type(callee.span) {
-            return (self.type_map.get_class_method_params(name, "__init__"), true);
+            return (
+                self.type_map.get_class_method_params(name, "__init__"),
+                true,
+            );
         }
         match &callee.kind {
             ast::ExprKind::Attribute { value, attr } => {
@@ -1025,10 +1062,7 @@ impl<'a> StmtLowerer<'a> {
                     && matches!(&super_callee.kind, ast::ExprKind::Ident(id) if id == "super")
                     && let Some(ref base_name) = self.current_class_base
                 {
-                    return (
-                        self.type_map.get_class_method_params(base_name, attr),
-                        true,
-                    );
+                    return (self.type_map.get_class_method_params(base_name, attr), true);
                 }
                 match self.type_map.get_type(value.span) {
                     Some(
@@ -1400,6 +1434,43 @@ fn collect_exported_target_names(target: &ast::Expr, exports: &mut Vec<String>) 
             }
         }
         _ => {}
+    }
+}
+
+fn stmt_assigns_symbol_at_top_level(stmt: &IRStmt, target_id: SymbolId) -> bool {
+    if let IRStmt::Assign { target, .. } = stmt {
+        match target {
+            IRExpr::Local(id) => *id == target_id,
+            IRExpr::Tuple(items) | IRExpr::List(items) => items
+                .iter()
+                .any(|item| matches!(item, IRExpr::Local(id) if *id == target_id)),
+            _ => false,
+        }
+    } else {
+        false
+    }
+}
+
+fn prepend_unassigned_globals(
+    top_stmts: &mut Vec<IRStmt>,
+    globals: &[(SymbolId, String, qsys_diagnostics::Span)],
+) {
+    let mut to_prepend = Vec::new();
+    for (sym_id, _, span) in globals {
+        if !top_stmts
+            .iter()
+            .any(|s| stmt_assigns_symbol_at_top_level(s, *sym_id))
+        {
+            to_prepend.push(IRStmt::Assign {
+                target: IRExpr::Local(*sym_id),
+                value: IRExpr::Nil,
+                span: *span,
+            });
+        }
+    }
+    if !to_prepend.is_empty() {
+        to_prepend.append(top_stmts);
+        *top_stmts = to_prepend;
     }
 }
 

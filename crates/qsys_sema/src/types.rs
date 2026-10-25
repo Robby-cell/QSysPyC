@@ -121,6 +121,7 @@ pub struct TypeMap {
     known_modules: FxHashSet<String>,
     function_return_types: FxHashMap<String, Type>,
     function_params: FxHashMap<String, Vec<(String, Option<AstExpr>)>>,
+    #[allow(clippy::type_complexity)]
     class_method_params: FxHashMap<(String, String), Vec<(String, Option<AstExpr>)>>,
 }
 

@@ -70,6 +70,7 @@ pub struct ExprAnalyzer<'a> {
     pub env: &'a RuntimeEnv,
     /// Execution phase of the code being analyzed, used to enforce global availability.
     pub context: ExecutionContext,
+    pub all_module_stmts: Option<&'a [ast::Stmt]>,
 }
 
 impl<'a> ExprAnalyzer<'a> {
@@ -85,11 +86,17 @@ impl<'a> ExprAnalyzer<'a> {
             diagnostics,
             env,
             context: ExecutionContext::Unknown,
+            all_module_stmts: None,
         }
     }
 
     pub fn with_context(mut self, context: ExecutionContext) -> Self {
         self.context = context;
+        self
+    }
+
+    pub fn with_all_module_stmts(mut self, stmts: &'a [ast::Stmt]) -> Self {
+        self.all_module_stmts = Some(stmts);
         self
     }
 
@@ -128,6 +135,10 @@ impl<'a> ExprAnalyzer<'a> {
             }
         }
         if matches!(self.scope_stack.current_scope().kind, ScopeKind::Module) {
+            self.pre_register_globals(stmts);
+            if let Some(all_stmts) = self.all_module_stmts {
+                self.pre_register_globals(all_stmts);
+            }
             for stmt in stmts {
                 if let ast::StmtKind::Assign {
                     target,
@@ -149,6 +160,9 @@ impl<'a> ExprAnalyzer<'a> {
                 }
             }
             self.pre_upgrade_outer_vars(stmts);
+            if let Some(all_stmts) = self.all_module_stmts {
+                self.pre_upgrade_outer_vars(all_stmts);
+            }
         }
 
         // Pass 3: Analyze ClassDef bodies first so all class/instance attributes and method return types are populated
@@ -206,7 +220,66 @@ impl<'a> ExprAnalyzer<'a> {
         }
     }
 
+    pub fn pre_register_globals(&mut self, stmts: &[ast::Stmt]) {
+        for stmt in stmts {
+            match &stmt.kind {
+                ast::StmtKind::Global(names) => {
+                    for (name, span) in names {
+                        let (sym_id, _) = self.scope_stack.define_or_lookup_global(name, *span);
+                        self.type_map.insert_symbol_name(sym_id, name.clone());
+                    }
+                }
+                ast::StmtKind::FunctionDef(f) => {
+                    self.pre_register_globals(&f.body);
+                }
+                ast::StmtKind::ClassDef(c) => {
+                    self.pre_register_globals(&c.body);
+                }
+                ast::StmtKind::If {
+                    then_branch,
+                    else_branch,
+                    ..
+                } => {
+                    self.pre_register_globals(then_branch);
+                    self.pre_register_globals(else_branch);
+                }
+                ast::StmtKind::While { body, .. } | ast::StmtKind::For { body, .. } => {
+                    self.pre_register_globals(body);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn upgrade_target_var_types(&mut self, target: &ast::Expr, val_ty: &Type) {
+        match &target.kind {
+            ast::ExprKind::Ident(name) => {
+                if let Some(sym) = self.scope_stack.lookup(name)
+                    && let SymbolKind::Variable { id, ty } = &sym.kind
+                    && matches!(ty, Type::None | Type::Any)
+                    && !matches!(val_ty, Type::Any | Type::None)
+                {
+                    let sym_id = *id;
+                    self.scope_stack
+                        .update_variable_type(sym_id, val_ty.clone());
+                }
+            }
+            ast::ExprKind::Tuple(items) | ast::ExprKind::List(items) => {
+                for (idx, item) in items.iter().enumerate() {
+                    let elem_ty = match val_ty {
+                        Type::Tuple(tys) => tys.get(idx).cloned().unwrap_or(Type::Any),
+                        Type::List(elem) => (**elem).clone(),
+                        _ => Type::Any,
+                    };
+                    self.upgrade_target_var_types(item, &elem_ty);
+                }
+            }
+            _ => {}
+        }
+    }
+
     pub fn pre_upgrade_outer_vars(&mut self, stmts: &[ast::Stmt]) {
+        self.pre_register_globals(stmts);
         for stmt in stmts {
             match &stmt.kind {
                 ast::StmtKind::Assign {
@@ -214,29 +287,27 @@ impl<'a> ExprAnalyzer<'a> {
                     value,
                     type_annotation,
                 } => {
-                    if let ast::ExprKind::Ident(name) = &target.kind
-                        && let Some(sym) = self.scope_stack.lookup(name)
-                        && let SymbolKind::Variable { id, ty } = &sym.kind
-                        && matches!(ty, Type::None | Type::Any)
-                    {
-                        let ann_ty = crate::type_from_annotation_with_scope(
-                            type_annotation.as_deref(),
-                            self.env,
-                            self.scope_stack,
-                        );
-                        let new_ty = if !matches!(ann_ty, Type::Any | Type::None) {
-                            ann_ty
-                        } else {
-                            self.peek_expr_type(value)
-                        };
-                        if !matches!(new_ty, Type::Any | Type::None) {
-                            let sym_id = *id;
-                            self.scope_stack.update_variable_type(sym_id, new_ty);
-                        }
-                    }
+                    let ann_ty = crate::type_from_annotation_with_scope(
+                        type_annotation.as_deref(),
+                        self.env,
+                        self.scope_stack,
+                    );
+                    let new_ty = if !matches!(ann_ty, Type::Any | Type::None) {
+                        ann_ty
+                    } else {
+                        self.peek_expr_type(value)
+                    };
+                    self.upgrade_target_var_types(target, &new_ty);
                 }
                 ast::StmtKind::FunctionDef(f) => {
                     self.pre_upgrade_outer_vars(&f.body);
+                }
+                ast::StmtKind::ClassDef(c) => {
+                    for body_stmt in &c.body {
+                        if let ast::StmtKind::FunctionDef(f) = &body_stmt.kind {
+                            self.pre_upgrade_outer_vars(&f.body);
+                        }
+                    }
                 }
                 ast::StmtKind::If {
                     then_branch,
@@ -512,9 +583,22 @@ impl<'a> ExprAnalyzer<'a> {
                     ScopeKind::Class { name } => Some(name.clone()),
                     _ => None,
                 };
-                let (sym_id, prev_ty, is_outer_var) = if let Some(existing) =
-                    self.scope_stack.current_scope().symbols.get(name)
-                {
+                let (sym_id, prev_ty, is_outer_var) = if self.scope_stack.is_explicit_global(name) {
+                    if let Some(existing) = self.scope_stack.lookup_in_module(name) {
+                        match &existing.kind {
+                            SymbolKind::Variable { id, ty }
+                            | SymbolKind::Parameter { id, ty, .. } => (*id, Some(ty.clone()), true),
+                            _ => {
+                                let (id, ty) =
+                                    self.scope_stack.define_or_lookup_global(name, target.span);
+                                (id, Some(ty), true)
+                            }
+                        }
+                    } else {
+                        let (id, ty) = self.scope_stack.define_or_lookup_global(name, target.span);
+                        (id, Some(ty), true)
+                    }
+                } else if let Some(existing) = self.scope_stack.current_scope().symbols.get(name) {
                     match &existing.kind {
                         SymbolKind::Variable { id, ty } | SymbolKind::Parameter { id, ty, .. } => {
                             (*id, Some(ty.clone()), false)
@@ -1009,6 +1093,43 @@ impl<'a> ExprAnalyzer<'a> {
                             stmt.span,
                         ));
                         self.type_map.insert_symbol_name(sym_id, bound_name);
+                    }
+                }
+            }
+
+            ast::StmtKind::Global(names) => {
+                for (name, span) in names {
+                    let (sym_id, ty) = self.scope_stack.define_or_lookup_global(name, *span);
+                    self.type_map.insert_symbol_name(sym_id, name.clone());
+                    self.type_map
+                        .insert_resolution(*span, ResolvedTarget::Local(sym_id));
+                    self.type_map.insert_type(*span, ty);
+                }
+            }
+
+            ast::StmtKind::Nonlocal(names) => {
+                for (name, span) in names {
+                    if let Some(sym) = self.scope_stack.lookup_nonlocal(name) {
+                        let sym_id = sym.id;
+                        let ty = match &sym.kind {
+                            SymbolKind::Variable { ty, .. } | SymbolKind::Parameter { ty, .. } => {
+                                ty.clone()
+                            }
+                            _ => Type::Any,
+                        };
+                        self.scope_stack.define(Symbol::new(
+                            sym_id,
+                            name.clone(),
+                            SymbolKind::Variable {
+                                id: sym_id,
+                                ty: ty.clone(),
+                            },
+                            *span,
+                        ));
+                        self.type_map.insert_symbol_name(sym_id, name.clone());
+                        self.type_map
+                            .insert_resolution(*span, ResolvedTarget::Local(sym_id));
+                        self.type_map.insert_type(*span, ty);
                     }
                 }
             }

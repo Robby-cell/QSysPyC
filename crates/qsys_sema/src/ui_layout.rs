@@ -272,7 +272,7 @@ pub fn extract_declarative_layout_from_method(body: &[ast::Stmt]) -> Option<ast:
 
     for stmt in body {
         match &stmt.kind {
-            ast::StmtKind::Pass => {}
+            ast::StmtKind::Pass | ast::StmtKind::Global(_) | ast::StmtKind::Nonlocal(_) => {}
             ast::StmtKind::Expr(e) if matches!(e.kind, ast::ExprKind::String(_)) => {}
             ast::StmtKind::Expr(e) => {
                 let sub = substitute_ui_vars(e, &local_ui_vars);
@@ -1520,7 +1520,7 @@ impl<'a> UiParserCtx<'a> {
     ) -> Option<PreviewVal> {
         for stmt in stmts {
             match &stmt.kind {
-                ast::StmtKind::Pass => {}
+                ast::StmtKind::Pass | ast::StmtKind::Global(_) | ast::StmtKind::Nonlocal(_) => {}
                 ast::StmtKind::Expr(e) if matches!(e.kind, ast::ExprKind::String(_)) => {}
                 ast::StmtKind::Assign { target, value, .. } => {
                     let val = self.eval_preview_expr(value, vars, depth)?;

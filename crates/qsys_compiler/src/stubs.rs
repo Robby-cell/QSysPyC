@@ -44,6 +44,9 @@ class ControlHandle:
     Strings: list[str]
     """Array of text strings for multi-channel controls."""
 
+    Choices: list[str]
+    """List of selectable string options for combo box or list box controls."""
+
     IsDisabled: bool
     """Whether the control is grayed out and disabled in the UI."""
 

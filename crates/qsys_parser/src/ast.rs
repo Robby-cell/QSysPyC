@@ -63,6 +63,8 @@ pub enum StmtKind {
     },
     Return(Option<Expr>),
     Expr(Expr),
+    Global(Vec<(String, Span)>),
+    Nonlocal(Vec<(String, Span)>),
     Break,
     Pass,
 }

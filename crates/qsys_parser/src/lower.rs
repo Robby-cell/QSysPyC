@@ -132,10 +132,7 @@ impl<'a> Lowerer<'a> {
                             .annotation
                             .as_ref()
                             .map(|a| lower_type_annotation(a)),
-                        default: arg
-                            .default
-                            .as_ref()
-                            .map(|d| Box::new(self.lower_expr(d))),
+                        default: arg.default.as_ref().map(|d| Box::new(self.lower_expr(d))),
                         span: text_range_to_span(arg.range()),
                     })
                     .collect();
@@ -295,8 +292,26 @@ impl<'a> Lowerer<'a> {
                 out.push(Stmt::new(StmtKind::Expr(expr), span));
             }
 
-            ruff::Stmt::Pass(_) | ruff::Stmt::Global(_) | ruff::Stmt::Nonlocal(_) => {
+            ruff::Stmt::Pass(_) => {
                 out.push(Stmt::new(StmtKind::Pass, span));
+            }
+
+            ruff::Stmt::Global(g) => {
+                let names = g
+                    .names
+                    .iter()
+                    .map(|n| (n.id.to_string(), text_range_to_span(n.range())))
+                    .collect();
+                out.push(Stmt::new(StmtKind::Global(names), span));
+            }
+
+            ruff::Stmt::Nonlocal(n) => {
+                let names = n
+                    .names
+                    .iter()
+                    .map(|n| (n.id.to_string(), text_range_to_span(n.range())))
+                    .collect();
+                out.push(Stmt::new(StmtKind::Nonlocal(names), span));
             }
 
             ruff::Stmt::Break(_) => out.push(Stmt::new(StmtKind::Break, span)),
@@ -528,10 +543,7 @@ impl<'a> Lowerer<'a> {
                             .map(|arg| Param {
                                 name: arg.parameter.name.to_string(),
                                 type_annotation: None,
-                                default: arg
-                                    .default
-                                    .as_ref()
-                                    .map(|d| Box::new(self.lower_expr(d))),
+                                default: arg.default.as_ref().map(|d| Box::new(self.lower_expr(d))),
                                 span: text_range_to_span(arg.range()),
                             })
                             .collect()
@@ -851,11 +863,7 @@ fn lower_type_annotation(expr: &ruff::Expr) -> String {
         ruff::Expr::BinOp(b) => {
             let left = lower_type_annotation(&b.left);
             let right = lower_type_annotation(&b.right);
-            if left == "None" {
-                right
-            } else {
-                left
-            }
+            if left == "None" { right } else { left }
         }
         ruff::Expr::Tuple(t) => {
             let elems: Vec<String> = t.elts.iter().map(lower_type_annotation).collect();
