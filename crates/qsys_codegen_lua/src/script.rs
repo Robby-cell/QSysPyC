@@ -61,12 +61,19 @@ pub fn emit_script(script: &IRScript, ctx: &mut CodegenContext) -> String {
     // Emit event bindings
     for binding in &script.event_bindings {
         let ctl_ref = format!("Controls[{}]", escape_lua_string(&binding.control_name));
-        let ctl_count = script
+        let ctl_def = script
             .controls
             .iter()
             .find(|c| c.id == binding.control_id)
-            .map(|c| c.def.count)
-            .unwrap_or(1);
+            .map(|c| &c.def);
+        let ctl_count = ctl_def.map(|d| d.count).unwrap_or(1);
+        let ctl_cols = ctl_def.and_then(|d| d.cols).unwrap_or(1).max(1);
+        let handler_arity = script
+            .methods
+            .iter()
+            .find(|m| m.id == binding.handler_id || m.name == binding.handler_name)
+            .map(|m| m.params.len())
+            .unwrap_or(2);
 
         if let Some(ch_idx) = binding.channel_index {
             emitter.write_line(&format!(
@@ -82,7 +89,14 @@ pub fn emit_script(script: &IRScript, ctx: &mut CodegenContext) -> String {
             emitter.indent();
             emitter.write_line("ctl.EventHandler = function(c)");
             emitter.indent();
-            emitter.write_line(&format!("{}(c, ix - 1)", binding.handler_name));
+            if handler_arity >= 3 {
+                emitter.write_line(&format!(
+                    "{}(c, (ix - 1) // {ctl_cols}, (ix - 1) % {ctl_cols})",
+                    binding.handler_name
+                ));
+            } else {
+                emitter.write_line(&format!("{}(c, ix - 1)", binding.handler_name));
+            }
             emitter.dedent();
             emitter.write_line("end");
             emitter.dedent();

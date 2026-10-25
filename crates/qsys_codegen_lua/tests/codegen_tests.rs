@@ -1404,3 +1404,138 @@ class Funnel(QSysPlugin):
         "Both `on_inputs` (defined before `runtime`) and `log_helper` (top-level function) must infer `debugger` as `Debugger` and use `:`:\n{lua}"
     );
 }
+
+#[test]
+fn test_2d_controls_grid_layout_row_labels_indexing_and_event_handler() {
+    let src = r#"
+from qsys import Control, ControlHandle, Property, QSysPlugin, UI
+
+class Funnel(QSysPlugin):
+    InputType = Property.Enum(
+        "Input Type",
+        choices=["Boolean", "Number", "String"],
+        default="Boolean",
+    )
+    InputsPerTrack = Property.Integer(name="Inputs per Track", default=3, min=1, max=100)
+    TrackCount = Property.Integer(name="Number of Tracks", default=2, min=2, max=100)
+
+    Inputs = Control.Generic(
+        InputType,
+        name="Inputs",
+        count=InputsPerTrack * TrackCount,
+        min=-65536,
+        max=65535,
+    )
+    Matrix = Control.Button(
+        name="Matrix",
+        count=(TrackCount, InputsPerTrack),
+    )
+
+    def format_track(self, r: int) -> str:
+        return f"Bus {r + 1}:"
+
+    layout = UI.Page(
+        "Main",
+        UI.GroupBox(
+            "Funnel",
+            UI.Field("Input {c}", Inputs, row_label="Track {r}:"),
+            UI.Grid(lambda r, c: f"M{r + 1}.{c + 1}", Matrix, row_label=format_track),
+        ),
+    )
+
+    def get_input(self, track: int, idx: int) -> ControlHandle:
+        return self.Inputs[track, idx]
+
+    @Inputs.EventHandler
+    def on_inputs(self, ctl: ControlHandle, track: int, idx: int) -> None:
+        other = self.Inputs[track][idx].Data
+        self.Matrix[track, idx].Boolean = True
+        print(track, idx, other)
+"#;
+
+    let file = SourceFile::new(FileId(1), "funnel_2d.py", src);
+    let parsed = parse_module(file).expect("Parse failed");
+    let model = analyze(&parsed).expect("Semantic analysis failed");
+    let ir = model.into_ir();
+    let backend = LuaBackend::new();
+    let (lua, diags) = backend
+        .emit(&ir, &CodegenConfig::default())
+        .expect("Codegen should succeed");
+    assert!(!diags.has_errors());
+
+    // 1. `Funnel_format_track` used in `row_label=format_track` must be hoisted before `GetControlLayout`
+    let fmt_pos = lua
+        .find("local function Funnel_format_track(self, r)")
+        .expect("Funnel_format_track should be emitted");
+    let layout_pos = lua
+        .find("function GetControlLayout(props)")
+        .expect("GetControlLayout should be emitted");
+    assert!(
+        fmt_pos < layout_pos,
+        "Row label helper method must be hoisted before GetControlLayout:\n{lua}"
+    );
+
+    // 2. GroupBox must scale width with `props["Inputs per Track"].Value` and height with `props["Number of Tracks"].Value`
+    assert!(
+        lua.contains("Type = \"GroupBox\",\n        Text = \"Funnel\",\n        Position = { 16, 16 },\n        Size = { 92 + (props[\"Inputs per Track\"].Value) * 92, 42 + (props[\"Number of Tracks\"].Value) * 120 },"),
+        "GroupBox must dynamically size width and height with cols and rows properties:\n{lua}"
+    );
+
+    // 3. `UI.Field("Input {c}", Inputs, row_label="Track {r}:")` must emit nested `for r` and `for c` loops
+    assert!(
+        lua.contains("for r = 1, props[\"Number of Tracks\"].Value do")
+            && lua.contains("Text = \"Track \" .. tostring(r) .. \":\",")
+            && lua.contains("for c = 1, props[\"Inputs per Track\"].Value do")
+            && lua.contains("local i = (r - 1) * props[\"Inputs per Track\"].Value + c")
+            && lua.contains("Text = \"Input \" .. tostring(c),")
+            && lua.contains("PrettyName = \"Input \" .. tostring(c),"),
+        "GetControlLayout must emit nested 2D loops with row prefix labels and per-cell labels:\n{lua}"
+    );
+
+    // 4. `UI.Grid(lambda r, c: ..., Matrix, row_label=format_track)` must call `Funnel_format_track(nil, r - 1)` and 2-arg inline lambda `(r - 1, c - 1)`
+    assert!(
+        lua.contains("Text = Funnel_format_track(nil, r - 1),")
+            && lua.contains("Text = (function(r, c) return (((\"M\" .. tostring((r + 1))) .. \".\") .. tostring((c + 1))) end)(r - 1, c - 1),"),
+        "UI.Grid must emit callable row label and 2-arg callable cell label:\n{lua}"
+    );
+
+    // 5. 2D indexing `self.Inputs[track, idx]`, `self.Inputs[track][idx]`, and `self.Matrix[track, idx]` must flatten to `(track * cols) + idx`
+    assert!(
+        lua.contains("__qsys_ctl(Controls[\"Inputs\"], ((track * Properties[\"Inputs per Track\"].Value) + idx) + 1, Properties[\"Inputs per Track\"].Value * Properties[\"Number of Tracks\"].Value)"),
+        "2D indexing `self.Inputs[track, idx]` and `self.Inputs[track][idx]` must flatten to `(track * cols) + idx`:\n{lua}"
+    );
+    assert!(
+        lua.contains("__qsys_ctl(Controls[\"Matrix\"], ((track * Properties[\"Inputs per Track\"].Value) + idx) + 1, Properties[\"Number of Tracks\"].Value * Properties[\"Inputs per Track\"].Value).Boolean = true"),
+        "2D assignment `self.Matrix[track, idx].Boolean = True` must flatten to `(track * cols) + idx`:\n{lua}"
+    );
+
+    // 6. 4-parameter `@Inputs.EventHandler` `def on_inputs(self, ctl, track, idx)` must pass `(ix - 1) // cols, (ix - 1) % cols`
+    assert!(
+        lua.contains("Funnel_on_inputs(nil, c, 0, 0)")
+            && lua.contains("Funnel_on_inputs(nil, c, (ix - 1) // Properties[\"Inputs per Track\"].Value, (ix - 1) % Properties[\"Inputs per Track\"].Value)"),
+        "4-parameter @Inputs.EventHandler must pass 0-based `(track, idx)` computed from `ix - 1` and `cols`:\n{lua}"
+    );
+
+    // 7. Verify solved preview labels in `IRPlugin.pages[0]`
+    if let qsys_ir::IRProgram::Plugin(plugin) = ir {
+        let page = &plugin.pages[0];
+        let label_texts: Vec<&str> = page
+            .graphics
+            .iter()
+            .filter_map(|g| match &g.kind {
+                qsys_model::GraphicItemKind::Label { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            label_texts,
+            vec![
+                "Track 1:", "Input 1", "Input 2", "Input 3", "Track 2:", "Input 1", "Input 2",
+                "Input 3", "Bus 1:", "M1.1", "M1.2", "M1.3", "Bus 2:", "M2.1", "M2.2", "M2.3",
+            ],
+            "Solved PageLayout preview must contain row prefix labels and per-cell labels in 2D grid order"
+        );
+    } else {
+        panic!("Expected IRProgram::Plugin");
+    }
+}

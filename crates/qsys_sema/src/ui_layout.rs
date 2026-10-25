@@ -4,8 +4,8 @@ use strsim::levenshtein;
 use qsys_diagnostics::{DiagnosticKind, Diagnostics, Span};
 use qsys_ir::ControlId;
 use qsys_model::{
-    Color, ControlStyle, FlexDirection, LabelPlacement, PageLayout, PropertyKind, UiControlSpec,
-    UiNode, UiPageSpec,
+    Color, ControlStyle, FlexDirection, GridCellPreview, LabelPlacement, PageLayout, PropertyKind,
+    UiControlSpec, UiGridSpec, UiNode, UiPageSpec,
 };
 use qsys_parser::ast;
 
@@ -795,16 +795,18 @@ impl<'a> UiParserCtx<'a> {
                         vec![UiNode::Spacer { width, height }]
                     }
 
-                    "Field" => self.parse_field_call(args, kwargs, expr.span),
+                    "Field" => self.parse_field_call(args, kwargs, expr.span, false),
 
-                    "Control" => self.parse_control_call(args, kwargs, expr.span),
+                    "Control" => self.parse_control_call(args, kwargs, expr.span, false),
+
+                    "Grid" => self.parse_grid_call(args, kwargs, expr.span),
 
                     other => {
                         self.diagnostics.report(
                             DiagnosticKind::InvalidDeclarationArgument {
                                 name: format!("UI.{other}"),
                                 message: format!(
-                                    "Unknown UI component 'UI.{other}'. Expected Page, GroupBox, Row, Col, Header, Label, Field, Control, or Spacer"
+                                    "Unknown UI component 'UI.{other}'. Expected Page, GroupBox, Row, Col, Grid, Header, Label, Field, Control, or Spacer"
                                 ),
                             },
                             expr.span,
@@ -817,7 +819,7 @@ impl<'a> UiParserCtx<'a> {
             // Direct control reference passed as a child node: e.g. `UI.Row(self.Gain, self.Mute)` or `UI.Row(Gain, Mute)`
             _ => {
                 if let Some((ctl, sub_idx)) = self.resolve_control_ref(expr) {
-                    self.build_control_nodes(ctl, sub_idx, &[], None, expr.span)
+                    self.build_control_nodes(ctl, sub_idx, &[], None, expr.span, false)
                 } else {
                     Vec::new()
                 }
@@ -853,11 +855,25 @@ impl<'a> UiParserCtx<'a> {
         }
     }
 
+    fn parse_grid_call(
+        &mut self,
+        args: &[ast::Expr],
+        kwargs: &[(String, ast::Expr)],
+        span: Span,
+    ) -> Vec<UiNode> {
+        if args.len() >= 2 {
+            self.parse_field_call(args, kwargs, span, true)
+        } else {
+            self.parse_control_call(args, kwargs, span, true)
+        }
+    }
+
     fn parse_field_call(
         &mut self,
         args: &[ast::Expr],
         kwargs: &[(String, ast::Expr)],
         span: Span,
+        force_grid: bool,
     ) -> Vec<UiNode> {
         // UI.Field("Master Gain", self.Gain, ...) or UI.Field(fn, self.Gain, ...) or UI.Field(label=..., control=self.Gain, ...)
         let label_expr = args
@@ -883,7 +899,7 @@ impl<'a> UiParserCtx<'a> {
         };
 
         if let Some((ctl, sub_idx)) = self.resolve_control_ref(ctl_expr) {
-            self.build_control_nodes(ctl, sub_idx, kwargs, label_spec, span)
+            self.build_control_nodes(ctl, sub_idx, kwargs, label_spec, span, force_grid)
         } else {
             Vec::new()
         }
@@ -894,6 +910,7 @@ impl<'a> UiParserCtx<'a> {
         args: &[ast::Expr],
         kwargs: &[(String, ast::Expr)],
         span: Span,
+        force_grid: bool,
     ) -> Vec<UiNode> {
         let ctl_expr = args
             .first()
@@ -917,7 +934,7 @@ impl<'a> UiParserCtx<'a> {
             .find(|(k, _)| k == "label")
             .and_then(|(_, v)| self.parse_label_spec(v, "UI.Control label"));
         if let Some((ctl, sub_idx)) = self.resolve_control_ref(ctl_expr) {
-            self.build_control_nodes(ctl, sub_idx, kwargs, explicit_label, span)
+            self.build_control_nodes(ctl, sub_idx, kwargs, explicit_label, span, force_grid)
         } else {
             Vec::new()
         }
@@ -930,6 +947,7 @@ impl<'a> UiParserCtx<'a> {
         kwargs: &[(String, ast::Expr)],
         label_override: Option<LabelSpec>,
         span: Span,
+        force_grid: bool,
     ) -> Vec<UiNode> {
         let explicit_style = get_kwarg_str(kwargs, "style").map(|s| ControlStyle::from_name(&s));
         let type_property = if explicit_style.is_none() {
@@ -1041,6 +1059,7 @@ impl<'a> UiParserCtx<'a> {
                 dynamic_legend_template: None,
                 label_lua_expr,
                 pretty_lua_expr,
+                grid: None,
                 is_dynamic_repeat_head: false,
                 skip_lua_emit: false,
             })];
@@ -1098,7 +1117,366 @@ impl<'a> UiParserCtx<'a> {
                 dynamic_legend_template: None,
                 label_lua_expr,
                 pretty_lua_expr,
+                grid: None,
                 is_dynamic_repeat_head: false,
+                skip_lua_emit: false,
+            })];
+        }
+
+        // Check if 2D grid layout is requested or inferred for this multi-channel control
+        let dir_kwarg = get_kwarg_str(kwargs, "direction").map(|s| s.to_ascii_lowercase());
+        let is_dir_grid = matches!(dir_kwarg.as_deref(), Some("grid" | "2d" | "matrix"));
+        let is_dir_1d = matches!(
+            dir_kwarg.as_deref(),
+            Some("row" | "horizontal" | "hstack" | "col" | "column" | "vertical" | "vstack")
+        );
+        let ui_rows = kwargs
+            .iter()
+            .find(|(k, _)| k == "rows")
+            .and_then(|(_, v)| self.parse_ui_dim_kwarg(v));
+        let ui_cols = kwargs
+            .iter()
+            .find(|(k, _)| k == "cols" || k == "columns")
+            .and_then(|(_, v)| self.parse_ui_dim_kwarg(v));
+        let explicit_row_label_spec = kwargs
+            .iter()
+            .find(|(k, _)| k == "row_label" || k == "track_label")
+            .and_then(|(_, v)| self.parse_label_spec(v, "row_label"));
+        let explicit_row_labels = get_kwarg_str_list(kwargs, "row_labels");
+        let label_has_2d_vars = matches!(
+            &label_override,
+            Some(LabelSpec::Text(s)) if has_2d_template_vars(s)
+        ) || matches!(
+            &pretty_spec,
+            Some(LabelSpec::Text(s)) if has_2d_template_vars(s)
+        );
+        let label_is_2d_callable = matches!(
+            &label_override,
+            Some(LabelSpec::Callable(fn_expr)) if self.callable_arity(fn_expr) >= 2
+        ) || matches!(
+            &pretty_spec,
+            Some(LabelSpec::Callable(fn_expr)) if self.callable_arity(fn_expr) >= 2
+        );
+        let has_explicit_2d_ui_opts = force_grid
+            || is_dir_grid
+            || ui_rows.is_some()
+            || ui_cols.is_some()
+            || explicit_row_label_spec.is_some()
+            || explicit_row_labels.is_some()
+            || label_has_2d_vars
+            || label_is_2d_callable;
+        let use_2d_grid = has_explicit_2d_ui_opts || (ctl.def.explicit_2d && !is_dir_1d);
+
+        if use_2d_grid {
+            let (preview_rows, rows_property) = if let Some((r, rp)) = &ui_rows {
+                ((*r).max(1), rp.clone())
+            } else if let Some(r) = ctl.def.rows {
+                (r.max(1), ctl.def.rows_property.clone())
+            } else if let Some((c, None)) = &ui_cols {
+                let c_max = (*c).max(1);
+                (ctl.def.count.max(1).div_ceil(c_max), None)
+            } else {
+                (1, None)
+            };
+
+            let (preview_cols, cols_property) = if let Some((c, cp)) = &ui_cols {
+                ((*c).max(1), cp.clone())
+            } else if let Some(c) = ctl.def.cols {
+                (c.max(1), ctl.def.cols_property.clone())
+            } else if let Some((r, None)) = &ui_rows {
+                let r_max = (*r).max(1);
+                (ctl.def.count.max(1).div_ceil(r_max), None)
+            } else {
+                (ctl.def.count.max(1), ctl.def.count_property.clone())
+            };
+
+            // If `label_override` only has row template variables (e.g. `UI.Field("Track {r}:", self.Inputs)`)
+            // and no explicit `row_label` kwarg was passed, promote `label_override` to `row_label_spec`!
+            let (effective_row_label_spec, effective_cell_label_spec) = if explicit_row_label_spec
+                .is_none()
+                && explicit_row_labels.is_none()
+                && let Some(LabelSpec::Text(ref s)) = label_override
+                && has_only_row_template_vars(s)
+            {
+                let cell_lbl = kwargs
+                    .iter()
+                    .find(|(k, _)| k == "cell_label")
+                    .and_then(|(_, v)| self.parse_label_spec(v, "cell_label"));
+                (Some(LabelSpec::Text(s.clone())), cell_lbl)
+            } else {
+                (explicit_row_label_spec, label_override.clone())
+            };
+
+            let has_row_label = effective_row_label_spec.is_some() || explicit_row_labels.is_some();
+            let mut preview_row_labels = Vec::with_capacity(preview_rows);
+            let mut preview_row_label_lua_exprs = Vec::with_capacity(preview_rows);
+            for r_idx in 0..preview_rows {
+                let r1 = r_idx + 1;
+                let r_idx_i64 = r_idx as i64;
+                let r_idx_str = r_idx.to_string();
+                if let Some(ref list) = explicit_row_labels {
+                    preview_row_labels.push(
+                        list.get(r_idx)
+                            .cloned()
+                            .unwrap_or_else(|| format!("Track {r1}")),
+                    );
+                    preview_row_label_lua_exprs.push(None);
+                } else if let Some(ref rspec) = effective_row_label_spec {
+                    match rspec {
+                        LabelSpec::Text(tmpl) => {
+                            preview_row_labels.push(format_row_label_surface(tmpl, r1));
+                            preview_row_label_lua_exprs.push(None);
+                        }
+                        LabelSpec::Callable(fn_expr) => {
+                            let p = self
+                                .eval_callable_preview(fn_expr, r_idx_i64)
+                                .unwrap_or_else(|| format!("Track {r1}"));
+                            let l = self.lower_callable_lua(fn_expr, &r_idx_str);
+                            preview_row_labels.push(p);
+                            preview_row_label_lua_exprs.push(Some(l));
+                        }
+                    }
+                }
+            }
+
+            let dynamic_row_label_template = match &effective_row_label_spec {
+                Some(LabelSpec::Text(s)) => Some(s.clone()),
+                Some(LabelSpec::Callable(_)) => Some(String::new()),
+                None => None,
+            };
+            let dynamic_row_label_lua_expr = match &effective_row_label_spec {
+                Some(LabelSpec::Callable(fn_expr)) => {
+                    Some(self.lower_callable_lua(fn_expr, "r - 1"))
+                }
+                _ => None,
+            };
+
+            let max_rlbl_chars = preview_row_labels
+                .iter()
+                .map(|s| s.chars().count())
+                .max()
+                .unwrap_or(8);
+            let default_row_lbl_w = ((max_rlbl_chars as f64) * 7.0 + 12.0).max(56.0);
+            let row_label_width =
+                get_kwarg_f64(kwargs, "row_label_width").unwrap_or(default_row_lbl_w);
+            let row_label_font_size = get_kwarg_u32(kwargs, "row_label_font_size").unwrap_or(11);
+            let base_gap = get_kwarg_f64(kwargs, "gap").unwrap_or(8.0);
+            let col_gap = get_kwarg_f64(kwargs, "col_gap").unwrap_or(base_gap);
+            let row_gap = get_kwarg_f64(kwargs, "row_gap").unwrap_or(base_gap);
+
+            let explicit_labels = get_kwarg_str_list(kwargs, "labels");
+            let explicit_pretty_names = get_kwarg_str_list(kwargs, "pretty_names");
+            let has_dynamic_repeat = (ctl.def.count_property.is_some()
+                || rows_property.is_some()
+                || cols_property.is_some())
+                && explicit_labels.is_none()
+                && explicit_pretty_names.is_none()
+                && explicit_row_labels.is_none();
+
+            let total_preview = (preview_rows * preview_cols).max(1);
+            let mut cells = Vec::with_capacity(total_preview);
+            for r_idx in 0..preview_rows {
+                let r1 = r_idx + 1;
+                let r_i64 = r_idx as i64;
+                let r_str = r_idx.to_string();
+                for c_idx in 0..preview_cols {
+                    let c1 = c_idx + 1;
+                    let c_i64 = c_idx as i64;
+                    let c_str = c_idx.to_string();
+                    let flat_idx = r_idx * preview_cols + c_idx;
+                    let ch = flat_idx + 1;
+                    let flat_i64 = flat_idx as i64;
+                    let flat_str = flat_idx.to_string();
+
+                    let qsys_key = if total_preview == 1 {
+                        ctl.def.name.clone()
+                    } else {
+                        format!("{} {}", ctl.def.name, ch)
+                    };
+
+                    let cell_label = explicit_labels
+                        .as_ref()
+                        .and_then(|list| list.get(flat_idx).cloned())
+                        .or_else(|| match &effective_cell_label_spec {
+                            Some(LabelSpec::Text(lbl)) => {
+                                Some(format_2d_surface(lbl, r1, c1, ch, has_row_label))
+                            }
+                            Some(LabelSpec::Callable(fn_expr)) => {
+                                if self.callable_arity(fn_expr) >= 2 {
+                                    Some(
+                                        self.eval_callable_2d_preview(fn_expr, r_i64, c_i64)
+                                            .unwrap_or_else(|| format!("{} {}", ctl.def.name, ch)),
+                                    )
+                                } else {
+                                    Some(
+                                        self.eval_callable_preview(fn_expr, flat_i64)
+                                            .unwrap_or_else(|| format!("{} {}", ctl.def.name, ch)),
+                                    )
+                                }
+                            }
+                            None => None,
+                        });
+
+                    let cell_pretty = explicit_pretty_names
+                        .as_ref()
+                        .and_then(|list| list.get(flat_idx).cloned())
+                        .or_else(|| match &pretty_spec {
+                            Some(LabelSpec::Text(p)) => {
+                                Some(format_2d_surface(p, r1, c1, ch, has_row_label))
+                            }
+                            Some(LabelSpec::Callable(fn_expr)) => {
+                                if self.callable_arity(fn_expr) >= 2 {
+                                    Some(
+                                        self.eval_callable_2d_preview(fn_expr, r_i64, c_i64)
+                                            .unwrap_or_else(|| qsys_key.clone()),
+                                    )
+                                } else {
+                                    Some(
+                                        self.eval_callable_preview(fn_expr, flat_i64)
+                                            .unwrap_or_else(|| qsys_key.clone()),
+                                    )
+                                }
+                            }
+                            None => None,
+                        })
+                        .or_else(|| cell_label.clone())
+                        .or_else(|| Some(qsys_key.clone()));
+
+                    let cell_legend = legend
+                        .as_ref()
+                        .map(|l| format_2d_surface(l, r1, c1, ch, has_row_label));
+
+                    let cell_label_lua = match &effective_cell_label_spec {
+                        Some(LabelSpec::Callable(fn_expr)) => {
+                            let is_2d_fn = self.callable_arity(fn_expr) >= 2;
+                            if has_dynamic_repeat {
+                                if flat_idx == 0 {
+                                    if is_2d_fn {
+                                        Some(self.lower_callable_2d_lua(fn_expr, "r - 1", "c - 1"))
+                                    } else {
+                                        Some(self.lower_callable_lua(fn_expr, "i - 1"))
+                                    }
+                                } else {
+                                    None
+                                }
+                            } else if is_2d_fn {
+                                Some(self.lower_callable_2d_lua(fn_expr, &r_str, &c_str))
+                            } else {
+                                Some(self.lower_callable_lua(fn_expr, &flat_str))
+                            }
+                        }
+                        _ => None,
+                    };
+
+                    let cell_pretty_lua = match &pretty_spec {
+                        Some(LabelSpec::Callable(fn_expr)) => {
+                            let is_2d_fn = self.callable_arity(fn_expr) >= 2;
+                            if has_dynamic_repeat {
+                                if flat_idx == 0 {
+                                    if is_2d_fn {
+                                        Some(self.lower_callable_2d_lua(fn_expr, "r - 1", "c - 1"))
+                                    } else {
+                                        Some(self.lower_callable_lua(fn_expr, "i - 1"))
+                                    }
+                                } else {
+                                    None
+                                }
+                            } else if is_2d_fn {
+                                Some(self.lower_callable_2d_lua(fn_expr, &r_str, &c_str))
+                            } else {
+                                Some(self.lower_callable_lua(fn_expr, &flat_str))
+                            }
+                        }
+                        None => cell_label_lua.clone(),
+                        _ => None,
+                    };
+
+                    cells.push(GridCellPreview {
+                        control_name: qsys_key,
+                        channel_index: ch,
+                        label: cell_label,
+                        pretty_name: cell_pretty,
+                        legend: cell_legend,
+                        label_lua_expr: cell_label_lua,
+                        pretty_lua_expr: cell_pretty_lua,
+                    });
+                }
+            }
+
+            let head_cell = cells.first();
+            let head_label = head_cell.and_then(|c| c.label.clone());
+            let head_pretty = head_cell.and_then(|c| c.pretty_name.clone());
+            let head_legend = head_cell.and_then(|c| c.legend.clone());
+            let head_label_lua = head_cell.and_then(|c| c.label_lua_expr.clone());
+            let head_pretty_lua = head_cell.and_then(|c| c.pretty_lua_expr.clone());
+            let head_ctl_name = head_cell
+                .map(|c| c.control_name.clone())
+                .unwrap_or_else(|| format!("{} 1", ctl.def.name));
+
+            let dyn_cell_label_tmpl = if has_dynamic_repeat {
+                match &effective_cell_label_spec {
+                    Some(LabelSpec::Text(s)) => Some(normalize_2d_cell_template(s, has_row_label)),
+                    Some(LabelSpec::Callable(_)) => Some(String::new()),
+                    None => None,
+                }
+            } else {
+                None
+            };
+            let dyn_cell_pretty_tmpl = if has_dynamic_repeat {
+                match &pretty_spec {
+                    Some(LabelSpec::Text(s)) => Some(normalize_2d_cell_template(s, has_row_label)),
+                    Some(LabelSpec::Callable(_)) => Some(String::new()),
+                    None => dyn_cell_label_tmpl.clone().or_else(|| {
+                        if let Some(LabelSpec::Text(ref r_tmpl)) = effective_row_label_spec {
+                            Some(format!("{} {{c}}", r_tmpl.trim_end_matches(':').trim()))
+                        } else {
+                            Some(ctl.def.name.clone())
+                        }
+                    }),
+                }
+            } else {
+                None
+            };
+
+            return vec![UiNode::Control(UiControlSpec {
+                control_name: head_ctl_name,
+                style,
+                label: head_label,
+                label_placement,
+                pretty_name: head_pretty,
+                legend: head_legend,
+                width,
+                height,
+                color,
+                margin,
+                read_only,
+                invisible,
+                type_property,
+                count_property: ctl.def.count_property.clone(),
+                base_control_name: Some(ctl.def.name.clone()),
+                channel_index: Some(1),
+                dynamic_label_template: dyn_cell_label_tmpl,
+                dynamic_pretty_template: dyn_cell_pretty_tmpl,
+                dynamic_legend_template: if has_dynamic_repeat { legend } else { None },
+                label_lua_expr: head_label_lua,
+                pretty_lua_expr: head_pretty_lua,
+                grid: Some(UiGridSpec {
+                    preview_rows,
+                    preview_cols,
+                    rows_property,
+                    cols_property,
+                    col_gap,
+                    row_gap,
+                    has_row_label,
+                    row_label_width,
+                    row_label_font_size,
+                    preview_row_labels,
+                    preview_row_label_lua_exprs,
+                    dynamic_row_label_template,
+                    dynamic_row_label_lua_expr,
+                    cells,
+                }),
+                is_dynamic_repeat_head: has_dynamic_repeat,
                 skip_lua_emit: false,
             })];
         }
@@ -1243,6 +1621,7 @@ impl<'a> UiParserCtx<'a> {
                 },
                 label_lua_expr: item_label_lua,
                 pretty_lua_expr: item_pretty_lua,
+                grid: None,
                 is_dynamic_repeat_head: has_dynamic_repeat && ch == 1,
                 skip_lua_emit: has_dynamic_repeat && ch > 1,
             }));
@@ -1270,6 +1649,72 @@ impl<'a> UiParserCtx<'a> {
         }
 
         expanded
+    }
+
+    fn parse_ui_dim_kwarg(&self, expr: &ast::Expr) -> Option<(usize, Option<String>)> {
+        let lookup_prop = |ident: &str| -> Option<(usize, Option<String>)> {
+            let prop = self
+                .env
+                .properties
+                .iter()
+                .find(|p| p.ident == ident || p.def.name == ident)?;
+            let default_count = match &prop.def.kind {
+                PropertyKind::Integer { default, .. } => (*default).max(1) as usize,
+                _ => 1,
+            };
+            Some((default_count, Some(prop.def.name.clone())))
+        };
+        match &expr.kind {
+            ast::ExprKind::Ident(ident) => {
+                if let Some(res) = lookup_prop(ident) {
+                    return Some(res);
+                }
+            }
+            ast::ExprKind::Attribute { value, attr } => {
+                if let ast::ExprKind::Ident(obj) = &value.kind
+                    && (obj == "self" || obj == self.class_name)
+                    && let Some(res) = lookup_prop(attr)
+                {
+                    return Some(res);
+                }
+            }
+            _ => {}
+        }
+        eval_constant(expr)
+            .and_then(|c| c.as_i64())
+            .map(|i| (i.max(1) as usize, None))
+    }
+
+    fn callable_arity(&self, fn_expr: &ast::Expr) -> usize {
+        match &fn_expr.kind {
+            ast::ExprKind::Lambda { params, .. } => params.len(),
+            ast::ExprKind::Attribute { value, attr } => {
+                if let ast::ExprKind::Ident(obj) = &value.kind
+                    && (obj == "self" || obj == self.class_name)
+                    && let Some(method) = self.env.class_methods.get(attr)
+                {
+                    let skip_self =
+                        usize::from(method.params.first().is_some_and(|p| p.name == "self"));
+                    return method.params.len().saturating_sub(skip_self);
+                }
+                1
+            }
+            ast::ExprKind::Ident(name) => {
+                if let Some(func) = self
+                    .env
+                    .local_functions
+                    .get(name)
+                    .or_else(|| self.env.class_methods.get(name))
+                    .or_else(|| self.env.module_functions.get(name))
+                {
+                    let skip_self =
+                        usize::from(func.params.first().is_some_and(|p| p.name == "self"));
+                    return func.params.len().saturating_sub(skip_self);
+                }
+                1
+            }
+            _ => 1,
+        }
     }
 
     fn lower_callable_lua(&self, fn_expr: &ast::Expr, idx_lua: &str) -> String {
@@ -1300,6 +1745,42 @@ impl<'a> UiParserCtx<'a> {
                     format!("{}_{name}(nil, {idx_lua})", self.class_name)
                 } else {
                     format!("{name}({idx_lua})")
+                }
+            }
+            _ => "\"\"".to_string(),
+        }
+    }
+
+    fn lower_callable_2d_lua(&self, fn_expr: &ast::Expr, r_lua: &str, c_lua: &str) -> String {
+        match &fn_expr.kind {
+            ast::ExprKind::Lambda { params, body } => {
+                let p0 = params.first().map(|p| p.name.as_str()).unwrap_or("_r");
+                let p1 = params.get(1).map(|p| p.name.as_str()).unwrap_or("_c");
+                let mut param_map = FxHashMap::default();
+                param_map.insert(p0.to_string(), p0.to_string());
+                param_map.insert(p1.to_string(), p1.to_string());
+                let body_lua = self.lower_ui_expr_to_lua(body, &param_map);
+                format!("(function({p0}, {p1}) return {body_lua} end)({r_lua}, {c_lua})")
+            }
+            ast::ExprKind::Attribute { value, attr } => {
+                if let ast::ExprKind::Ident(obj) = &value.kind
+                    && (obj == "self" || obj == self.class_name)
+                {
+                    format!("{}_{attr}(nil, {r_lua}, {c_lua})", self.class_name)
+                } else {
+                    let obj_lua = self.lower_ui_expr_to_lua(value, &FxHashMap::default());
+                    format!("{obj_lua}.{attr}({r_lua}, {c_lua})")
+                }
+            }
+            ast::ExprKind::Ident(name) => {
+                if self.env.local_functions.contains_key(name)
+                    || self.env.module_functions.contains_key(name)
+                {
+                    format!("{name}({r_lua}, {c_lua})")
+                } else if self.env.class_methods.contains_key(name) {
+                    format!("{}_{name}(nil, {r_lua}, {c_lua})", self.class_name)
+                } else {
+                    format!("{name}({r_lua}, {c_lua})")
                 }
             }
             _ => "\"\"".to_string(),
@@ -1486,6 +1967,47 @@ impl<'a> UiParserCtx<'a> {
                     .or_else(|| self.env.class_methods.get(name))
                     .or_else(|| self.env.module_functions.get(name))?;
                 self.eval_preview_function(func, &[PreviewVal::Int(idx)], 0)
+                    .map(|v| v.to_display_string())
+            }
+            _ => None,
+        }
+    }
+
+    fn eval_callable_2d_preview(&self, fn_expr: &ast::Expr, r: i64, c: i64) -> Option<String> {
+        match &fn_expr.kind {
+            ast::ExprKind::Lambda { params, body } => {
+                let mut vars = FxHashMap::default();
+                for (name, val) in &self.env.constants {
+                    vars.insert(name.clone(), PreviewVal::from_const(val));
+                }
+                if let Some(p0) = params.first() {
+                    vars.insert(p0.name.clone(), PreviewVal::Int(r));
+                }
+                if let Some(p1) = params.get(1) {
+                    vars.insert(p1.name.clone(), PreviewVal::Int(c));
+                }
+                self.eval_preview_expr(body, &vars, 0)
+                    .map(|v| v.to_display_string())
+            }
+            ast::ExprKind::Attribute { value, attr } => {
+                if let ast::ExprKind::Ident(obj) = &value.kind
+                    && (obj == "self" || obj == self.class_name)
+                    && let Some(method) = self.env.class_methods.get(attr)
+                {
+                    return self
+                        .eval_preview_function(method, &[PreviewVal::Int(r), PreviewVal::Int(c)], 0)
+                        .map(|v| v.to_display_string());
+                }
+                None
+            }
+            ast::ExprKind::Ident(name) => {
+                let func = self
+                    .env
+                    .local_functions
+                    .get(name)
+                    .or_else(|| self.env.class_methods.get(name))
+                    .or_else(|| self.env.module_functions.get(name))?;
+                self.eval_preview_function(func, &[PreviewVal::Int(r), PreviewVal::Int(c)], 0)
                     .map(|v| v.to_display_string())
             }
             _ => None,
@@ -1830,18 +2352,56 @@ impl<'a> UiParserCtx<'a> {
             }
 
             ast::ExprKind::Subscript { value, index } => {
-                let (ctl, _) = self.resolve_control_ref(value)?;
-                let Some(idx_val) = eval_constant(index).and_then(|c| c.as_i64()) else {
-                    self.diagnostics.report(
-                        DiagnosticKind::InvalidDeclarationArgument {
-                            name: ctl.ident.clone(),
-                            message:
-                                "Control subscript index in UI layout must be an integer literal"
-                                    .to_string(),
-                        },
-                        index.span,
-                    );
-                    return None;
+                let (ctl, outer_idx) = self.resolve_control_ref(value)?;
+                let idx_val = if let Some(r_idx) = outer_idx {
+                    let Some(c_val) = eval_constant(index).and_then(|c| c.as_i64()) else {
+                        self.diagnostics.report(
+                            DiagnosticKind::InvalidDeclarationArgument {
+                                name: ctl.ident.clone(),
+                                message: "Control subscript index in UI layout must be an integer literal".to_string(),
+                            },
+                            index.span,
+                        );
+                        return None;
+                    };
+                    let cols = ctl.def.cols.unwrap_or(1) as i64;
+                    (r_idx as i64) * cols + c_val
+                } else if let ast::ExprKind::Tuple(elts) = &index.kind
+                    && elts.len() == 2
+                {
+                    let (Some(r_val), Some(c_val)) = (
+                        eval_constant(&elts[0]).and_then(|c| c.as_i64()),
+                        eval_constant(&elts[1]).and_then(|c| c.as_i64()),
+                    ) else {
+                        self.diagnostics.report(
+                            DiagnosticKind::InvalidDeclarationArgument {
+                                name: ctl.ident.clone(),
+                                message: "Control 2D subscript indices in UI layout must be integer literals".to_string(),
+                            },
+                            index.span,
+                        );
+                        return None;
+                    };
+                    if r_val < 0 || c_val < 0 {
+                        -1
+                    } else {
+                        let cols = ctl.def.cols.unwrap_or(1) as i64;
+                        r_val * cols + c_val
+                    }
+                } else {
+                    let Some(val) = eval_constant(index).and_then(|c| c.as_i64()) else {
+                        self.diagnostics.report(
+                            DiagnosticKind::InvalidDeclarationArgument {
+                                name: ctl.ident.clone(),
+                                message:
+                                    "Control subscript index in UI layout must be an integer literal"
+                                        .to_string(),
+                            },
+                            index.span,
+                        );
+                        return None;
+                    };
+                    val
                 };
                 if idx_val < 0
                     || (ctl.def.count_property.is_none() && (idx_val as usize) >= ctl.def.count)
@@ -1893,6 +2453,72 @@ fn escape_lua_str_content(s: &str) -> String {
         }
     }
     out
+}
+
+fn has_2d_template_vars(template: &str) -> bool {
+    template.contains("{r}")
+        || template.contains("{row}")
+        || template.contains("{track}")
+        || template.contains("{c}")
+        || template.contains("{col}")
+}
+
+fn has_only_row_template_vars(template: &str) -> bool {
+    let has_row =
+        template.contains("{r}") || template.contains("{row}") || template.contains("{track}");
+    let has_col_or_flat = template.contains("{c}")
+        || template.contains("{col}")
+        || template.contains("{i}")
+        || template.contains("{ch}");
+    has_row && !has_col_or_flat
+}
+
+fn normalize_2d_cell_template(template: &str, has_row_label: bool) -> String {
+    if has_2d_template_vars(template) || template.contains("{i}") || template.contains("{ch}") {
+        template.to_string()
+    } else if has_row_label {
+        format!("{template} {{c}}")
+    } else {
+        template.to_string()
+    }
+}
+
+fn format_2d_template(template: &str, r: usize, c: usize, ch: usize) -> String {
+    let r_str = r.to_string();
+    let c_str = c.to_string();
+    let ch_str = ch.to_string();
+    template
+        .replace("{r}", &r_str)
+        .replace("{row}", &r_str)
+        .replace("{track}", &r_str)
+        .replace("{c}", &c_str)
+        .replace("{col}", &c_str)
+        .replace("{i}", &ch_str)
+        .replace("{ch}", &ch_str)
+}
+
+fn format_2d_surface(template: &str, r: usize, c: usize, ch: usize, has_row_label: bool) -> String {
+    if has_2d_template_vars(template) || template.contains("{i}") || template.contains("{ch}") {
+        format_2d_template(template, r, c, ch)
+    } else if has_row_label {
+        format!("{template} {c}")
+    } else {
+        format!("{template} {ch}")
+    }
+}
+
+fn format_row_label_surface(template: &str, r: usize) -> String {
+    let r_str = r.to_string();
+    if template.contains("{r}") || template.contains("{row}") || template.contains("{track}") {
+        template
+            .replace("{r}", &r_str)
+            .replace("{row}", &r_str)
+            .replace("{track}", &r_str)
+    } else if template.contains("{i}") || template.contains("{ch}") {
+        template.replace("{i}", &r_str).replace("{ch}", &r_str)
+    } else {
+        format!("{template} {r_str}")
+    }
 }
 
 fn format_channel_template(template: &str, ch: usize) -> String {

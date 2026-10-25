@@ -62,8 +62,12 @@ class ControlHandle:
     RampTime: float
     """Time in seconds over which the control ramps to new values."""
 
-    def __getitem__(self, index: int) -> ControlHandle:
-        """Select a 0-based channel from a multi-channel (`count > 1`) control."""
+    def __getitem__(self, index: int | tuple[int, int] | str) -> ControlHandle:
+        """Select a 0-based channel (or 2D `(row, col)` channel) from a multi-channel (`count > 1`) control."""
+        ...
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        """Assign a dynamic property field on the control (e.g. `ctl["Choices"] = ...`)."""
         ...
 
     @classmethod
@@ -77,6 +81,8 @@ class ControlHandle:
                 print(ctl.Value)
         """
         ...
+
+CountSpec = int | PropertyHandle | tuple[int | PropertyHandle, int | PropertyHandle]
 
 class Control:
     """Factory declarations for Q-SYS controls."""
@@ -95,7 +101,9 @@ class Control:
         default: float | str = 0.0,
         pins: PinStyle = "Both",
         user_pin: bool = True,
-        count: int | PropertyHandle = 1,
+        count: CountSpec = 1,
+        rows: int | PropertyHandle | None = None,
+        cols: int | PropertyHandle | None = None,
     ) -> ControlHandle:
         """Declare a generic control whose Q-SYS ControlType depends on an Enum/String Property."""
         ...
@@ -109,7 +117,9 @@ class Control:
         default: float | str = 0.0,
         pins: PinStyle = "Both",
         user_pin: bool = True,
-        count: int | PropertyHandle = 1,
+        count: CountSpec = 1,
+        rows: int | PropertyHandle | None = None,
+        cols: int | PropertyHandle | None = None,
     ) -> ControlHandle:
         """Alias for Control.Generic — declare a property-typed dynamic control."""
         ...
@@ -123,7 +133,9 @@ class Control:
         unit: ControlUnit = "Float",
         pins: PinStyle = "Both",
         user_pin: bool = True,
-        count: int | PropertyHandle = 1,
+        count: CountSpec = 1,
+        rows: int | PropertyHandle | None = None,
+        cols: int | PropertyHandle | None = None,
     ) -> ControlHandle:
         """Continuous float control (Knob or continuous slider)."""
         ...
@@ -137,7 +149,9 @@ class Control:
         unit: ControlUnit = "Float",
         pins: PinStyle = "Both",
         user_pin: bool = True,
-        count: int | PropertyHandle = 1,
+        count: CountSpec = 1,
+        rows: int | PropertyHandle | None = None,
+        cols: int | PropertyHandle | None = None,
     ) -> ControlHandle:
         """Rotary continuous knob control."""
         ...
@@ -151,7 +165,9 @@ class Control:
         unit: ControlUnit = "Float",
         pins: PinStyle = "Both",
         user_pin: bool = True,
-        count: int | PropertyHandle = 1,
+        count: CountSpec = 1,
+        rows: int | PropertyHandle | None = None,
+        cols: int | PropertyHandle | None = None,
     ) -> ControlHandle:
         """Linear fader slider control."""
         ...
@@ -162,7 +178,9 @@ class Control:
         type: ButtonType = "Momentary",
         pins: PinStyle = "Both",
         user_pin: bool = True,
-        count: int | PropertyHandle = 1,
+        count: CountSpec = 1,
+        rows: int | PropertyHandle | None = None,
+        cols: int | PropertyHandle | None = None,
     ) -> ControlHandle:
         """Push button control with configurable behavior (Momentary, Toggle, Trigger)."""
         ...
@@ -173,7 +191,9 @@ class Control:
         type: ButtonType = "Toggle",
         pins: PinStyle = "Both",
         user_pin: bool = True,
-        count: int | PropertyHandle = 1,
+        count: CountSpec = 1,
+        rows: int | PropertyHandle | None = None,
+        cols: int | PropertyHandle | None = None,
     ) -> ControlHandle:
         """Binary toggle button control."""
         ...
@@ -185,7 +205,9 @@ class Control:
         type: TextType = "Text",
         pins: PinStyle = "Both",
         user_pin: bool = True,
-        count: int | PropertyHandle = 1,
+        count: CountSpec = 1,
+        rows: int | PropertyHandle | None = None,
+        cols: int | PropertyHandle | None = None,
     ) -> ControlHandle:
         """Text display or input box control."""
         ...
@@ -196,7 +218,9 @@ class Control:
         unit: ControlUnit = "Float",
         pins: PinStyle = "Both",
         user_pin: bool = True,
-        count: int | PropertyHandle = 1,
+        count: CountSpec = 1,
+        rows: int | PropertyHandle | None = None,
+        cols: int | PropertyHandle | None = None,
     ) -> ControlHandle:
         """Read-only LED or meter display indicator."""
         ...
@@ -207,7 +231,9 @@ class Control:
         default: str = "255.255.255.255",
         pins: PinStyle = "Both",
         user_pin: bool = True,
-        count: int | PropertyHandle = 1,
+        count: CountSpec = 1,
+        rows: int | PropertyHandle | None = None,
+        cols: int | PropertyHandle | None = None,
     ) -> ControlHandle:
         """Q-SYS IP Address text control."""
         ...
@@ -218,7 +244,9 @@ class Control:
         default: str = "00:00:00:00:00:00",
         pins: PinStyle = "Both",
         user_pin: bool = True,
-        count: int | PropertyHandle = 1,
+        count: CountSpec = 1,
+        rows: int | PropertyHandle | None = None,
+        cols: int | PropertyHandle | None = None,
     ) -> ControlHandle:
         """Q-SYS MAC Address text control."""
         ...
@@ -227,6 +255,12 @@ class PropertyHandle:
     """Handle to a plugin property value configured in Q-SYS Designer properties panel."""
 
     Value: Any
+
+    def __mul__(self, other: int | PropertyHandle) -> PropertyHandle:
+        ...
+
+    def __rmul__(self, other: int | PropertyHandle) -> PropertyHandle:
+        ...
 
 class Property:
     """Factory declarations for Q-SYS Plugin Properties."""

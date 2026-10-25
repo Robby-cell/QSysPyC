@@ -147,6 +147,24 @@ pub fn emit_plugin(plugin: &IRPlugin, ctx: &mut CodegenContext) -> String {
             .map(|c| &c.def);
         let ctl_count = ctl_def.map(|d| d.count).unwrap_or(1);
         let ctl_count_prop = ctl_def.and_then(|d| d.count_property.as_deref());
+        let handler_arity = plugin
+            .methods
+            .iter()
+            .find(|m| m.id == binding.handler_id || m.name == binding.handler_name)
+            .map(|m| m.params.len())
+            .unwrap_or(2);
+        let is_2d_handler = handler_arity >= 3;
+        let cols_runtime_expr =
+            if let Some(cols_prop) = ctl_def.and_then(|d| d.cols_property.as_deref()) {
+                let raw = format_count_lua_expr(cols_prop, "Properties");
+                if raw.contains(" * ") || raw.contains(" + ") || raw.contains(" - ") {
+                    format!("({raw})")
+                } else {
+                    raw
+                }
+            } else {
+                ctl_def.and_then(|d| d.cols).unwrap_or(1).max(1).to_string()
+            };
 
         if let Some(prop_name) = ctl_count_prop {
             let prop_ref = format_count_lua_expr(prop_name, "Properties");
@@ -186,7 +204,11 @@ pub fn emit_plugin(plugin: &IRPlugin, ctx: &mut CodegenContext) -> String {
                 emitter.indent();
                 emitter.write_line(&format!("{ctl_ref}.EventHandler = function(c)"));
                 emitter.indent();
-                emitter.write_line(&format!("{handler_fn}(nil, c, 0)"));
+                if is_2d_handler {
+                    emitter.write_line(&format!("{handler_fn}(nil, c, 0, 0)"));
+                } else {
+                    emitter.write_line(&format!("{handler_fn}(nil, c, 0)"));
+                }
                 emitter.dedent();
                 emitter.write_line("end");
                 emitter.dedent();
@@ -196,7 +218,13 @@ pub fn emit_plugin(plugin: &IRPlugin, ctx: &mut CodegenContext) -> String {
                 emitter.indent();
                 emitter.write_line("ctl.EventHandler = function(c)");
                 emitter.indent();
-                emitter.write_line(&format!("{handler_fn}(nil, c, ix - 1)"));
+                if is_2d_handler {
+                    emitter.write_line(&format!(
+                        "{handler_fn}(nil, c, (ix - 1) // {cols_runtime_expr}, (ix - 1) % {cols_runtime_expr})"
+                    ));
+                } else {
+                    emitter.write_line(&format!("{handler_fn}(nil, c, ix - 1)"));
+                }
                 emitter.dedent();
                 emitter.write_line("end");
                 emitter.dedent();
@@ -218,7 +246,13 @@ pub fn emit_plugin(plugin: &IRPlugin, ctx: &mut CodegenContext) -> String {
             emitter.indent();
             emitter.write_line("ctl.EventHandler = function(c)");
             emitter.indent();
-            emitter.write_line(&format!("{handler_fn}(nil, c, ix - 1)"));
+            if is_2d_handler {
+                emitter.write_line(&format!(
+                    "{handler_fn}(nil, c, (ix - 1) // {cols_runtime_expr}, (ix - 1) % {cols_runtime_expr})"
+                ));
+            } else {
+                emitter.write_line(&format!("{handler_fn}(nil, c, ix - 1)"));
+            }
             emitter.dedent();
             emitter.write_line("end");
             emitter.dedent();
@@ -658,6 +692,56 @@ fn format_dynamic_channel_lua_expr(template: &str, prop_expr: &str) -> String {
     }
 }
 
+fn format_template_with_rc_i_lua(template: &str) -> Option<String> {
+    let normalized = template
+        .replace("{row}", "{r}")
+        .replace("{track}", "{r}")
+        .replace("{col}", "{c}")
+        .replace("{ch}", "{i}");
+    if !normalized.contains("{r}") && !normalized.contains("{c}") && !normalized.contains("{i}") {
+        return None;
+    }
+    let mut parts = Vec::new();
+    let mut rest = normalized.as_str();
+    while !rest.is_empty() {
+        let next_r = rest.find("{r}").map(|p| (p, "r"));
+        let next_c = rest.find("{c}").map(|p| (p, "c"));
+        let next_i = rest.find("{i}").map(|p| (p, "i"));
+        let earliest = [next_r, next_c, next_i]
+            .into_iter()
+            .flatten()
+            .min_by_key(|(pos, _)| *pos);
+        if let Some((pos, var)) = earliest {
+            if pos > 0 {
+                parts.push(escape_lua_string(&rest[..pos]));
+            }
+            parts.push(format!("tostring({var})"));
+            rest = &rest[pos + 3..];
+        } else {
+            parts.push(escape_lua_string(rest));
+            break;
+        }
+    }
+    Some(parts.join(" .. "))
+}
+
+fn format_dynamic_row_label_lua_expr(template: &str) -> String {
+    if let Some(expr) = format_template_with_rc_i_lua(template) {
+        expr
+    } else {
+        let prefix = escape_lua_string(&format!("{template} "));
+        format!("{prefix} .. tostring(r)")
+    }
+}
+
+fn format_dynamic_2d_lua_expr(template: &str, prop_expr: &str) -> String {
+    if let Some(expr) = format_template_with_rc_i_lua(template) {
+        expr
+    } else {
+        format_dynamic_channel_lua_expr(template, prop_expr)
+    }
+}
+
 fn build_dynamic_style_lua_expr(emitter: &LuaEmitter<'_>, type_prop: &str) -> String {
     let prop_expr = format!("props[{}].Value", escape_lua_string(type_prop));
     let matching_gspec = emitter.ctx.controls.values().find_map(|d| {
@@ -735,6 +819,135 @@ fn emit_control_layout_item(emitter: &mut LuaEmitter<'_>, ctl: &ControlLayoutDef
         let base_prefix = escape_lua_string(&format!("{} ", rep.base_control_name));
         let dx = rep.step_x.round() as i64;
         let dy = rep.step_y.round() as i64;
+
+        if let (Some(rows_spec), Some(cols_spec)) = (&rep.rows_spec, &rep.cols_spec) {
+            let rows_expr = format_count_lua_expr(rows_spec, "props");
+            let cols_expr = format_count_lua_expr(cols_spec, "props");
+            let cols_factor = if cols_expr.contains(" * ")
+                || cols_expr.contains(" + ")
+                || cols_expr.contains(" - ")
+            {
+                format!("({cols_expr})")
+            } else {
+                cols_expr.clone()
+            };
+
+            emitter.write_line(&format!("for r = 1, {rows_expr} do"));
+            emitter.indent();
+
+            if rep.row_label_template.is_some() || rep.row_label_lua_expr.is_some() {
+                let rlbl_dyn_x = ctl
+                    .dyn_x
+                    .as_ref()
+                    .map(|e| e.add_const(rep.row_label_offset_x.round() as i64));
+                let rlbl_dyn_y = ctl
+                    .dyn_y
+                    .as_ref()
+                    .map(|e| e.add_const(rep.row_label_offset_y.round() as i64));
+                let rlx_str =
+                    format_axis_or_static(&rlbl_dyn_x, ctl.position.x + rep.row_label_offset_x);
+                let rly_str =
+                    format_axis_or_static(&rlbl_dyn_y, ctl.position.y + rep.row_label_offset_y);
+                let rl_pos_y = if dy == 0 {
+                    rly_str
+                } else {
+                    format!("{rly_str} + (r - 1) * {dy}")
+                };
+                let rlw = rep.row_label_width.round() as i64;
+                let rlh = rep.row_label_height.round() as i64;
+                let rlbl_text_expr = rep.row_label_lua_expr.clone().unwrap_or_else(|| {
+                    format_dynamic_row_label_lua_expr(
+                        rep.row_label_template.as_deref().unwrap_or(""),
+                    )
+                });
+
+                emitter.write_line("table.insert(graphics, {");
+                emitter.indent();
+                emitter.write_line("Type = \"Label\",");
+                emitter.write_line(&format!("Text = {rlbl_text_expr},"));
+                emitter.write_line(&format!("Position = {{ {rlx_str}, {rl_pos_y} }},"));
+                emitter.write_line(&format!("Size = {{ {rlw}, {rlh} }},"));
+                emitter.write_line(&format!("FontSize = {},", rep.row_label_font_size));
+                emitter.write_line("HTextAlign = \"Left\",");
+                emitter.dedent();
+                emitter.write_line("})");
+            }
+
+            emitter.write_line(&format!("for c = 1, {cols_expr} do"));
+            emitter.indent();
+            emitter.write_line(&format!("local i = (r - 1) * {cols_factor} + c"));
+
+            if rep.label_template.is_some() || rep.label_lua_expr.is_some() {
+                let lbl_dyn_x = ctl
+                    .dyn_x
+                    .as_ref()
+                    .map(|e| e.add_const(rep.label_offset_x.round() as i64));
+                let lbl_dyn_y = ctl
+                    .dyn_y
+                    .as_ref()
+                    .map(|e| e.add_const(rep.label_offset_y.round() as i64));
+                let lx_str = format_axis_or_static(&lbl_dyn_x, ctl.position.x + rep.label_offset_x);
+                let ly_str = format_axis_or_static(&lbl_dyn_y, ctl.position.y + rep.label_offset_y);
+                let lw = rep.label_width.round() as i64;
+                let lh = rep.label_height.round() as i64;
+                let l_pos_x = if dx == 0 {
+                    lx_str
+                } else {
+                    format!("{lx_str} + (c - 1) * {dx}")
+                };
+                let l_pos_y = if dy == 0 {
+                    ly_str
+                } else {
+                    format!("{ly_str} + (r - 1) * {dy}")
+                };
+                let lbl_text_expr = rep.label_lua_expr.clone().unwrap_or_else(|| {
+                    format_dynamic_2d_lua_expr(
+                        rep.label_template.as_deref().unwrap_or(""),
+                        &prop_expr,
+                    )
+                });
+
+                emitter.write_line("table.insert(graphics, {");
+                emitter.indent();
+                emitter.write_line("Type = \"Label\",");
+                emitter.write_line(&format!("Text = {lbl_text_expr},"));
+                emitter.write_line(&format!("Position = {{ {l_pos_x}, {l_pos_y} }},"));
+                emitter.write_line(&format!("Size = {{ {lw}, {lh} }},"));
+                emitter.write_line(&format!("FontSize = {},", rep.label_font_size));
+                emitter.write_line("HTextAlign = \"Left\",");
+                emitter.dedent();
+                emitter.write_line("})");
+            }
+
+            let pos_x = if dx == 0 {
+                x_str.clone()
+            } else {
+                format!("{x_str} + (c - 1) * {dx}")
+            };
+            let pos_y = if dy == 0 {
+                y_str.clone()
+            } else {
+                format!("{y_str} + (r - 1) * {dy}")
+            };
+            let pretty_expr = rep.pretty_name_lua_expr.clone().unwrap_or_else(|| {
+                format_dynamic_2d_lua_expr(&rep.pretty_name_template, &prop_expr)
+            });
+
+            emitter.write_line(&format!(
+                "local ctl_key = ({prop_expr} == 1) and {base_str} or ({base_prefix} .. tostring(i))"
+            ));
+            emitter.write_line("layout[ctl_key] = {");
+            emitter.indent();
+            emit_control_layout_fields(emitter, ctl, &pretty_expr, &pos_x, &pos_y, w, h);
+            emitter.dedent();
+            emitter.write_line("}");
+
+            emitter.dedent();
+            emitter.write_line("end");
+            emitter.dedent();
+            emitter.write_line("end");
+            return;
+        }
 
         emitter.write_line(&format!("for i = 1, {prop_expr} do"));
         emitter.indent();
@@ -979,6 +1192,10 @@ fn page_references_fn_name(page: &PageLayout, fn_name: &str) -> bool {
                     .is_some_and(|e| e.contains(&call_prefix))
                     || rep
                         .pretty_name_lua_expr
+                        .as_ref()
+                        .is_some_and(|e| e.contains(&call_prefix))
+                    || rep
+                        .row_label_lua_expr
                         .as_ref()
                         .is_some_and(|e| e.contains(&call_prefix))
             })

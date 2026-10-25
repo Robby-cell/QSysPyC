@@ -631,7 +631,88 @@ fn eval_count_expr(
     None
 }
 
-fn resolve_count_arg(
+pub(crate) fn combine_2d_count_specs(
+    r_val: usize,
+    r_prop: &Option<String>,
+    c_val: usize,
+    c_prop: &Option<String>,
+) -> Option<String> {
+    let to_token = |val: usize, prop: &Option<String>| -> String {
+        if let Some(p) = prop {
+            if p.contains("{PROP:") {
+                if p.contains(' ') {
+                    format!("({p})")
+                } else {
+                    p.clone()
+                }
+            } else {
+                format!("{{PROP:{p}}}")
+            }
+        } else {
+            val.to_string()
+        }
+    };
+
+    match (r_prop.is_some(), c_prop.is_some()) {
+        (false, false) => None,
+        (true, false) if c_val == 1 => r_prop.clone(),
+        (false, true) if r_val == 1 => c_prop.clone(),
+        _ => Some(format!(
+            "{} * {}",
+            to_token(r_val, r_prop),
+            to_token(c_val, c_prop)
+        )),
+    }
+}
+
+fn expr_ident_hint(expr: &ast::Expr) -> String {
+    match &expr.kind {
+        ast::ExprKind::Ident(id) => id.clone(),
+        ast::ExprKind::Attribute { value, attr } => {
+            if attr == "Value" {
+                expr_ident_hint(value)
+            } else {
+                attr.clone()
+            }
+        }
+        _ => String::new(),
+    }
+}
+
+fn should_swap_mul_dims(
+    left: &ast::Expr,
+    l_prop: &Option<String>,
+    right: &ast::Expr,
+    r_prop: &Option<String>,
+) -> bool {
+    let l_str = format!(
+        "{} {}",
+        expr_ident_hint(left),
+        l_prop.as_deref().unwrap_or("")
+    )
+    .to_ascii_lowercase();
+    let r_str = format!(
+        "{} {}",
+        expr_ident_hint(right),
+        r_prop.as_deref().unwrap_or("")
+    )
+    .to_ascii_lowercase();
+
+    let is_col_like = |s: &str| s.contains("per") || s.contains("col");
+    let is_row_like = |s: &str| {
+        !is_col_like(s)
+            && (s.contains("row")
+                || s.contains("track")
+                || s.contains("group")
+                || s.contains("bank")
+                || s.contains("bus")
+                || s.contains("line"))
+    };
+
+    (is_col_like(&l_str) && !is_col_like(&r_str)) || (is_row_like(&r_str) && !is_row_like(&l_str))
+}
+
+pub(crate) fn resolve_count_arg(
     val: &ast::Expr,
     control_name: &str,
     properties: &[DeclaredProperty],
@@ -766,16 +847,122 @@ fn try_parse_control(
         },
     };
 
-    let (count, count_property) = match kwargs.iter().find(|(k, _)| k == "count") {
-        Some((_, val)) => resolve_count_arg(
-            val,
+    let mut rows: Option<usize> = None;
+    let mut cols: Option<usize> = None;
+    let mut rows_property: Option<String> = None;
+    let mut cols_property: Option<String> = None;
+    let mut explicit_2d = false;
+
+    let count_kwarg = kwargs.iter().find(|(k, _)| k == "count");
+    let (mut count, mut count_property) = match count_kwarg {
+        Some((_, val)) => match &val.kind {
+            ast::ExprKind::Tuple(items) | ast::ExprKind::List(items) if items.len() == 2 => {
+                let (r_val, r_prop) = resolve_count_arg(
+                    &items[0],
+                    &control_name,
+                    properties,
+                    prop_resolutions,
+                    diagnostics,
+                )?;
+                let (c_val, c_prop) = resolve_count_arg(
+                    &items[1],
+                    &control_name,
+                    properties,
+                    prop_resolutions,
+                    diagnostics,
+                )?;
+                let total = r_val.saturating_mul(c_val).clamp(1, 256);
+                let total_prop = combine_2d_count_specs(r_val, &r_prop, c_val, &c_prop);
+                rows = Some(r_val);
+                cols = Some(c_val);
+                rows_property = r_prop;
+                cols_property = c_prop;
+                explicit_2d = true;
+                (total, total_prop)
+            }
+            _ => {
+                let (total, total_prop) = resolve_count_arg(
+                    val,
+                    &control_name,
+                    properties,
+                    prop_resolutions,
+                    diagnostics,
+                )?;
+                if let ast::ExprKind::Binary {
+                    left,
+                    op: ast::BinaryOp::Mul,
+                    right,
+                } = &val.kind
+                {
+                    let mut dummy_res = Vec::new();
+                    let mut dummy_diags = Diagnostics::new();
+                    if let (Some((l_val, l_prop)), Some((r_val, r_prop))) = (
+                        resolve_count_arg(
+                            left,
+                            &control_name,
+                            properties,
+                            &mut dummy_res,
+                            &mut dummy_diags,
+                        ),
+                        resolve_count_arg(
+                            right,
+                            &control_name,
+                            properties,
+                            &mut dummy_res,
+                            &mut dummy_diags,
+                        ),
+                    ) {
+                        if should_swap_mul_dims(left, &l_prop, right, &r_prop) {
+                            rows = Some(r_val);
+                            rows_property = r_prop;
+                            cols = Some(l_val);
+                            cols_property = l_prop;
+                        } else {
+                            rows = Some(l_val);
+                            rows_property = l_prop;
+                            cols = Some(r_val);
+                            cols_property = r_prop;
+                        }
+                    }
+                }
+                (total, total_prop)
+            }
+        },
+        None => (1, None),
+    };
+
+    if let Some((_, r_expr)) = kwargs.iter().find(|(k, _)| k == "rows") {
+        let (r_val, r_prop) = resolve_count_arg(
+            r_expr,
             &control_name,
             properties,
             prop_resolutions,
             diagnostics,
-        )?,
-        None => (1, None),
-    };
+        )?;
+        rows = Some(r_val);
+        rows_property = r_prop;
+        explicit_2d = true;
+    }
+    if let Some((_, c_expr)) = kwargs.iter().find(|(k, _)| k == "cols" || k == "columns") {
+        let (c_val, c_prop) = resolve_count_arg(
+            c_expr,
+            &control_name,
+            properties,
+            prop_resolutions,
+            diagnostics,
+        )?;
+        cols = Some(c_val);
+        cols_property = c_prop;
+        explicit_2d = true;
+    }
+    if explicit_2d && count_kwarg.is_none() {
+        let r_val = rows.unwrap_or(1);
+        let c_val = cols.unwrap_or(1);
+        rows = Some(r_val);
+        cols = Some(c_val);
+        count = r_val.saturating_mul(c_val).clamp(1, 256);
+        count_property = combine_2d_count_specs(r_val, &rows_property, c_val, &cols_property);
+    }
 
     let pin_style = match kwargs.iter().find(|(k, _)| k == "pins") {
         Some((_, val)) => {
@@ -1119,6 +1306,7 @@ fn try_parse_control(
                 .with_pin_style(pin_style)
                 .with_user_pin(user_pin)
                 .with_count_property(count_property)
+                .with_grid_dimensions(rows, cols, rows_property, cols_property, explicit_2d)
                 .with_generic_spec(Some(gspec));
             if count > 1 {
                 def = def.with_count(count);
@@ -1138,7 +1326,8 @@ fn try_parse_control(
     let mut def = ControlDef::new(control_name, kind)
         .with_pin_style(pin_style)
         .with_user_pin(user_pin)
-        .with_count_property(count_property);
+        .with_count_property(count_property)
+        .with_grid_dimensions(rows, cols, rows_property, cols_property, explicit_2d);
     if count > 1 {
         def = def.with_count(count);
     }

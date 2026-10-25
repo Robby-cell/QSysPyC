@@ -1016,27 +1016,101 @@ impl<'a> StmtLowerer<'a> {
                 attr: attr.clone(),
             },
 
-            // Subscript Indexing (Dictionaries and string keys do NOT get +1 offset)
-            ast::ExprKind::Subscript { value, index } => {
-                let val_ty = self.type_map.get_type(value.span);
-                let idx_ty = self.type_map.get_type(index.span);
-                let is_str_idx = matches!(index.kind, ast::ExprKind::String(_))
-                    || matches!(idx_ty, Some(Type::String));
-
-                let is_zero_based = !is_str_idx
-                    && matches!(
-                        val_ty,
-                        Some(Type::List(_) | Type::Tuple(_) | Type::ControlHandle)
-                    );
-
-                IRExpr::Index {
-                    base: Box::new(self.lower_expr(value)),
-                    index: Box::new(self.lower_expr(index)),
-                    is_zero_based,
-                }
-            }
+            // Subscript Indexing (Dictionaries and string keys do NOT get +1 offset;
+            // 2D control indexing `self.Inputs[r, c]` and `self.Inputs[r][c]` flattens to `r * cols + c`)
+            ast::ExprKind::Subscript { value, index } => self.lower_subscript_expr(value, index),
 
             ast::ExprKind::Error => IRExpr::Nil,
+        }
+    }
+
+    fn control_cols_ir(&self, ctl_id: ControlId) -> IRExpr {
+        if let Some(ctl) = self.controls.iter().find(|c| c.id == ctl_id) {
+            if let Some(ref cols_prop) = ctl.def.cols_property
+                && let Some(prop) = self
+                    .ui_env
+                    .properties
+                    .iter()
+                    .find(|p| p.def.name == *cols_prop)
+            {
+                return IRExpr::Property(prop.id);
+            }
+            return IRExpr::Int(ctl.def.cols.unwrap_or(1) as i64);
+        }
+        IRExpr::Int(1)
+    }
+
+    fn lower_subscript_expr(&self, value: &ast::Expr, index: &ast::Expr) -> IRExpr {
+        let val_ty = self.type_map.get_type(value.span);
+        let idx_ty = self.type_map.get_type(index.span);
+        let is_str_idx =
+            matches!(index.kind, ast::ExprKind::String(_)) || matches!(idx_ty, Some(Type::String));
+
+        if !is_str_idx {
+            // 1. Tuple 2D indexing on a control: `self.Inputs[r, c]`
+            if let Some(ResolvedTarget::Control(ctl_id)) = self.type_map.get_resolution(value.span)
+                && let ast::ExprKind::Tuple(elts) = &index.kind
+                && elts.len() == 2
+            {
+                let r_ir = self.lower_expr(&elts[0]);
+                let c_ir = self.lower_expr(&elts[1]);
+                let cols_ir = self.control_cols_ir(*ctl_id);
+                let flat_idx = IRExpr::Binary {
+                    left: Box::new(IRExpr::Binary {
+                        left: Box::new(r_ir),
+                        op: IRBinaryOp::Mul,
+                        right: Box::new(cols_ir),
+                    }),
+                    op: IRBinaryOp::Add,
+                    right: Box::new(c_ir),
+                };
+                return IRExpr::Index {
+                    base: Box::new(IRExpr::Control(*ctl_id)),
+                    index: Box::new(flat_idx),
+                    is_zero_based: true,
+                };
+            }
+
+            // 2. Chained 2D indexing on a control: `self.Inputs[r][c]`
+            if let ast::ExprKind::Subscript {
+                value: inner_val,
+                index: r_expr,
+            } = &value.kind
+                && let Some(ResolvedTarget::Control(ctl_id)) =
+                    self.type_map.get_resolution(inner_val.span)
+                && !matches!(r_expr.kind, ast::ExprKind::String(_))
+                && !matches!(self.type_map.get_type(r_expr.span), Some(Type::String))
+            {
+                let r_ir = self.lower_expr(r_expr);
+                let c_ir = self.lower_expr(index);
+                let cols_ir = self.control_cols_ir(*ctl_id);
+                let flat_idx = IRExpr::Binary {
+                    left: Box::new(IRExpr::Binary {
+                        left: Box::new(r_ir),
+                        op: IRBinaryOp::Mul,
+                        right: Box::new(cols_ir),
+                    }),
+                    op: IRBinaryOp::Add,
+                    right: Box::new(c_ir),
+                };
+                return IRExpr::Index {
+                    base: Box::new(IRExpr::Control(*ctl_id)),
+                    index: Box::new(flat_idx),
+                    is_zero_based: true,
+                };
+            }
+        }
+
+        let is_zero_based = !is_str_idx
+            && matches!(
+                val_ty,
+                Some(Type::List(_) | Type::Tuple(_) | Type::ControlHandle)
+            );
+
+        IRExpr::Index {
+            base: Box::new(self.lower_expr(value)),
+            index: Box::new(self.lower_expr(index)),
+            is_zero_based,
         }
     }
 
@@ -1151,22 +1225,7 @@ impl<'a> StmtLowerer<'a> {
             ast::ExprKind::Subscript {
                 value: sub_val,
                 index: sub_idx,
-            } => {
-                let val_ty = self.type_map.get_type(sub_val.span);
-                let idx_ty = self.type_map.get_type(sub_idx.span);
-                let is_str_idx = matches!(sub_idx.kind, ast::ExprKind::String(_))
-                    || matches!(idx_ty, Some(Type::String));
-                let is_zero_based = !is_str_idx
-                    && matches!(
-                        val_ty,
-                        Some(Type::List(_) | Type::Tuple(_) | Type::ControlHandle)
-                    );
-                IRExpr::Index {
-                    base: Box::new(self.lower_expr(sub_val)),
-                    index: Box::new(self.lower_expr(sub_idx)),
-                    is_zero_based,
-                }
-            }
+            } => self.lower_subscript_expr(sub_val, sub_idx),
             ast::ExprKind::Tuple(items) | ast::ExprKind::List(items) => {
                 IRExpr::Tuple(items.iter().map(|i| self.lower_assign_target(i)).collect())
             }

@@ -395,7 +395,7 @@ pub fn analyze_lossy_with_env(
                             let mut param_ty = if is_event_handler && idx == 1 {
                                 Type::ControlHandle
                             } else if is_event_handler
-                                && idx == 2
+                                && (idx == 2 || idx == 3)
                                 && param.type_annotation.is_none()
                             {
                                 Type::Int
@@ -636,7 +636,7 @@ pub fn analyze_lossy_with_env(
                             let mut param_ty = if is_event_handler && idx == 1 {
                                 Type::ControlHandle
                             } else if is_event_handler
-                                && idx == 2
+                                && (idx == 2 || idx == 3)
                                 && param.type_annotation.is_none()
                             {
                                 Type::Int

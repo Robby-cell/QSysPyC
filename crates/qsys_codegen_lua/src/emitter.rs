@@ -1018,6 +1018,9 @@ impl<'a> LuaEmitter<'a> {
 }
 
 pub fn format_count_lua_expr(spec: &str, table_var: &str) -> String {
+    if spec.trim().parse::<i64>().is_ok() {
+        return spec.trim().to_string();
+    }
     if spec.contains("{PROP:") {
         let mut out = String::new();
         let mut rest = spec;

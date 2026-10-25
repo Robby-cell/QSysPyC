@@ -442,6 +442,7 @@ impl DynAxisExpr {
 }
 
 /// Specification for emitting a dynamic `for i = 1, props["..."].Value do` loop
+/// (or nested 2D `for r = 1, ... do for c = 1, ... do` loops)
 /// in `GetControlLayout(props)` when a control's `count` is driven by a `Property`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DynamicRepeatSpec {
@@ -461,6 +462,64 @@ pub struct DynamicRepeatSpec {
     pub label_width: f64,
     pub label_height: f64,
     pub label_font_size: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rows_spec: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cols_spec: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row_label_template: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row_label_lua_expr: Option<String>,
+    #[serde(default)]
+    pub row_label_offset_x: f64,
+    #[serde(default)]
+    pub row_label_offset_y: f64,
+    #[serde(default)]
+    pub row_label_width: f64,
+    #[serde(default)]
+    pub row_label_height: f64,
+    #[serde(default)]
+    pub row_label_font_size: u32,
+}
+
+/// Preview metadata for an individual cell `(r, c)` inside a 2D `UiGridSpec`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GridCellPreview {
+    pub control_name: String,
+    pub channel_index: usize,
+    pub label: Option<String>,
+    pub pretty_name: Option<String>,
+    pub legend: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label_lua_expr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pretty_lua_expr: Option<String>,
+}
+
+/// 2D grid layout configuration attached to a `UiControlSpec`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UiGridSpec {
+    pub preview_rows: usize,
+    pub preview_cols: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rows_property: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cols_property: Option<String>,
+    pub col_gap: f64,
+    pub row_gap: f64,
+    pub has_row_label: bool,
+    pub row_label_width: f64,
+    pub row_label_font_size: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub preview_row_labels: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub preview_row_label_lua_exprs: Vec<Option<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dynamic_row_label_template: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dynamic_row_label_lua_expr: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cells: Vec<GridCellPreview>,
 }
 
 /// Per-control graphical layout parameters.
@@ -617,6 +676,8 @@ pub struct UiControlSpec {
     pub label_lua_expr: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pretty_lua_expr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grid: Option<UiGridSpec>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub is_dynamic_repeat_head: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -769,7 +830,33 @@ fn measure_dyn_node(
 
         UiNode::Control(spec) => {
             let sz = measure_node(node);
-            if spec.is_dynamic_repeat_head
+            if let Some(ref grid) = spec.grid {
+                let cell = measure_control_cell_size(spec);
+                let row_lbl_area_w = if grid.has_row_label {
+                    grid.row_label_width + 8.0
+                } else {
+                    0.0
+                };
+                let step_x = (cell.width + grid.col_gap).round() as i64;
+                let step_y = (cell.height + grid.row_gap).round() as i64;
+                let dyn_w = if let Some(ref col_prop) = grid.cols_property {
+                    let base_w = (row_lbl_area_w - grid.col_gap).round() as i64;
+                    let mut sum = DynLinearSum::static_val(base_w);
+                    sum.add_term(col_prop.clone(), step_x);
+                    DynAxisExpr::from_sum(sum)
+                } else {
+                    DynAxisExpr::static_val(sz.width)
+                };
+                let dyn_h = if let Some(ref row_prop) = grid.rows_property {
+                    let base_h = (-grid.row_gap).round() as i64;
+                    let mut sum = DynLinearSum::static_val(base_h);
+                    sum.add_term(row_prop.clone(), step_y);
+                    DynAxisExpr::from_sum(sum)
+                } else {
+                    DynAxisExpr::static_val(sz.height)
+                };
+                (dyn_w, dyn_h)
+            } else if spec.is_dynamic_repeat_head
                 && let Some(prop_name) = &spec.count_property
             {
                 match parent_dir {
@@ -894,6 +981,23 @@ fn measure_dyn_node(
     }
 }
 
+fn measure_control_cell_size(spec: &UiControlSpec) -> Size {
+    let def_size = spec.style.default_size();
+    let ctl_w = spec.width.unwrap_or(def_size.width);
+    let ctl_h = spec.height.unwrap_or(def_size.height);
+
+    if spec.label.is_some() {
+        match spec.label_placement {
+            LabelPlacement::Top => Size::new(ctl_w.max(64.0), ctl_h + 20.0),
+            LabelPlacement::Left { width: lbl_w } => {
+                Size::new(lbl_w + 8.0 + ctl_w, ctl_h.max(22.0))
+            }
+        }
+    } else {
+        Size::new(ctl_w, ctl_h)
+    }
+}
+
 fn measure_node(node: &UiNode) -> Size {
     match node {
         UiNode::Spacer { width, height } => Size::new(*width, *height),
@@ -911,19 +1015,23 @@ fn measure_node(node: &UiNode) -> Size {
         }
 
         UiNode::Control(spec) => {
-            let def_size = spec.style.default_size();
-            let ctl_w = spec.width.unwrap_or(def_size.width);
-            let ctl_h = spec.height.unwrap_or(def_size.height);
-
-            if spec.label.is_some() {
-                match spec.label_placement {
-                    LabelPlacement::Top => Size::new(ctl_w.max(64.0), ctl_h + 20.0),
-                    LabelPlacement::Left { width: lbl_w } => {
-                        Size::new(lbl_w + 8.0 + ctl_w, ctl_h.max(22.0))
-                    }
-                }
+            let cell = measure_control_cell_size(spec);
+            if let Some(ref grid) = spec.grid {
+                let row_lbl_area_w = if grid.has_row_label {
+                    grid.row_label_width + 8.0
+                } else {
+                    0.0
+                };
+                let rows = grid.preview_rows.max(1);
+                let cols = grid.preview_cols.max(1);
+                let w = row_lbl_area_w
+                    + (cols as f64) * cell.width
+                    + (cols.saturating_sub(1) as f64) * grid.col_gap;
+                let h =
+                    (rows as f64) * cell.height + (rows.saturating_sub(1) as f64) * grid.row_gap;
+                Size::new(w, h)
             } else {
-                Size::new(ctl_w, ctl_h)
+                cell
             }
         }
 
@@ -1082,6 +1190,258 @@ fn arrange_node(
             let def_size = spec.style.default_size();
             let ctl_w = spec.width.unwrap_or(def_size.width);
             let ctl_h = spec.height.unwrap_or(def_size.height);
+
+            if let Some(ref grid) = spec.grid {
+                let cell_sz = measure_control_cell_size(spec);
+                let step_x = cell_sz.width + grid.col_gap;
+                let step_y = cell_sz.height + grid.row_gap;
+                let row_lbl_area_w = if grid.has_row_label {
+                    grid.row_label_width + 8.0
+                } else {
+                    0.0
+                };
+                let rows = grid.preview_rows.max(1);
+                let cols = grid.preview_cols.max(1);
+                let is_dyn_grid = spec.is_dynamic_repeat_head
+                    && (spec.count_property.is_some()
+                        || grid.rows_property.is_some()
+                        || grid.cols_property.is_some());
+
+                for r in 0..rows {
+                    let row_y = y + (r as f64) * step_y;
+                    let ctl_y_in_row = if spec.label.is_some()
+                        && matches!(spec.label_placement, LabelPlacement::Top)
+                    {
+                        row_y + 20.0
+                    } else {
+                        row_y
+                    };
+                    if grid.has_row_label {
+                        let rlbl_y = ctl_y_in_row + ((ctl_h - 18.0) / 2.0).max(0.0);
+                        let rlbl_text = grid
+                            .preview_row_labels
+                            .get(r)
+                            .cloned()
+                            .unwrap_or_else(|| format!("Track {}", r + 1));
+                        let rlbl_lua = grid
+                            .preview_row_label_lua_exprs
+                            .get(r)
+                            .and_then(|e| e.clone());
+                        graphics.push(GraphicItem {
+                            kind: GraphicItemKind::Label {
+                                text: rlbl_text,
+                                font_size: grid.row_label_font_size,
+                                h_align: "Left".to_string(),
+                            },
+                            position: Position::new(x, rlbl_y),
+                            size: Size::new(grid.row_label_width, 18.0),
+                            text_lua_expr: rlbl_lua,
+                            dyn_x: dyn_x.clone().into_opt(),
+                            dyn_y: dyn_y.add_const((rlbl_y - y).round() as i64).into_opt(),
+                            dyn_width: None,
+                            dyn_height: None,
+                            color: None,
+                            skip_lua_emit: is_dyn_grid || spec.skip_lua_emit,
+                        });
+                    }
+
+                    for c in 0..cols {
+                        let flat_idx = r * cols + c;
+                        let cell_x = x + row_lbl_area_w + (c as f64) * step_x;
+                        let cell_preview = grid.cells.get(flat_idx);
+                        let cell_lbl = cell_preview
+                            .and_then(|cp| cp.label.clone())
+                            .or_else(|| spec.label.clone());
+                        let cell_lbl_lua = cell_preview
+                            .and_then(|cp| cp.label_lua_expr.clone())
+                            .or_else(|| spec.label_lua_expr.clone());
+                        let cell_pretty = cell_preview
+                            .and_then(|cp| cp.pretty_name.clone())
+                            .or_else(|| spec.pretty_name.clone())
+                            .or_else(|| cell_lbl.clone());
+                        let cell_pretty_lua = cell_preview
+                            .and_then(|cp| cp.pretty_lua_expr.clone())
+                            .or_else(|| spec.pretty_lua_expr.clone())
+                            .or_else(|| cell_lbl_lua.clone());
+                        let cell_legend = cell_preview
+                            .and_then(|cp| cp.legend.clone())
+                            .or_else(|| spec.legend.clone());
+                        let cell_ctl_name = cell_preview
+                            .map(|cp| cp.control_name.clone())
+                            .unwrap_or_else(|| spec.control_name.clone());
+                        let cell_ch = cell_preview
+                            .map(|cp| Some(cp.channel_index))
+                            .unwrap_or(spec.channel_index);
+
+                        let is_head_cell = r == 0 && c == 0;
+                        let skip_cell_lbl_lua = spec.skip_lua_emit || is_dyn_grid;
+                        let skip_cell_ctl_lua =
+                            spec.skip_lua_emit || (is_dyn_grid && !is_head_cell);
+
+                        let (ctl_x, ctl_y, ctl_dyn_x, ctl_dyn_y, lbl_info) = if let Some(ref lbl) =
+                            cell_lbl
+                        {
+                            match spec.label_placement {
+                                LabelPlacement::Top => {
+                                    let box_w = ctl_w.max(64.0);
+                                    graphics.push(GraphicItem {
+                                        kind: GraphicItemKind::Label {
+                                            text: lbl.clone(),
+                                            font_size: 11,
+                                            h_align: "Left".to_string(),
+                                        },
+                                        position: Position::new(cell_x, row_y),
+                                        size: Size::new(box_w, 18.0),
+                                        text_lua_expr: cell_lbl_lua.clone(),
+                                        dyn_x: dyn_x
+                                            .add_const((cell_x - x).round() as i64)
+                                            .into_opt(),
+                                        dyn_y: dyn_y
+                                            .add_const((row_y - y).round() as i64)
+                                            .into_opt(),
+                                        dyn_width: None,
+                                        dyn_height: None,
+                                        color: None,
+                                        skip_lua_emit: skip_cell_lbl_lua,
+                                    });
+                                    (
+                                        cell_x,
+                                        row_y + 20.0,
+                                        dyn_x.add_const((cell_x - x).round() as i64),
+                                        dyn_y.add_const((row_y + 20.0 - y).round() as i64),
+                                        Some((cell_x, row_y, box_w, 18.0, 11u32)),
+                                    )
+                                }
+                                LabelPlacement::Left { width: lbl_w } => {
+                                    let row_h = ctl_h.max(22.0);
+                                    let lbl_y_off = ((row_h - 18.0) / 2.0).max(0.0);
+                                    let lbl_y = row_y + lbl_y_off;
+                                    graphics.push(GraphicItem {
+                                        kind: GraphicItemKind::Label {
+                                            text: lbl.clone(),
+                                            font_size: 12,
+                                            h_align: "Left".to_string(),
+                                        },
+                                        position: Position::new(cell_x, lbl_y),
+                                        size: Size::new(lbl_w, 18.0),
+                                        text_lua_expr: cell_lbl_lua.clone(),
+                                        dyn_x: dyn_x
+                                            .add_const((cell_x - x).round() as i64)
+                                            .into_opt(),
+                                        dyn_y: dyn_y
+                                            .add_const((lbl_y - y).round() as i64)
+                                            .into_opt(),
+                                        dyn_width: None,
+                                        dyn_height: None,
+                                        color: None,
+                                        skip_lua_emit: skip_cell_lbl_lua,
+                                    });
+                                    (
+                                        cell_x + lbl_w + 8.0,
+                                        row_y,
+                                        dyn_x.add_const((cell_x + lbl_w + 8.0 - x).round() as i64),
+                                        dyn_y.add_const((row_y - y).round() as i64),
+                                        Some((cell_x, lbl_y, lbl_w, 18.0, 12u32)),
+                                    )
+                                }
+                            }
+                        } else {
+                            (
+                                cell_x,
+                                row_y,
+                                dyn_x.add_const((cell_x - x).round() as i64),
+                                dyn_y.add_const((row_y - y).round() as i64),
+                                None,
+                            )
+                        };
+
+                        let dynamic_repeat = if is_dyn_grid
+                            && is_head_cell
+                            && let Some(base_name) = &spec.base_control_name
+                        {
+                            let (lbl_ox, lbl_oy, lbl_w, lbl_h, lbl_fs) =
+                                if let Some((lx, ly, lw, lh, lfs)) = lbl_info {
+                                    (lx - ctl_x, ly - ctl_y, lw, lh, lfs)
+                                } else {
+                                    (0.0, 0.0, 0.0, 0.0, 11)
+                                };
+                            let pretty_tmpl = spec
+                                .dynamic_pretty_template
+                                .clone()
+                                .or_else(|| spec.pretty_name.clone())
+                                .or_else(|| spec.dynamic_label_template.clone())
+                                .unwrap_or_else(|| base_name.clone());
+                            let rows_spec = grid
+                                .rows_property
+                                .clone()
+                                .unwrap_or_else(|| rows.to_string());
+                            let cols_spec = grid
+                                .cols_property
+                                .clone()
+                                .unwrap_or_else(|| cols.to_string());
+                            let total_prop = spec
+                                .count_property
+                                .clone()
+                                .unwrap_or_else(|| format!("{} * {}", rows_spec, cols_spec));
+                            let rlbl_oy = ((ctl_h - 18.0) / 2.0).max(0.0);
+                            Some(DynamicRepeatSpec {
+                                count_property: total_prop,
+                                base_control_name: base_name.clone(),
+                                label_template: spec.dynamic_label_template.clone(),
+                                pretty_name_template: pretty_tmpl,
+                                legend_template: spec.dynamic_legend_template.clone(),
+                                label_lua_expr: spec.label_lua_expr.clone(),
+                                pretty_name_lua_expr: spec.pretty_lua_expr.clone(),
+                                step_x,
+                                step_y,
+                                label_offset_x: lbl_ox,
+                                label_offset_y: lbl_oy,
+                                label_width: lbl_w,
+                                label_height: lbl_h,
+                                label_font_size: lbl_fs,
+                                rows_spec: Some(rows_spec),
+                                cols_spec: Some(cols_spec),
+                                row_label_template: grid.dynamic_row_label_template.clone(),
+                                row_label_lua_expr: grid.dynamic_row_label_lua_expr.clone(),
+                                row_label_offset_x: x - ctl_x,
+                                row_label_offset_y: rlbl_oy,
+                                row_label_width: grid.row_label_width,
+                                row_label_height: 18.0,
+                                row_label_font_size: grid.row_label_font_size,
+                            })
+                        } else {
+                            None
+                        };
+
+                        controls.push(ControlLayoutDef {
+                            name: cell_ctl_name,
+                            pretty_name: cell_pretty,
+                            pretty_name_lua_expr: cell_pretty_lua,
+                            style: Some(spec.style.clone()),
+                            position: Position::new(ctl_x, ctl_y),
+                            size: Size::new(ctl_w, ctl_h),
+                            dyn_x: ctl_dyn_x.into_opt(),
+                            dyn_y: ctl_dyn_y.into_opt(),
+                            color: spec.color.clone(),
+                            margin: spec.margin,
+                            legend: cell_legend,
+                            is_disabled: spec.read_only,
+                            is_invisible: spec.invisible,
+                            count_property: spec.count_property.clone(),
+                            type_property: spec.type_property.clone(),
+                            base_control_name: spec.base_control_name.clone(),
+                            channel_index: cell_ch,
+                            dynamic_repeat,
+                            skip_lua_emit: skip_cell_ctl_lua,
+                        });
+                    }
+                }
+
+                let grid_sz = measure_node(node);
+                let (dyn_w, dyn_h) = measure_dyn_node(node, parent_dir, parent_gap);
+                return (grid_sz, dyn_w, dyn_h);
+            }
+
             let skip_lbl_lua = spec.skip_lua_emit || spec.is_dynamic_repeat_head;
 
             let (ctl_x, ctl_y, ctl_dyn_x, ctl_dyn_y, total_w, total_h, lbl_info) =
@@ -1191,6 +1551,15 @@ fn arrange_node(
                     label_width: lbl_w,
                     label_height: lbl_h,
                     label_font_size: lbl_fs,
+                    rows_spec: None,
+                    cols_spec: None,
+                    row_label_template: None,
+                    row_label_lua_expr: None,
+                    row_label_offset_x: 0.0,
+                    row_label_offset_y: 0.0,
+                    row_label_width: 0.0,
+                    row_label_height: 0.0,
+                    row_label_font_size: 0,
                 })
             } else {
                 None

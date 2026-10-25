@@ -7,6 +7,7 @@ use qsys_model::{ControlDef, PropertyDef};
 use crate::types::Type;
 
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum SymbolKind {
     Variable {
         id: SymbolId,

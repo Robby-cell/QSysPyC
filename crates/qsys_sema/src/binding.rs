@@ -41,22 +41,61 @@ pub fn resolve_event_decorator(
     scope_stack: &ScopeStack,
     diagnostics: &mut Diagnostics,
 ) -> Option<ResolvedBinding> {
-    let (ctl_name, subscript_expr, member_name) = match &decorator.expr.kind {
+    let (ctl_name, subscript_expr, second_subscript_expr, member_name) = match &decorator.expr.kind
+    {
         ast::ExprKind::Attribute { value, attr } => match &value.kind {
-            ast::ExprKind::Ident(id) => (id.as_str(), None, attr.as_str()),
+            ast::ExprKind::Ident(id) => (id.as_str(), None, None, attr.as_str()),
             ast::ExprKind::Subscript {
                 value: sub_val,
                 index: sub_idx,
             } => {
                 if let ast::ExprKind::Ident(id) = &sub_val.kind {
-                    (id.as_str(), Some(sub_idx.as_ref()), attr.as_str())
+                    (id.as_str(), Some(sub_idx.as_ref()), None, attr.as_str())
                 } else if let ast::ExprKind::Attribute {
                     value: self_val,
                     attr: ctl_attr,
                 } = &sub_val.kind
                     && matches!(&self_val.kind, ast::ExprKind::Ident(s) if s == "self")
                 {
-                    (ctl_attr.as_str(), Some(sub_idx.as_ref()), attr.as_str())
+                    (
+                        ctl_attr.as_str(),
+                        Some(sub_idx.as_ref()),
+                        None,
+                        attr.as_str(),
+                    )
+                } else if let ast::ExprKind::Subscript {
+                    value: inner_val,
+                    index: first_idx,
+                } = &sub_val.kind
+                {
+                    if let ast::ExprKind::Ident(id) = &inner_val.kind {
+                        (
+                            id.as_str(),
+                            Some(first_idx.as_ref()),
+                            Some(sub_idx.as_ref()),
+                            attr.as_str(),
+                        )
+                    } else if let ast::ExprKind::Attribute {
+                        value: self_val,
+                        attr: ctl_attr,
+                    } = &inner_val.kind
+                        && matches!(&self_val.kind, ast::ExprKind::Ident(s) if s == "self")
+                    {
+                        (
+                            ctl_attr.as_str(),
+                            Some(first_idx.as_ref()),
+                            Some(sub_idx.as_ref()),
+                            attr.as_str(),
+                        )
+                    } else {
+                        diagnostics.report(
+                            DiagnosticKind::unsupported_expression(
+                                "Complex decorator expressions are not supported on event handlers",
+                            ),
+                            decorator.span,
+                        );
+                        return None;
+                    }
                 } else {
                     diagnostics.report(
                         DiagnosticKind::unsupported_expression(
@@ -71,7 +110,7 @@ pub fn resolve_event_decorator(
                 value: self_val,
                 attr: ctl_attr,
             } if matches!(&self_val.kind, ast::ExprKind::Ident(s) if s == "self") => {
-                (ctl_attr.as_str(), None, attr.as_str())
+                (ctl_attr.as_str(), None, None, attr.as_str())
             }
             _ => {
                 diagnostics.report(
@@ -86,7 +125,7 @@ pub fn resolve_event_decorator(
         _ => return None,
     };
 
-    let (qsys_control_id, qsys_control_name, ctl_count, has_prop_count) =
+    let (qsys_control_id, qsys_control_name, ctl_count, ctl_cols, has_prop_count) =
         match scope_stack.lookup(ctl_name) {
             Some(sym) => {
                 if let SymbolKind::Control { id, def } = &sym.kind {
@@ -94,6 +133,7 @@ pub fn resolve_event_decorator(
                         *id,
                         def.name.clone(),
                         def.count,
+                        def.cols.unwrap_or(1),
                         def.count_property.is_some(),
                     )
                 } else {
@@ -121,7 +161,21 @@ pub fn resolve_event_decorator(
             }
         };
 
-    let channel_index = if let Some(idx_expr) = subscript_expr {
+    let pair_exprs = match (subscript_expr, second_subscript_expr) {
+        (Some(first), Some(second)) => Some((first, Some(second))),
+        (Some(first), None) => {
+            if let ast::ExprKind::Tuple(items) = &first.kind
+                && items.len() == 2
+            {
+                Some((&items[0], Some(&items[1])))
+            } else {
+                Some((first, None))
+            }
+        }
+        (None, _) => None,
+    };
+
+    let channel_index = if let Some((idx_expr, col_expr_opt)) = pair_exprs {
         let Some(idx_val) = eval_constant(idx_expr).and_then(|c| c.as_i64()) else {
             diagnostics.report(
                 DiagnosticKind::InvalidDeclarationArgument {
@@ -132,7 +186,27 @@ pub fn resolve_event_decorator(
             );
             return None;
         };
-        if idx_val < 0 || (!has_prop_count && (idx_val as usize) >= ctl_count) {
+        let flat_idx = if let Some(col_expr) = col_expr_opt {
+            let Some(col_val) = eval_constant(col_expr).and_then(|c| c.as_i64()) else {
+                diagnostics.report(
+                    DiagnosticKind::InvalidDeclarationArgument {
+                        name: ctl_name.to_string(),
+                        message: "Event decorator channel index must be an integer literal"
+                            .to_string(),
+                    },
+                    col_expr.span,
+                );
+                return None;
+            };
+            if idx_val < 0 || col_val < 0 {
+                -1
+            } else {
+                idx_val * (ctl_cols as i64) + col_val
+            }
+        } else {
+            idx_val
+        };
+        if flat_idx < 0 || (!has_prop_count && (flat_idx as usize) >= ctl_count) {
             diagnostics.report(
                 DiagnosticKind::InvalidDeclarationArgument {
                     name: ctl_name.to_string(),
@@ -140,7 +214,7 @@ pub fn resolve_event_decorator(
                         "Control '{}' has count {}; index {} is out of bounds (expected 0..{})",
                         ctl_name,
                         ctl_count,
-                        idx_val,
+                        flat_idx,
                         ctl_count.saturating_sub(1)
                     ),
                 },
@@ -148,7 +222,7 @@ pub fn resolve_event_decorator(
             );
             return None;
         }
-        Some(idx_val as usize)
+        Some(flat_idx as usize)
     } else {
         None
     };

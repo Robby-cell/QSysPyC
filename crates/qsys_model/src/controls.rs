@@ -192,6 +192,16 @@ pub struct ControlDef {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub count_property: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rows: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cols: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rows_property: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cols_property: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub explicit_2d: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generic_spec: Option<GenericControlSpec>,
     pub pin_style: PinStyle,
     pub user_pin: bool,
@@ -204,6 +214,11 @@ impl ControlDef {
             kind,
             count: 1,
             count_property: None,
+            rows: None,
+            cols: None,
+            rows_property: None,
+            cols_property: None,
+            explicit_2d: false,
             generic_spec: None,
             pin_style: PinStyle::Both,
             user_pin: true,
@@ -267,6 +282,22 @@ impl ControlDef {
 
     pub fn with_count_property(mut self, count_property: Option<String>) -> Self {
         self.count_property = count_property;
+        self
+    }
+
+    pub fn with_grid_dimensions(
+        mut self,
+        rows: Option<usize>,
+        cols: Option<usize>,
+        rows_property: Option<String>,
+        cols_property: Option<String>,
+        explicit_2d: bool,
+    ) -> Self {
+        self.rows = rows;
+        self.cols = cols;
+        self.rows_property = rows_property;
+        self.cols_property = cols_property;
+        self.explicit_2d = explicit_2d;
         self
     }
 
