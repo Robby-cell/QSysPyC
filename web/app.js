@@ -558,11 +558,11 @@ function applyQuickFix(marker, replacement) {
   const editRange =
     dotIdx !== -1
       ? new monaco.Range(
-          markerRange.startLineNumber,
-          markerRange.startColumn + dotIdx + 1,
-          markerRange.endLineNumber,
-          markerRange.endColumn,
-        )
+        markerRange.startLineNumber,
+        markerRange.startColumn + dotIdx + 1,
+        markerRange.endLineNumber,
+        markerRange.endColumn,
+      )
       : markerRange;
 
   pyEditor.executeEdits("qsyspy-quickfix", [{ range: editRange, text: replacement }]);
@@ -721,9 +721,8 @@ function triggerCompile() {
           const msgSpan = document.createElement("span");
           msgSpan.className = "error-msg";
           const locLabel = m.inPreamble ? "Imported Module" : `Line ${line}:${col}`;
-          msgSpan.innerHTML = `<strong>${locLabel}</strong> &mdash; ${escapeHtml(m.message)}${
-            m.help ? ` <span class="error-help">(${escapeHtml(m.help)})</span>` : ""
-          }`;
+          msgSpan.innerHTML = `<strong>${locLabel}</strong> &mdash; ${escapeHtml(m.message)}${m.help ? ` <span class="error-help">(${escapeHtml(m.help)})</span>` : ""
+            }`;
 
           row.appendChild(codeSpan);
           row.appendChild(msgSpan);
@@ -1017,7 +1016,7 @@ function renderActiveUiPage() {
       btn.type = "button";
       btn.className = "qsys-btn-widget";
       const isTrigger = meta?.button_type === "Trigger";
-      btn.textContent = c.legend || (isTrigger ? "Trigger" : prettyName);
+      // btn.textContent = c.legend || (isTrigger ? "Trigger" : prettyName);
       btn.addEventListener("click", () => {
         if (isTrigger) {
           btn.classList.add("active");
@@ -1077,11 +1076,11 @@ function scaffoldUiLayout() {
   const fieldLines =
     controls.length > 0
       ? controls.slice(0, 6).map((c) => {
-          if (c.count > 1) {
-            return `                UI.Field("${c.ident}", self.${c.ident}, direction="row"),`;
-          }
-          return `                UI.Field("${c.ident}", self.${c.ident}),`;
-        })
+        if (c.count > 1) {
+          return `                UI.Field("${c.ident}", self.${c.ident}, direction="row"),`;
+        }
+        return `                UI.Field("${c.ident}", self.${c.ident}),`;
+      })
       : [`                # Pass your Control attributes directly (no magic strings!)`];
 
   const methodSnippet = [
