@@ -1020,6 +1020,16 @@ impl<'a> StmtLowerer<'a> {
             // 2D control indexing `self.Inputs[r, c]` and `self.Inputs[r][c]` flattens to `r * cols + c`)
             ast::ExprKind::Subscript { value, index } => self.lower_subscript_expr(value, index),
 
+            ast::ExprKind::IfExp { test, body, orelse } => {
+                let test_truthiness = lower_truthiness(self.type_map.get_truthiness(test.span));
+                IRExpr::IfExp {
+                    test: Box::new(self.lower_expr(test)),
+                    test_truthiness,
+                    body: Box::new(self.lower_expr(body)),
+                    orelse: Box::new(self.lower_expr(orelse)),
+                }
+            }
+
             ast::ExprKind::Error => IRExpr::Nil,
         }
     }

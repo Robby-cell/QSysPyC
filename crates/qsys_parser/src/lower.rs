@@ -553,6 +553,13 @@ impl<'a> Lowerer<'a> {
                 ExprKind::Lambda { params, body }
             }
 
+            ruff::Expr::If(if_expr) => {
+                let test = Box::new(self.lower_expr(&if_expr.test));
+                let body = Box::new(self.lower_expr(&if_expr.body));
+                let orelse = Box::new(self.lower_expr(&if_expr.orelse));
+                ExprKind::IfExp { test, body, orelse }
+            }
+
             ruff::Expr::BinOp(b) => {
                 let left = Box::new(self.lower_expr(&b.left));
                 let right = Box::new(self.lower_expr(&b.right));
@@ -835,6 +842,11 @@ fn substitute_expr_ident(expr: &Expr, target: &str, replacement: &Expr) -> Expr 
                 }
             }
         }
+        ExprKind::IfExp { test, body, orelse } => ExprKind::IfExp {
+            test: Box::new(substitute_expr_ident(test, target, replacement)),
+            body: Box::new(substitute_expr_ident(body, target, replacement)),
+            orelse: Box::new(substitute_expr_ident(orelse, target, replacement)),
+        },
     };
     Expr::new(kind, expr.span)
 }

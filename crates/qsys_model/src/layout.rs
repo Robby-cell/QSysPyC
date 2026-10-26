@@ -455,6 +455,8 @@ pub struct DynamicRepeatSpec {
     pub label_lua_expr: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pretty_name_lua_expr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub style_lua_expr: Option<String>,
     pub step_x: f64,
     pub step_y: f64,
     pub label_offset_x: f64,
@@ -480,6 +482,20 @@ pub struct DynamicRepeatSpec {
     pub row_label_height: f64,
     #[serde(default)]
     pub row_label_font_size: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub col_label_template: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub col_label_lua_expr: Option<String>,
+    #[serde(default)]
+    pub col_label_offset_x: f64,
+    #[serde(default)]
+    pub col_label_offset_y: f64,
+    #[serde(default)]
+    pub col_label_width: f64,
+    #[serde(default)]
+    pub col_label_height: f64,
+    #[serde(default)]
+    pub col_label_font_size: u32,
 }
 
 /// Preview metadata for an individual cell `(r, c)` inside a 2D `UiGridSpec`.
@@ -494,6 +510,8 @@ pub struct GridCellPreview {
     pub label_lua_expr: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pretty_lua_expr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub style_lua_expr: Option<String>,
 }
 
 /// 2D grid layout configuration attached to a `UiControlSpec`.
@@ -518,6 +536,18 @@ pub struct UiGridSpec {
     pub dynamic_row_label_template: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dynamic_row_label_lua_expr: Option<String>,
+    #[serde(default)]
+    pub has_col_label: bool,
+    #[serde(default)]
+    pub col_label_font_size: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub preview_col_labels: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub preview_col_label_lua_exprs: Vec<Option<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dynamic_col_label_template: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dynamic_col_label_lua_expr: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cells: Vec<GridCellPreview>,
 }
@@ -530,6 +560,8 @@ pub struct ControlLayoutDef {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pretty_name_lua_expr: Option<String>,
     pub style: Option<ControlStyle>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub style_lua_expr: Option<String>,
     pub position: Position,
     pub size: Size,
     pub color: Option<Color>,
@@ -562,6 +594,7 @@ impl ControlLayoutDef {
             pretty_name: None,
             pretty_name_lua_expr: None,
             style: None,
+            style_lua_expr: None,
             position,
             size,
             color: None,
@@ -676,6 +709,8 @@ pub struct UiControlSpec {
     pub label_lua_expr: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pretty_lua_expr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub style_lua_expr: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grid: Option<UiGridSpec>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -837,6 +872,7 @@ fn measure_dyn_node(
                 } else {
                     0.0
                 };
+                let col_hdr_area_h = if grid.has_col_label { 20.0 } else { 0.0 };
                 let step_x = (cell.width + grid.col_gap).round() as i64;
                 let step_y = (cell.height + grid.row_gap).round() as i64;
                 let dyn_w = if let Some(ref col_prop) = grid.cols_property {
@@ -848,7 +884,7 @@ fn measure_dyn_node(
                     DynAxisExpr::static_val(sz.width)
                 };
                 let dyn_h = if let Some(ref row_prop) = grid.rows_property {
-                    let base_h = (-grid.row_gap).round() as i64;
+                    let base_h = (col_hdr_area_h - grid.row_gap).round() as i64;
                     let mut sum = DynLinearSum::static_val(base_h);
                     sum.add_term(row_prop.clone(), step_y);
                     DynAxisExpr::from_sum(sum)
@@ -993,6 +1029,8 @@ fn measure_control_cell_size(spec: &UiControlSpec) -> Size {
                 Size::new(lbl_w + 8.0 + ctl_w, ctl_h.max(22.0))
             }
         }
+    } else if spec.grid.as_ref().is_some_and(|g| g.has_col_label) {
+        Size::new(ctl_w.max(64.0), ctl_h)
     } else {
         Size::new(ctl_w, ctl_h)
     }
@@ -1022,13 +1060,15 @@ fn measure_node(node: &UiNode) -> Size {
                 } else {
                     0.0
                 };
+                let col_hdr_area_h = if grid.has_col_label { 20.0 } else { 0.0 };
                 let rows = grid.preview_rows.max(1);
                 let cols = grid.preview_cols.max(1);
                 let w = row_lbl_area_w
                     + (cols as f64) * cell.width
                     + (cols.saturating_sub(1) as f64) * grid.col_gap;
-                let h =
-                    (rows as f64) * cell.height + (rows.saturating_sub(1) as f64) * grid.row_gap;
+                let h = col_hdr_area_h
+                    + (rows as f64) * cell.height
+                    + (rows.saturating_sub(1) as f64) * grid.row_gap;
                 Size::new(w, h)
             } else {
                 cell
@@ -1200,6 +1240,8 @@ fn arrange_node(
                 } else {
                     0.0
                 };
+                let col_hdr_area_h = if grid.has_col_label { 20.0 } else { 0.0 };
+                let col_hdr_w = cell_sz.width.max(64.0);
                 let rows = grid.preview_rows.max(1);
                 let cols = grid.preview_cols.max(1);
                 let is_dyn_grid = spec.is_dynamic_repeat_head
@@ -1207,8 +1249,39 @@ fn arrange_node(
                         || grid.rows_property.is_some()
                         || grid.cols_property.is_some());
 
+                if grid.has_col_label {
+                    for c in 0..cols {
+                        let col_x = x + row_lbl_area_w + (c as f64) * step_x;
+                        let clbl_text = grid
+                            .preview_col_labels
+                            .get(c)
+                            .cloned()
+                            .unwrap_or_else(|| format!("Input {}", c + 1));
+                        let clbl_lua = grid
+                            .preview_col_label_lua_exprs
+                            .get(c)
+                            .and_then(|e| e.clone());
+                        graphics.push(GraphicItem {
+                            kind: GraphicItemKind::Label {
+                                text: clbl_text,
+                                font_size: grid.col_label_font_size,
+                                h_align: "Left".to_string(),
+                            },
+                            position: Position::new(col_x, y),
+                            size: Size::new(col_hdr_w, 18.0),
+                            text_lua_expr: clbl_lua,
+                            dyn_x: dyn_x.add_const((col_x - x).round() as i64).into_opt(),
+                            dyn_y: dyn_y.clone().into_opt(),
+                            dyn_width: None,
+                            dyn_height: None,
+                            color: None,
+                            skip_lua_emit: is_dyn_grid || spec.skip_lua_emit,
+                        });
+                    }
+                }
+
                 for r in 0..rows {
-                    let row_y = y + (r as f64) * step_y;
+                    let row_y = y + col_hdr_area_h + (r as f64) * step_y;
                     let ctl_y_in_row = if spec.label.is_some()
                         && matches!(spec.label_placement, LabelPlacement::Top)
                     {
@@ -1263,6 +1336,9 @@ fn arrange_node(
                             .and_then(|cp| cp.pretty_lua_expr.clone())
                             .or_else(|| spec.pretty_lua_expr.clone())
                             .or_else(|| cell_lbl_lua.clone());
+                        let cell_style_lua = cell_preview
+                            .and_then(|cp| cp.style_lua_expr.clone())
+                            .or_else(|| spec.style_lua_expr.clone());
                         let cell_legend = cell_preview
                             .and_then(|cp| cp.legend.clone())
                             .or_else(|| spec.legend.clone());
@@ -1384,6 +1460,8 @@ fn arrange_node(
                                 .clone()
                                 .unwrap_or_else(|| format!("{} * {}", rows_spec, cols_spec));
                             let rlbl_oy = ((ctl_h - 18.0) / 2.0).max(0.0);
+                            let clbl_ox = (x + row_lbl_area_w) - ctl_x;
+                            let clbl_oy = y - ctl_y;
                             Some(DynamicRepeatSpec {
                                 count_property: total_prop,
                                 base_control_name: base_name.clone(),
@@ -1392,6 +1470,7 @@ fn arrange_node(
                                 legend_template: spec.dynamic_legend_template.clone(),
                                 label_lua_expr: spec.label_lua_expr.clone(),
                                 pretty_name_lua_expr: spec.pretty_lua_expr.clone(),
+                                style_lua_expr: spec.style_lua_expr.clone(),
                                 step_x,
                                 step_y,
                                 label_offset_x: lbl_ox,
@@ -1408,6 +1487,13 @@ fn arrange_node(
                                 row_label_width: grid.row_label_width,
                                 row_label_height: 18.0,
                                 row_label_font_size: grid.row_label_font_size,
+                                col_label_template: grid.dynamic_col_label_template.clone(),
+                                col_label_lua_expr: grid.dynamic_col_label_lua_expr.clone(),
+                                col_label_offset_x: clbl_ox,
+                                col_label_offset_y: clbl_oy,
+                                col_label_width: col_hdr_w,
+                                col_label_height: 18.0,
+                                col_label_font_size: grid.col_label_font_size,
                             })
                         } else {
                             None
@@ -1417,6 +1503,7 @@ fn arrange_node(
                             name: cell_ctl_name,
                             pretty_name: cell_pretty,
                             pretty_name_lua_expr: cell_pretty_lua,
+                            style_lua_expr: cell_style_lua,
                             style: Some(spec.style.clone()),
                             position: Position::new(ctl_x, ctl_y),
                             size: Size::new(ctl_w, ctl_h),
@@ -1544,6 +1631,7 @@ fn arrange_node(
                     legend_template: spec.dynamic_legend_template.clone(),
                     label_lua_expr: spec.label_lua_expr.clone(),
                     pretty_name_lua_expr: spec.pretty_lua_expr.clone(),
+                    style_lua_expr: spec.style_lua_expr.clone(),
                     step_x,
                     step_y,
                     label_offset_x: lbl_ox,
@@ -1560,6 +1648,13 @@ fn arrange_node(
                     row_label_width: 0.0,
                     row_label_height: 0.0,
                     row_label_font_size: 0,
+                    col_label_template: None,
+                    col_label_lua_expr: None,
+                    col_label_offset_x: 0.0,
+                    col_label_offset_y: 0.0,
+                    col_label_width: 0.0,
+                    col_label_height: 0.0,
+                    col_label_font_size: 0,
                 })
             } else {
                 None
@@ -1572,6 +1667,7 @@ fn arrange_node(
                     .pretty_lua_expr
                     .clone()
                     .or_else(|| spec.label_lua_expr.clone()),
+                style_lua_expr: spec.style_lua_expr.clone(),
                 style: Some(spec.style.clone()),
                 position: Position::new(ctl_x, ctl_y),
                 size: Size::new(ctl_w, ctl_h),

@@ -1477,19 +1477,19 @@ class Funnel(QSysPlugin):
 
     // 2. GroupBox must scale width with `props["Inputs per Track"].Value` and height with `props["Number of Tracks"].Value`
     assert!(
-        lua.contains("Type = \"GroupBox\",\n        Text = \"Funnel\",\n        Position = { 16, 16 },\n        Size = { 92 + (props[\"Inputs per Track\"].Value) * 92, 42 + (props[\"Number of Tracks\"].Value) * 120 },"),
+        lua.contains("Type = \"GroupBox\",\n        Text = \"Funnel\",\n        Position = { 16, 16 },\n        Size = { 92 + (props[\"Inputs per Track\"].Value) * 92, 62 + (props[\"Number of Tracks\"].Value) * 100 },"),
         "GroupBox must dynamically size width and height with cols and rows properties:\n{lua}"
     );
 
-    // 3. `UI.Field("Input {c}", Inputs, row_label="Track {r}:")` must emit nested `for r` and `for c` loops
+    // 3. `UI.Field("Input {c}", Inputs, row_label="Track {r}:")` must emit top X-axis `for c` column headers and nested `for r`/`for c` loops
     assert!(
-        lua.contains("for r = 1, props[\"Number of Tracks\"].Value do")
+        lua.contains("for c = 1, props[\"Inputs per Track\"].Value do")
+            && lua.contains("Text = \"Input \" .. tostring(c),\n            Position = { 104 + (c - 1) * 92, 52 },")
+            && lua.contains("for r = 1, props[\"Number of Tracks\"].Value do")
             && lua.contains("Text = \"Track \" .. tostring(r) .. \":\",")
-            && lua.contains("for c = 1, props[\"Inputs per Track\"].Value do")
             && lua.contains("local i = (r - 1) * props[\"Inputs per Track\"].Value + c")
-            && lua.contains("Text = \"Input \" .. tostring(c),")
             && lua.contains("PrettyName = \"Input \" .. tostring(c),"),
-        "GetControlLayout must emit nested 2D loops with row prefix labels and per-cell labels:\n{lua}"
+        "GetControlLayout must emit top X-axis column headers and nested 2D loops with row prefix labels:\n{lua}"
     );
 
     // 4. `UI.Grid(lambda r, c: ..., Matrix, row_label=format_track)` must call `Funnel_format_track(nil, r - 1)` and 2-arg inline lambda `(r - 1, c - 1)`
@@ -1530,12 +1530,140 @@ class Funnel(QSysPlugin):
         assert_eq!(
             label_texts,
             vec![
-                "Track 1:", "Input 1", "Input 2", "Input 3", "Track 2:", "Input 1", "Input 2",
-                "Input 3", "Bus 1:", "M1.1", "M1.2", "M1.3", "Bus 2:", "M2.1", "M2.2", "M2.3",
+                "Input 1", "Input 2", "Input 3", "Track 1:", "Track 2:", "Bus 1:", "M1.1", "M1.2",
+                "M1.3", "Bus 2:", "M2.1", "M2.2", "M2.3",
             ],
-            "Solved PageLayout preview must contain row prefix labels and per-cell labels in 2D grid order"
+            "Solved PageLayout preview must contain top X-axis column headers once, row prefix labels, and 2D cell labels"
         );
     } else {
         panic!("Expected IRProgram::Plugin");
     }
+}
+
+#[test]
+fn test_dynamic_style_expressions_and_grid_axis_labels() {
+    let src = r#"
+from qsys import Control, ControlHandle, Property, QSysPlugin, UI
+
+class Funnel(QSysPlugin):
+    InputType = Property.Enum(
+        "Input Type",
+        choices=["Boolean", "Number", "String"],
+        default="String",
+    )
+    InputsPerTrack = Property.Integer(name="Inputs per Track", default=2, min=1, max=100)
+    TrackCount = Property.Integer(name="Number of Tracks", default=2, min=2, max=100)
+
+    Inputs = Control.Generic(
+        InputType,
+        name="Inputs",
+        count=InputsPerTrack * TrackCount,
+        min=-65536,
+        max=65535,
+    )
+    Outputs = Control.Generic(
+        InputType,
+        name="Outputs",
+        count=InputsPerTrack,
+        pins="Output",
+    )
+    Status = Control.Generic(InputType, name="Status")
+
+    def resolve_style(self) -> str:
+        return "Text" if self.InputType.Value == "String" else "Button"
+
+    layout = UI.Page(
+        "Main",
+        UI.GroupBox(
+            "Funnel",
+            UI.Grid(
+                Inputs,
+                row_label="Track {i}",
+                col_label="Input {i}",
+                style=resolve_style(),
+            ),
+            UI.Row(
+                "Outputs:",
+                UI.Field(
+                    "Out {i}",
+                    Outputs,
+                    style="text" if InputType.Value == "String" else "knob",
+                ),
+            ),
+            UI.Col(
+                "Status Section",
+                UI.Field(
+                    "Status",
+                    Status,
+                    style=InputType.Value == "Boolean" and "led" or "text",
+                ),
+            ),
+        ),
+    )
+
+    @Inputs.EventHandler
+    def on_inputs(self, ctl: ControlHandle, track: int, idx: int) -> None:
+        mode = "str" if self.InputType.Value == "String" else "other"
+        print(mode, track, idx)
+"#;
+
+    let file = SourceFile::new(FileId(1), "funnel_style_axis.py", src);
+    let parsed = parse_module(file).expect("Parse failed");
+    let model = analyze(&parsed).expect("Semantic analysis failed");
+    let ir = model.into_ir();
+    let backend = LuaBackend::new();
+    let (lua, diags) = backend
+        .emit(&ir, &CodegenConfig::default())
+        .expect("Codegen should succeed");
+    assert!(!diags.has_errors());
+
+    // 1. `Funnel_resolve_style` must be hoisted before `GetControlLayout` and use ternary conditional expression
+    let style_fn_pos = lua
+        .find("local function Funnel_resolve_style(self)")
+        .expect("Funnel_resolve_style should be emitted");
+    let layout_pos = lua
+        .find("function GetControlLayout(props)")
+        .expect("GetControlLayout should be emitted");
+    assert!(
+        style_fn_pos < layout_pos,
+        "Style helper method `Funnel_resolve_style` must be hoisted before GetControlLayout:\n{lua}"
+    );
+    assert!(
+        lua.contains(
+            "return ((Properties[\"Input Type\"].Value == \"String\") and \"Text\" or \"Button\")"
+        ),
+        "`return \"Text\" if self.InputType.Value == \"String\" else \"Button\"` must lower to Lua conditional expression:\n{lua}"
+    );
+
+    // 2. `UI.Grid(Inputs, row_label="Track {i}", col_label="Input {i}", style=resolve_style())`
+    //    must emit top column headers (`for c`), left row headers (`for r`), and `Style = Funnel_resolve_style(nil),`
+    assert!(
+        lua.contains("for c = 1, props[\"Inputs per Track\"].Value do")
+            && lua.contains("Text = \"Input \" .. tostring(c),")
+            && lua.contains("for r = 1, props[\"Number of Tracks\"].Value do")
+            && lua.contains("Text = \"Track \" .. tostring(r),")
+            && lua.contains("Style = Funnel_resolve_style(nil),"),
+        "UI.Grid with row_label, col_label, and style=resolve_style() must emit axis headers and dynamic Style call:\n{lua}"
+    );
+
+    // 3. `style="text" if InputType.Value == "String" else "knob"` and `style=InputType.Value == "Boolean" and "led" or "text"`
+    //    must normalize style names ("Text", "Knob", "Led") and emit Lua conditional expressions
+    assert!(
+        lua.contains(
+            "Style = ((props[\"Input Type\"].Value == \"String\") and \"Text\" or \"Knob\"),"
+        ),
+        "Ternary `style=\"text\" if ... else \"knob\"` must normalize style names and emit Lua conditional expression:\n{lua}"
+    );
+    assert!(
+        lua.contains(
+            "Style = (((props[\"Input Type\"].Value == \"Boolean\") and \"Led\") or \"Text\"),"
+        ),
+        "Boolean `and`/`or` `style=... and \"led\" or \"text\"` must normalize style names and emit Lua expression:\n{lua}"
+    );
+
+    // 4. Container labels on `UI.Row("Outputs:", ...)` and `UI.Col("Status Section", ...)` must be emitted
+    assert!(
+        lua.contains("Text = \"Outputs:\",") && lua.contains("Text = \"Status Section\","),
+        "UI.Row and UI.Col leading labels must be emitted as Label graphics:\n{lua}"
+    );
 }

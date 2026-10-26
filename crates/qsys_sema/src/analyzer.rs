@@ -1683,6 +1683,20 @@ impl<'a> ExprAnalyzer<'a> {
                 Type::Any
             }
 
+            ast::ExprKind::IfExp { test, body, orelse } => {
+                let test_ty = self.infer_expr(test);
+                self.type_map.insert_type(test.span, test_ty);
+                let body_ty = self.infer_expr(body);
+                let orelse_ty = self.infer_expr(orelse);
+                if body_ty == orelse_ty || orelse_ty == Type::Any || orelse_ty == Type::None {
+                    body_ty
+                } else if body_ty == Type::Any || body_ty == Type::None {
+                    orelse_ty
+                } else {
+                    Type::Any
+                }
+            }
+
             ast::ExprKind::Error => Type::Any,
         };
 

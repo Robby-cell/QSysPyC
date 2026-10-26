@@ -234,6 +234,12 @@ pub enum IRExpr {
         params: Vec<IRParam>,
         body: Box<IRExpr>,
     },
+    IfExp {
+        test: Box<IRExpr>,
+        test_truthiness: IRTruthiness,
+        body: Box<IRExpr>,
+        orelse: Box<IRExpr>,
+    },
 
     RawLua(String),
 }

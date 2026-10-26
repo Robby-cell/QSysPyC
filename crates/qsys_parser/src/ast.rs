@@ -157,6 +157,11 @@ pub enum ExprKind {
         params: Vec<Param>,
         body: Box<Expr>,
     },
+    IfExp {
+        test: Box<Expr>,
+        body: Box<Expr>,
+        orelse: Box<Expr>,
+    },
     Error,
 }
 

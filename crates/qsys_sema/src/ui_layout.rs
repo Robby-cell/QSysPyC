@@ -91,6 +91,13 @@ enum LabelSpec {
 }
 
 #[derive(Debug, Clone)]
+enum StyleSpec {
+    Static(ControlStyle),
+    DynamicExpr(ast::Expr),
+    Callable(ast::Expr),
+}
+
+#[derive(Debug, Clone)]
 enum PreviewVal {
     Int(i64),
     Float(f64),
@@ -252,6 +259,22 @@ pub fn substitute_ui_vars(expr: &ast::Expr, vars: &FxHashMap<String, ast::Expr>)
         },
         ast::ExprKind::Tuple(items) => ast::Expr {
             kind: ast::ExprKind::Tuple(items.iter().map(|i| substitute_ui_vars(i, vars)).collect()),
+            span: expr.span,
+        },
+        ast::ExprKind::BoolOp { op, left, right } => ast::Expr {
+            kind: ast::ExprKind::BoolOp {
+                op: *op,
+                left: Box::new(substitute_ui_vars(left, vars)),
+                right: Box::new(substitute_ui_vars(right, vars)),
+            },
+            span: expr.span,
+        },
+        ast::ExprKind::IfExp { test, body, orelse } => ast::Expr {
+            kind: ast::ExprKind::IfExp {
+                test: Box::new(substitute_ui_vars(test, vars)),
+                body: Box::new(substitute_ui_vars(body, vars)),
+                orelse: Box::new(substitute_ui_vars(orelse, vars)),
+            },
             span: expr.span,
         },
         _ => expr.clone(),
@@ -669,9 +692,33 @@ impl<'a> UiParserCtx<'a> {
 
                 match tag {
                     "Row" | "HStack" => {
+                        let mut label = get_kwarg_str(kwargs, "label")
+                            .or_else(|| get_kwarg_str(kwargs, "title"))
+                            .or_else(|| get_kwarg_str(kwargs, "text"));
+                        let mut child_start = 0;
+                        if let Some(first) = args.first()
+                            && let Some(s) =
+                                eval_constant(first).and_then(|c| c.as_str().map(String::from))
+                        {
+                            label = Some(s);
+                            child_start = 1;
+                        }
                         let gap = get_kwarg_f64(kwargs, "gap").unwrap_or(8.0);
                         let padding = get_kwarg_f64(kwargs, "padding").unwrap_or(0.0);
-                        let children = self.collect_children(args, kwargs);
+                        let mut children = Vec::new();
+                        if let Some(lbl_text) = label {
+                            let lbl_w = get_kwarg_f64(kwargs, "label_width");
+                            let lbl_fs = get_kwarg_u32(kwargs, "label_font_size").unwrap_or(11);
+                            children.push(UiNode::Label {
+                                text: lbl_text,
+                                width: lbl_w,
+                                height: 22.0,
+                                font_size: lbl_fs,
+                                h_align: "Left".to_string(),
+                                color: None,
+                            });
+                        }
+                        children.extend(self.collect_children(&args[child_start..], kwargs));
                         vec![UiNode::Row {
                             children,
                             gap,
@@ -680,9 +727,33 @@ impl<'a> UiParserCtx<'a> {
                     }
 
                     "Col" | "Column" | "VStack" | "Div" => {
+                        let mut label = get_kwarg_str(kwargs, "label")
+                            .or_else(|| get_kwarg_str(kwargs, "title"))
+                            .or_else(|| get_kwarg_str(kwargs, "text"));
+                        let mut child_start = 0;
+                        if let Some(first) = args.first()
+                            && let Some(s) =
+                                eval_constant(first).and_then(|c| c.as_str().map(String::from))
+                        {
+                            label = Some(s);
+                            child_start = 1;
+                        }
                         let gap = get_kwarg_f64(kwargs, "gap").unwrap_or(8.0);
                         let padding = get_kwarg_f64(kwargs, "padding").unwrap_or(0.0);
-                        let children = self.collect_children(args, kwargs);
+                        let mut children = Vec::new();
+                        if let Some(lbl_text) = label {
+                            let lbl_w = get_kwarg_f64(kwargs, "label_width");
+                            let lbl_fs = get_kwarg_u32(kwargs, "label_font_size").unwrap_or(11);
+                            children.push(UiNode::Label {
+                                text: lbl_text,
+                                width: lbl_w,
+                                height: 18.0,
+                                font_size: lbl_fs,
+                                h_align: "Left".to_string(),
+                                color: None,
+                            });
+                        }
+                        children.extend(self.collect_children(&args[child_start..], kwargs));
                         vec![UiNode::Col {
                             children,
                             gap,
@@ -855,6 +926,108 @@ impl<'a> UiParserCtx<'a> {
         }
     }
 
+    fn parse_style_kwarg(&self, kwargs: &[(String, ast::Expr)]) -> Option<StyleSpec> {
+        let (_, expr) = kwargs.iter().find(|(k, _)| k == "style")?;
+        if let Some(s) = eval_constant_with_env(expr, &self.env.constants)
+            .or_else(|| eval_constant(expr))
+            .and_then(|c| c.as_str().map(String::from))
+        {
+            return Some(StyleSpec::Static(ControlStyle::from_name(&s)));
+        }
+
+        let norm_expr = normalize_style_string_literals(expr);
+        match &norm_expr.kind {
+            ast::ExprKind::Lambda { .. } => Some(StyleSpec::Callable(norm_expr)),
+            ast::ExprKind::Ident(name)
+                if self.env.local_functions.contains_key(name)
+                    || self.env.class_methods.contains_key(name)
+                    || self.env.module_functions.contains_key(name) =>
+            {
+                Some(StyleSpec::Callable(norm_expr))
+            }
+            ast::ExprKind::Attribute { value, attr }
+                if matches!(
+                    &value.kind,
+                    ast::ExprKind::Ident(obj) if obj == "self" || obj == self.class_name
+                ) && self.env.class_methods.contains_key(attr) =>
+            {
+                Some(StyleSpec::Callable(norm_expr))
+            }
+            _ => Some(StyleSpec::DynamicExpr(norm_expr)),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_style_for_item(
+        &self,
+        style_spec: &Option<StyleSpec>,
+        ctl: &DeclaredControl,
+        r_idx: Option<i64>,
+        c_idx: Option<i64>,
+        flat_idx: i64,
+        r_lua: Option<&str>,
+        c_lua: Option<&str>,
+        flat_lua: &str,
+    ) -> (ControlStyle, Option<String>) {
+        let default_style = ControlStyle::default_for_kind(&ctl.def.kind);
+        match style_spec {
+            None => (default_style, None),
+            Some(StyleSpec::Static(s)) => (s.clone(), None),
+            Some(StyleSpec::DynamicExpr(expr)) => {
+                let mut vars = FxHashMap::default();
+                for (name, val) in &self.env.constants {
+                    vars.insert(name.clone(), PreviewVal::from_const(val));
+                }
+                vars.insert("i".to_string(), PreviewVal::Int(flat_idx));
+                if let Some(r) = r_idx {
+                    vars.insert("r".to_string(), PreviewVal::Int(r));
+                }
+                if let Some(c) = c_idx {
+                    vars.insert("c".to_string(), PreviewVal::Int(c));
+                }
+                let preview_style = self
+                    .eval_preview_expr(expr, &vars, 0)
+                    .map(|v| ControlStyle::from_name(&v.to_display_string()))
+                    .unwrap_or(default_style);
+                let mut local_map = FxHashMap::default();
+                local_map.insert("i".to_string(), format!("({flat_lua})"));
+                if let Some(rl) = r_lua {
+                    local_map.insert("r".to_string(), format!("({rl})"));
+                }
+                if let Some(cl) = c_lua {
+                    local_map.insert("c".to_string(), format!("({cl})"));
+                }
+                let lua = self.lower_ui_expr_to_lua(expr, &local_map);
+                (preview_style, Some(lua))
+            }
+            Some(StyleSpec::Callable(fn_expr)) => {
+                let arity = self.callable_arity(fn_expr);
+                let preview_str = if arity == 0 {
+                    self.eval_callable_0_preview(fn_expr)
+                } else if arity >= 2
+                    && let (Some(r), Some(c)) = (r_idx, c_idx)
+                {
+                    self.eval_callable_2d_preview(fn_expr, r, c)
+                } else {
+                    self.eval_callable_preview(fn_expr, flat_idx)
+                };
+                let preview_style = preview_str
+                    .map(|s| ControlStyle::from_name(&s))
+                    .unwrap_or(default_style);
+                let lua = if arity == 0 {
+                    self.lower_callable_0_lua(fn_expr)
+                } else if arity >= 2
+                    && let (Some(rl), Some(cl)) = (r_lua, c_lua)
+                {
+                    self.lower_callable_2d_lua(fn_expr, rl, cl)
+                } else {
+                    self.lower_callable_lua(fn_expr, flat_lua)
+                };
+                (preview_style, Some(lua))
+            }
+        }
+    }
+
     fn parse_grid_call(
         &mut self,
         args: &[ast::Expr],
@@ -949,8 +1122,8 @@ impl<'a> UiParserCtx<'a> {
         span: Span,
         force_grid: bool,
     ) -> Vec<UiNode> {
-        let explicit_style = get_kwarg_str(kwargs, "style").map(|s| ControlStyle::from_name(&s));
-        let type_property = if explicit_style.is_none() {
+        let style_spec = self.parse_style_kwarg(kwargs);
+        let type_property = if style_spec.is_none() {
             ctl.def
                 .generic_spec
                 .as_ref()
@@ -958,7 +1131,16 @@ impl<'a> UiParserCtx<'a> {
         } else {
             None
         };
-        let style = explicit_style.unwrap_or_else(|| ControlStyle::default_for_kind(&ctl.def.kind));
+        let (style, base_style_lua_expr) = self.resolve_style_for_item(
+            &style_spec,
+            ctl,
+            Some(0),
+            Some(0),
+            0,
+            Some("0"),
+            Some("0"),
+            "0",
+        );
 
         let label_pos_str = get_kwarg_str(kwargs, "label_pos").unwrap_or_else(|| "top".to_string());
         let label_width = get_kwarg_f64(kwargs, "label_width").unwrap_or(88.0);
@@ -1059,6 +1241,7 @@ impl<'a> UiParserCtx<'a> {
                 dynamic_legend_template: None,
                 label_lua_expr,
                 pretty_lua_expr,
+                style_lua_expr: base_style_lua_expr,
                 grid: None,
                 is_dynamic_repeat_head: false,
                 skip_lua_emit: false,
@@ -1070,6 +1253,16 @@ impl<'a> UiParserCtx<'a> {
             let ch = idx + 1;
             let idx_str = idx.to_string();
             let qsys_key = format!("{} {}", ctl.def.name, ch);
+            let (idx_style, idx_style_lua) = self.resolve_style_for_item(
+                &style_spec,
+                ctl,
+                None,
+                None,
+                idx as i64,
+                None,
+                None,
+                &idx_str,
+            );
             let (ch_label, label_lua_expr) = match &label_override {
                 Some(LabelSpec::Text(lbl)) => (Some(format_channel_template(lbl, ch)), None),
                 Some(LabelSpec::Callable(fn_expr)) => {
@@ -1097,7 +1290,7 @@ impl<'a> UiParserCtx<'a> {
             };
             return vec![UiNode::Control(UiControlSpec {
                 control_name: qsys_key,
-                style,
+                style: idx_style,
                 label: ch_label,
                 label_placement,
                 pretty_name: resolved_pretty,
@@ -1117,6 +1310,7 @@ impl<'a> UiParserCtx<'a> {
                 dynamic_legend_template: None,
                 label_lua_expr,
                 pretty_lua_expr,
+                style_lua_expr: idx_style_lua,
                 grid: None,
                 is_dynamic_repeat_head: false,
                 skip_lua_emit: false,
@@ -1140,9 +1334,21 @@ impl<'a> UiParserCtx<'a> {
             .and_then(|(_, v)| self.parse_ui_dim_kwarg(v));
         let explicit_row_label_spec = kwargs
             .iter()
-            .find(|(k, _)| k == "row_label" || k == "track_label")
+            .find(|(k, _)| matches!(k.as_str(), "row_label" | "track_label" | "y_label"))
             .and_then(|(_, v)| self.parse_label_spec(v, "row_label"));
-        let explicit_row_labels = get_kwarg_str_list(kwargs, "row_labels");
+        let explicit_row_labels = get_kwarg_str_list(kwargs, "row_labels")
+            .or_else(|| get_kwarg_str_list(kwargs, "y_labels"));
+        let explicit_col_label_spec = kwargs
+            .iter()
+            .find(|(k, _)| matches!(k.as_str(), "col_label" | "column_label" | "x_label"))
+            .and_then(|(_, v)| self.parse_label_spec(v, "col_label"));
+        let explicit_col_labels = get_kwarg_str_list(kwargs, "col_labels")
+            .or_else(|| get_kwarg_str_list(kwargs, "column_labels"))
+            .or_else(|| get_kwarg_str_list(kwargs, "x_labels"));
+        let explicit_cell_label_spec = kwargs
+            .iter()
+            .find(|(k, _)| k == "cell_label")
+            .and_then(|(_, v)| self.parse_label_spec(v, "cell_label"));
         let label_has_2d_vars = matches!(
             &label_override,
             Some(LabelSpec::Text(s)) if has_2d_template_vars(s)
@@ -1163,6 +1369,8 @@ impl<'a> UiParserCtx<'a> {
             || ui_cols.is_some()
             || explicit_row_label_spec.is_some()
             || explicit_row_labels.is_some()
+            || explicit_col_label_spec.is_some()
+            || explicit_col_labels.is_some()
             || label_has_2d_vars
             || label_is_2d_callable;
         let use_2d_grid = has_explicit_2d_ui_opts || (ctl.def.explicit_2d && !is_dir_1d);
@@ -1190,22 +1398,60 @@ impl<'a> UiParserCtx<'a> {
                 (ctl.def.count.max(1), ctl.def.count_property.clone())
             };
 
-            // If `label_override` only has row template variables (e.g. `UI.Field("Track {r}:", self.Inputs)`)
-            // and no explicit `row_label` kwarg was passed, promote `label_override` to `row_label_spec`!
-            let (effective_row_label_spec, effective_cell_label_spec) = if explicit_row_label_spec
-                .is_none()
-                && explicit_row_labels.is_none()
-                && let Some(LabelSpec::Text(ref s)) = label_override
-                && has_only_row_template_vars(s)
-            {
-                let cell_lbl = kwargs
-                    .iter()
-                    .find(|(k, _)| k == "cell_label")
-                    .and_then(|(_, v)| self.parse_label_spec(v, "cell_label"));
-                (Some(LabelSpec::Text(s.clone())), cell_lbl)
-            } else {
-                (explicit_row_label_spec, label_override.clone())
+            // Determine `effective_row_label_spec`, `effective_col_label_spec`, and `effective_cell_label_spec`:
+            // - If `row_label` is given and `col_label` is not given, a 1D/column `label_override` (e.g.
+            //   `UI.Field("Input {i}", self.Inputs, row_label="Track {i}")` or `UI.Field("Input {c}", ..., row_label=...)`)
+            //   is promoted to `effective_col_label_spec` (top X-axis column header) instead of repeating on every cell!
+            // - If neither `row_label` nor `col_label` is given and `label_override` has only row vars (`"Track {r}:"`),
+            //   it is promoted to `effective_row_label_spec`.
+            // - If neither `row_label` nor `col_label` is given and `label_override` has only col vars (`"Input {c}"`),
+            //   it is promoted to `effective_col_label_spec`.
+            let has_explicit_row_lbl =
+                explicit_row_label_spec.is_some() || explicit_row_labels.is_some();
+            let has_explicit_col_lbl =
+                explicit_col_label_spec.is_some() || explicit_col_labels.is_some();
+            let label_override_is_1d_or_col = match &label_override {
+                Some(LabelSpec::Text(s)) => !has_row_template_vars(s),
+                Some(LabelSpec::Callable(fn_expr)) => self.callable_arity(fn_expr) <= 1,
+                None => false,
             };
+
+            let (effective_row_label_spec, effective_col_label_spec, effective_cell_label_spec) =
+                if !has_explicit_row_lbl
+                    && let Some(LabelSpec::Text(ref s)) = label_override
+                    && has_only_row_template_vars(s)
+                {
+                    (
+                        Some(LabelSpec::Text(s.clone())),
+                        explicit_col_label_spec,
+                        explicit_cell_label_spec,
+                    )
+                } else if has_explicit_row_lbl
+                    && !has_explicit_col_lbl
+                    && label_override_is_1d_or_col
+                {
+                    (
+                        explicit_row_label_spec,
+                        label_override.clone(),
+                        explicit_cell_label_spec,
+                    )
+                } else if !has_explicit_row_lbl
+                    && !has_explicit_col_lbl
+                    && let Some(LabelSpec::Text(ref s)) = label_override
+                    && has_only_col_template_vars(s)
+                {
+                    (
+                        None,
+                        Some(LabelSpec::Text(s.clone())),
+                        explicit_cell_label_spec,
+                    )
+                } else {
+                    (
+                        explicit_row_label_spec,
+                        explicit_col_label_spec,
+                        explicit_cell_label_spec.or_else(|| label_override.clone()),
+                    )
+                };
 
             let has_row_label = effective_row_label_spec.is_some() || explicit_row_labels.is_some();
             let mut preview_row_labels = Vec::with_capacity(preview_rows);
@@ -1251,6 +1497,50 @@ impl<'a> UiParserCtx<'a> {
                 _ => None,
             };
 
+            let has_col_label = effective_col_label_spec.is_some() || explicit_col_labels.is_some();
+            let mut preview_col_labels = Vec::with_capacity(preview_cols);
+            let mut preview_col_label_lua_exprs = Vec::with_capacity(preview_cols);
+            for c_idx in 0..preview_cols {
+                let c1 = c_idx + 1;
+                let c_idx_i64 = c_idx as i64;
+                let c_idx_str = c_idx.to_string();
+                if let Some(ref list) = explicit_col_labels {
+                    preview_col_labels.push(
+                        list.get(c_idx)
+                            .cloned()
+                            .unwrap_or_else(|| format!("Input {c1}")),
+                    );
+                    preview_col_label_lua_exprs.push(None);
+                } else if let Some(ref cspec) = effective_col_label_spec {
+                    match cspec {
+                        LabelSpec::Text(tmpl) => {
+                            preview_col_labels.push(format_col_label_surface(tmpl, c1));
+                            preview_col_label_lua_exprs.push(None);
+                        }
+                        LabelSpec::Callable(fn_expr) => {
+                            let p = self
+                                .eval_callable_preview(fn_expr, c_idx_i64)
+                                .unwrap_or_else(|| format!("Input {c1}"));
+                            let l = self.lower_callable_lua(fn_expr, &c_idx_str);
+                            preview_col_labels.push(p);
+                            preview_col_label_lua_exprs.push(Some(l));
+                        }
+                    }
+                }
+            }
+
+            let dynamic_col_label_template = match &effective_col_label_spec {
+                Some(LabelSpec::Text(s)) => Some(s.clone()),
+                Some(LabelSpec::Callable(_)) => Some(String::new()),
+                None => None,
+            };
+            let dynamic_col_label_lua_expr = match &effective_col_label_spec {
+                Some(LabelSpec::Callable(fn_expr)) => {
+                    Some(self.lower_callable_lua(fn_expr, "c - 1"))
+                }
+                _ => None,
+            };
+
             let max_rlbl_chars = preview_row_labels
                 .iter()
                 .map(|s| s.chars().count())
@@ -1260,6 +1550,7 @@ impl<'a> UiParserCtx<'a> {
             let row_label_width =
                 get_kwarg_f64(kwargs, "row_label_width").unwrap_or(default_row_lbl_w);
             let row_label_font_size = get_kwarg_u32(kwargs, "row_label_font_size").unwrap_or(11);
+            let col_label_font_size = get_kwarg_u32(kwargs, "col_label_font_size").unwrap_or(11);
             let base_gap = get_kwarg_f64(kwargs, "gap").unwrap_or(8.0);
             let col_gap = get_kwarg_f64(kwargs, "col_gap").unwrap_or(base_gap);
             let row_gap = get_kwarg_f64(kwargs, "row_gap").unwrap_or(base_gap);
@@ -1271,7 +1562,8 @@ impl<'a> UiParserCtx<'a> {
                 || cols_property.is_some())
                 && explicit_labels.is_none()
                 && explicit_pretty_names.is_none()
-                && explicit_row_labels.is_none();
+                && explicit_row_labels.is_none()
+                && explicit_col_labels.is_none();
 
             let total_preview = (preview_rows * preview_cols).max(1);
             let mut cells = Vec::with_capacity(total_preview);
@@ -1340,6 +1632,7 @@ impl<'a> UiParserCtx<'a> {
                             None => None,
                         })
                         .or_else(|| cell_label.clone())
+                        .or_else(|| preview_col_labels.get(c_idx).cloned())
                         .or_else(|| Some(qsys_key.clone()));
 
                     let cell_legend = legend
@@ -1387,8 +1680,48 @@ impl<'a> UiParserCtx<'a> {
                                 Some(self.lower_callable_lua(fn_expr, &flat_str))
                             }
                         }
-                        None => cell_label_lua.clone(),
+                        None => cell_label_lua.clone().or_else(|| {
+                            if has_dynamic_repeat {
+                                if flat_idx == 0 {
+                                    dynamic_col_label_lua_expr.clone()
+                                } else {
+                                    None
+                                }
+                            } else {
+                                preview_col_label_lua_exprs
+                                    .get(c_idx)
+                                    .and_then(|e| e.clone())
+                            }
+                        }),
                         _ => None,
+                    };
+
+                    let (_, cell_style_lua) = if has_dynamic_repeat {
+                        if flat_idx == 0 {
+                            self.resolve_style_for_item(
+                                &style_spec,
+                                ctl,
+                                Some(r_i64),
+                                Some(c_i64),
+                                flat_i64,
+                                Some("r - 1"),
+                                Some("c - 1"),
+                                "i - 1",
+                            )
+                        } else {
+                            (style.clone(), None)
+                        }
+                    } else {
+                        self.resolve_style_for_item(
+                            &style_spec,
+                            ctl,
+                            Some(r_i64),
+                            Some(c_i64),
+                            flat_i64,
+                            Some(&r_str),
+                            Some(&c_str),
+                            &flat_str,
+                        )
                     };
 
                     cells.push(GridCellPreview {
@@ -1399,6 +1732,7 @@ impl<'a> UiParserCtx<'a> {
                         legend: cell_legend,
                         label_lua_expr: cell_label_lua,
                         pretty_lua_expr: cell_pretty_lua,
+                        style_lua_expr: cell_style_lua,
                     });
                 }
             }
@@ -1409,6 +1743,7 @@ impl<'a> UiParserCtx<'a> {
             let head_legend = head_cell.and_then(|c| c.legend.clone());
             let head_label_lua = head_cell.and_then(|c| c.label_lua_expr.clone());
             let head_pretty_lua = head_cell.and_then(|c| c.pretty_lua_expr.clone());
+            let head_style_lua = head_cell.and_then(|c| c.style_lua_expr.clone());
             let head_ctl_name = head_cell
                 .map(|c| c.control_name.clone())
                 .unwrap_or_else(|| format!("{} 1", ctl.def.name));
@@ -1427,7 +1762,11 @@ impl<'a> UiParserCtx<'a> {
                     Some(LabelSpec::Text(s)) => Some(normalize_2d_cell_template(s, has_row_label)),
                     Some(LabelSpec::Callable(_)) => Some(String::new()),
                     None => dyn_cell_label_tmpl.clone().or_else(|| {
-                        if let Some(LabelSpec::Text(ref r_tmpl)) = effective_row_label_spec {
+                        if let Some(LabelSpec::Text(ref c_tmpl)) = effective_col_label_spec {
+                            Some(normalize_col_template_to_2d_pretty(c_tmpl))
+                        } else if let Some(LabelSpec::Callable(_)) = effective_col_label_spec {
+                            Some(String::new())
+                        } else if let Some(LabelSpec::Text(ref r_tmpl)) = effective_row_label_spec {
                             Some(format!("{} {{c}}", r_tmpl.trim_end_matches(':').trim()))
                         } else {
                             Some(ctl.def.name.clone())
@@ -1460,6 +1799,7 @@ impl<'a> UiParserCtx<'a> {
                 dynamic_legend_template: if has_dynamic_repeat { legend } else { None },
                 label_lua_expr: head_label_lua,
                 pretty_lua_expr: head_pretty_lua,
+                style_lua_expr: head_style_lua,
                 grid: Some(UiGridSpec {
                     preview_rows,
                     preview_cols,
@@ -1474,6 +1814,12 @@ impl<'a> UiParserCtx<'a> {
                     preview_row_label_lua_exprs,
                     dynamic_row_label_template,
                     dynamic_row_label_lua_expr,
+                    has_col_label,
+                    col_label_font_size,
+                    preview_col_labels,
+                    preview_col_label_lua_exprs,
+                    dynamic_col_label_template,
+                    dynamic_col_label_lua_expr,
                     cells,
                 }),
                 is_dynamic_repeat_head: has_dynamic_repeat,
@@ -1581,6 +1927,34 @@ impl<'a> UiParserCtx<'a> {
                 _ => None,
             };
 
+            let (item_style, item_style_lua) = if has_dynamic_repeat {
+                if ch == 1 {
+                    self.resolve_style_for_item(
+                        &style_spec,
+                        ctl,
+                        None,
+                        None,
+                        idx0,
+                        None,
+                        None,
+                        "i - 1",
+                    )
+                } else {
+                    (style.clone(), None)
+                }
+            } else {
+                self.resolve_style_for_item(
+                    &style_spec,
+                    ctl,
+                    None,
+                    None,
+                    idx0,
+                    None,
+                    None,
+                    &idx0_str,
+                )
+            };
+
             let dyn_label_tmpl_for_item = if has_dynamic_repeat && ch == 1 {
                 match &label_override {
                     Some(LabelSpec::Text(s)) => Some(s.clone()),
@@ -1593,7 +1967,7 @@ impl<'a> UiParserCtx<'a> {
 
             expanded.push(UiNode::Control(UiControlSpec {
                 control_name: qsys_key,
-                style: style.clone(),
+                style: item_style,
                 label: ch_label,
                 label_placement,
                 pretty_name: ch_pretty,
@@ -1621,6 +1995,7 @@ impl<'a> UiParserCtx<'a> {
                 },
                 label_lua_expr: item_label_lua,
                 pretty_lua_expr: item_pretty_lua,
+                style_lua_expr: item_style_lua,
                 grid: None,
                 is_dynamic_repeat_head: has_dynamic_repeat && ch == 1,
                 skip_lua_emit: has_dynamic_repeat && ch > 1,
@@ -1714,6 +2089,37 @@ impl<'a> UiParserCtx<'a> {
                 1
             }
             _ => 1,
+        }
+    }
+
+    fn lower_callable_0_lua(&self, fn_expr: &ast::Expr) -> String {
+        match &fn_expr.kind {
+            ast::ExprKind::Lambda { body, .. } => {
+                let body_lua = self.lower_ui_expr_to_lua(body, &FxHashMap::default());
+                format!("(function() return {body_lua} end)()")
+            }
+            ast::ExprKind::Attribute { value, attr } => {
+                if let ast::ExprKind::Ident(obj) = &value.kind
+                    && (obj == "self" || obj == self.class_name)
+                {
+                    format!("{}_{attr}(nil)", self.class_name)
+                } else {
+                    let obj_lua = self.lower_ui_expr_to_lua(value, &FxHashMap::default());
+                    format!("{obj_lua}.{attr}()")
+                }
+            }
+            ast::ExprKind::Ident(name) => {
+                if self.env.local_functions.contains_key(name)
+                    || self.env.module_functions.contains_key(name)
+                {
+                    format!("{name}()")
+                } else if self.env.class_methods.contains_key(name) {
+                    format!("{}_{name}(nil)", self.class_name)
+                } else {
+                    format!("{name}()")
+                }
+            }
+            _ => "\"\"".to_string(),
         }
     }
 
@@ -1898,6 +2304,25 @@ impl<'a> UiParserCtx<'a> {
                 };
                 format!("({l} {op_str} {r})")
             }
+            ast::ExprKind::BoolOp { op, left, right } => {
+                let op_str = match op {
+                    ast::LogicalOp::And => "and",
+                    ast::LogicalOp::Or => "or",
+                };
+                let l = self.lower_ui_expr_to_lua(left, local_map);
+                let r = self.lower_ui_expr_to_lua(right, local_map);
+                format!("({l} {op_str} {r})")
+            }
+            ast::ExprKind::IfExp { test, body, orelse } => {
+                let t = self.lower_ui_expr_to_lua(test, local_map);
+                let b = self.lower_ui_expr_to_lua(body, local_map);
+                let o = self.lower_ui_expr_to_lua(orelse, local_map);
+                if matches!(body.kind, ast::ExprKind::Bool(false) | ast::ExprKind::None) {
+                    format!("(function() if {t} then return {b} else return {o} end end)()")
+                } else {
+                    format!("({t} and {b} or {o})")
+                }
+            }
             ast::ExprKind::Call { callee, args, .. } => {
                 let rendered_args: Vec<String> = args
                     .iter()
@@ -1932,6 +2357,41 @@ impl<'a> UiParserCtx<'a> {
                 format!("{callee_lua}({})", rendered_args.join(", "))
             }
             _ => "\"\"".to_string(),
+        }
+    }
+
+    fn eval_callable_0_preview(&self, fn_expr: &ast::Expr) -> Option<String> {
+        match &fn_expr.kind {
+            ast::ExprKind::Lambda { body, .. } => {
+                let mut vars = FxHashMap::default();
+                for (name, val) in &self.env.constants {
+                    vars.insert(name.clone(), PreviewVal::from_const(val));
+                }
+                self.eval_preview_expr(body, &vars, 0)
+                    .map(|v| v.to_display_string())
+            }
+            ast::ExprKind::Attribute { value, attr } => {
+                if let ast::ExprKind::Ident(obj) = &value.kind
+                    && (obj == "self" || obj == self.class_name)
+                    && let Some(method) = self.env.class_methods.get(attr)
+                {
+                    return self
+                        .eval_preview_function(method, &[], 0)
+                        .map(|v| v.to_display_string());
+                }
+                None
+            }
+            ast::ExprKind::Ident(name) => {
+                let func = self
+                    .env
+                    .local_functions
+                    .get(name)
+                    .or_else(|| self.env.class_methods.get(name))
+                    .or_else(|| self.env.module_functions.get(name))?;
+                self.eval_preview_function(func, &[], 0)
+                    .map(|v| v.to_display_string())
+            }
+            _ => None,
         }
     }
 
@@ -2231,6 +2691,18 @@ impl<'a> UiParserCtx<'a> {
                     (PreviewVal::Int(a), ast::BinaryOp::NotEq, PreviewVal::Int(b)) => {
                         Some(PreviewVal::Bool(a != b))
                     }
+                    (PreviewVal::Str(a), ast::BinaryOp::Eq, PreviewVal::Str(b)) => {
+                        Some(PreviewVal::Bool(a == b))
+                    }
+                    (PreviewVal::Str(a), ast::BinaryOp::NotEq, PreviewVal::Str(b)) => {
+                        Some(PreviewVal::Bool(a != b))
+                    }
+                    (PreviewVal::Bool(a), ast::BinaryOp::Eq, PreviewVal::Bool(b)) => {
+                        Some(PreviewVal::Bool(a == b))
+                    }
+                    (PreviewVal::Bool(a), ast::BinaryOp::NotEq, PreviewVal::Bool(b)) => {
+                        Some(PreviewVal::Bool(a != b))
+                    }
                     (PreviewVal::Int(a), ast::BinaryOp::Lt, PreviewVal::Int(b)) => {
                         Some(PreviewVal::Bool(a < b))
                     }
@@ -2261,6 +2733,33 @@ impl<'a> UiParserCtx<'a> {
                         }
                     }
                     _ => None,
+                }
+            }
+            ast::ExprKind::BoolOp { op, left, right } => {
+                let l = self.eval_preview_expr(left, vars, depth)?;
+                match op {
+                    ast::LogicalOp::And => {
+                        if !l.is_truthy() {
+                            Some(l)
+                        } else {
+                            self.eval_preview_expr(right, vars, depth)
+                        }
+                    }
+                    ast::LogicalOp::Or => {
+                        if l.is_truthy() {
+                            Some(l)
+                        } else {
+                            self.eval_preview_expr(right, vars, depth)
+                        }
+                    }
+                }
+            }
+            ast::ExprKind::IfExp { test, body, orelse } => {
+                let cond = self.eval_preview_expr(test, vars, depth)?;
+                if cond.is_truthy() {
+                    self.eval_preview_expr(body, vars, depth)
+                } else {
+                    self.eval_preview_expr(orelse, vars, depth)
                 }
             }
             ast::ExprKind::Call { callee, args, .. } => {
@@ -2455,31 +2954,99 @@ fn escape_lua_str_content(s: &str) -> String {
     out
 }
 
-fn has_2d_template_vars(template: &str) -> bool {
+fn normalize_style_string_literals(expr: &ast::Expr) -> ast::Expr {
+    match &expr.kind {
+        ast::ExprKind::String(s) => {
+            let norm = match s.trim().to_ascii_lowercase().as_str() {
+                "fader" => "Fader",
+                "knob" => "Knob",
+                "button" => "Button",
+                "text" => "Text",
+                "meter" => "Meter",
+                "led" => "Led",
+                "listbox" => "ListBox",
+                "combobox" | "combo" => "ComboBox",
+                "none" => "None",
+                _ => s.as_str(),
+            };
+            ast::Expr {
+                kind: ast::ExprKind::String(norm.to_string()),
+                span: expr.span,
+            }
+        }
+        ast::ExprKind::BoolOp { op, left, right } => ast::Expr {
+            kind: ast::ExprKind::BoolOp {
+                op: *op,
+                left: Box::new(normalize_style_string_literals(left)),
+                right: Box::new(normalize_style_string_literals(right)),
+            },
+            span: expr.span,
+        },
+        ast::ExprKind::IfExp { test, body, orelse } => ast::Expr {
+            kind: ast::ExprKind::IfExp {
+                test: test.clone(),
+                body: Box::new(normalize_style_string_literals(body)),
+                orelse: Box::new(normalize_style_string_literals(orelse)),
+            },
+            span: expr.span,
+        },
+        ast::ExprKind::Lambda { params, body } => ast::Expr {
+            kind: ast::ExprKind::Lambda {
+                params: params.clone(),
+                body: Box::new(normalize_style_string_literals(body)),
+            },
+            span: expr.span,
+        },
+        _ => expr.clone(),
+    }
+}
+
+fn has_row_template_vars(template: &str) -> bool {
     template.contains("{r}")
         || template.contains("{row}")
         || template.contains("{track}")
-        || template.contains("{c}")
-        || template.contains("{col}")
+        || template.contains("{y}")
+}
+
+fn has_col_template_vars(template: &str) -> bool {
+    template.contains("{c}") || template.contains("{col}") || template.contains("{x}")
+}
+
+fn has_2d_template_vars(template: &str) -> bool {
+    has_row_template_vars(template) || has_col_template_vars(template)
 }
 
 fn has_only_row_template_vars(template: &str) -> bool {
-    let has_row =
-        template.contains("{r}") || template.contains("{row}") || template.contains("{track}");
-    let has_col_or_flat = template.contains("{c}")
-        || template.contains("{col}")
-        || template.contains("{i}")
-        || template.contains("{ch}");
+    let has_row = has_row_template_vars(template);
+    let has_col_or_flat =
+        has_col_template_vars(template) || template.contains("{i}") || template.contains("{ch}");
     has_row && !has_col_or_flat
+}
+
+fn has_only_col_template_vars(template: &str) -> bool {
+    let has_col = has_col_template_vars(template);
+    let has_row_or_flat =
+        has_row_template_vars(template) || template.contains("{i}") || template.contains("{ch}");
+    has_col && !has_row_or_flat
 }
 
 fn normalize_2d_cell_template(template: &str, has_row_label: bool) -> String {
     if has_2d_template_vars(template) || template.contains("{i}") || template.contains("{ch}") {
-        template.to_string()
+        template.replace("{y}", "{r}").replace("{x}", "{c}")
     } else if has_row_label {
         format!("{template} {{c}}")
     } else {
         template.to_string()
+    }
+}
+
+fn normalize_col_template_to_2d_pretty(template: &str) -> String {
+    if has_col_template_vars(template) {
+        template.replace("{x}", "{c}").replace("{col}", "{c}")
+    } else if template.contains("{i}") || template.contains("{ch}") {
+        template.replace("{i}", "{c}").replace("{ch}", "{c}")
+    } else {
+        format!("{template} {{c}}")
     }
 }
 
@@ -2491,8 +3058,10 @@ fn format_2d_template(template: &str, r: usize, c: usize, ch: usize) -> String {
         .replace("{r}", &r_str)
         .replace("{row}", &r_str)
         .replace("{track}", &r_str)
+        .replace("{y}", &r_str)
         .replace("{c}", &c_str)
         .replace("{col}", &c_str)
+        .replace("{x}", &c_str)
         .replace("{i}", &ch_str)
         .replace("{ch}", &ch_str)
 }
@@ -2509,15 +3078,30 @@ fn format_2d_surface(template: &str, r: usize, c: usize, ch: usize, has_row_labe
 
 fn format_row_label_surface(template: &str, r: usize) -> String {
     let r_str = r.to_string();
-    if template.contains("{r}") || template.contains("{row}") || template.contains("{track}") {
+    if has_row_template_vars(template) {
         template
             .replace("{r}", &r_str)
             .replace("{row}", &r_str)
             .replace("{track}", &r_str)
+            .replace("{y}", &r_str)
     } else if template.contains("{i}") || template.contains("{ch}") {
         template.replace("{i}", &r_str).replace("{ch}", &r_str)
     } else {
         format!("{template} {r_str}")
+    }
+}
+
+fn format_col_label_surface(template: &str, c: usize) -> String {
+    let c_str = c.to_string();
+    if has_col_template_vars(template) {
+        template
+            .replace("{c}", &c_str)
+            .replace("{col}", &c_str)
+            .replace("{x}", &c_str)
+    } else if template.contains("{i}") || template.contains("{ch}") {
+        template.replace("{i}", &c_str).replace("{ch}", &c_str)
+    } else {
+        format!("{template} {c_str}")
     }
 }
 

@@ -696,7 +696,9 @@ fn format_template_with_rc_i_lua(template: &str) -> Option<String> {
     let normalized = template
         .replace("{row}", "{r}")
         .replace("{track}", "{r}")
+        .replace("{y}", "{r}")
         .replace("{col}", "{c}")
+        .replace("{x}", "{c}")
         .replace("{ch}", "{i}");
     if !normalized.contains("{r}") && !normalized.contains("{c}") && !normalized.contains("{i}") {
         return None;
@@ -726,11 +728,22 @@ fn format_template_with_rc_i_lua(template: &str) -> Option<String> {
 }
 
 fn format_dynamic_row_label_lua_expr(template: &str) -> String {
-    if let Some(expr) = format_template_with_rc_i_lua(template) {
+    let row_norm = template.replace("{i}", "{r}").replace("{ch}", "{r}");
+    if let Some(expr) = format_template_with_rc_i_lua(&row_norm) {
         expr
     } else {
         let prefix = escape_lua_string(&format!("{template} "));
         format!("{prefix} .. tostring(r)")
+    }
+}
+
+fn format_dynamic_col_label_lua_expr(template: &str) -> String {
+    let col_norm = template.replace("{i}", "{c}").replace("{ch}", "{c}");
+    if let Some(expr) = format_template_with_rc_i_lua(&col_norm) {
+        expr
+    } else {
+        let prefix = escape_lua_string(&format!("{template} "));
+        format!("{prefix} .. tostring(c)")
     }
 }
 
@@ -784,7 +797,14 @@ fn emit_control_layout_fields(
     h: i64,
 ) {
     emitter.write_line(&format!("PrettyName = {pretty_expr},"));
-    if let Some(ref type_prop) = ctl.type_property {
+    let custom_style_lua = ctl
+        .dynamic_repeat
+        .as_ref()
+        .and_then(|r| r.style_lua_expr.as_ref())
+        .or(ctl.style_lua_expr.as_ref());
+    if let Some(style_expr) = custom_style_lua {
+        emitter.write_line(&format!("Style = {style_expr},"));
+    } else if let Some(ref type_prop) = ctl.type_property {
         let style_expr = build_dynamic_style_lua_expr(emitter, type_prop);
         emitter.write_line(&format!("Style = {style_expr},"));
     } else if let Some(ref style) = ctl.style {
@@ -831,6 +851,48 @@ fn emit_control_layout_item(emitter: &mut LuaEmitter<'_>, ctl: &ControlLayoutDef
             } else {
                 cols_expr.clone()
             };
+
+            if rep.col_label_template.is_some() || rep.col_label_lua_expr.is_some() {
+                let clbl_dyn_x = ctl
+                    .dyn_x
+                    .as_ref()
+                    .map(|e| e.add_const(rep.col_label_offset_x.round() as i64));
+                let clbl_dyn_y = ctl
+                    .dyn_y
+                    .as_ref()
+                    .map(|e| e.add_const(rep.col_label_offset_y.round() as i64));
+                let clx_str =
+                    format_axis_or_static(&clbl_dyn_x, ctl.position.x + rep.col_label_offset_x);
+                let cly_str =
+                    format_axis_or_static(&clbl_dyn_y, ctl.position.y + rep.col_label_offset_y);
+                let cl_pos_x = if dx == 0 {
+                    clx_str
+                } else {
+                    format!("{clx_str} + (c - 1) * {dx}")
+                };
+                let clw = rep.col_label_width.round() as i64;
+                let clh = rep.col_label_height.round() as i64;
+                let clbl_text_expr = rep.col_label_lua_expr.clone().unwrap_or_else(|| {
+                    format_dynamic_col_label_lua_expr(
+                        rep.col_label_template.as_deref().unwrap_or(""),
+                    )
+                });
+
+                emitter.write_line(&format!("for c = 1, {cols_expr} do"));
+                emitter.indent();
+                emitter.write_line("table.insert(graphics, {");
+                emitter.indent();
+                emitter.write_line("Type = \"Label\",");
+                emitter.write_line(&format!("Text = {clbl_text_expr},"));
+                emitter.write_line(&format!("Position = {{ {cl_pos_x}, {cly_str} }},"));
+                emitter.write_line(&format!("Size = {{ {clw}, {clh} }},"));
+                emitter.write_line(&format!("FontSize = {},", rep.col_label_font_size));
+                emitter.write_line("HTextAlign = \"Left\",");
+                emitter.dedent();
+                emitter.write_line("})");
+                emitter.dedent();
+                emitter.write_line("end");
+            }
 
             emitter.write_line(&format!("for r = 1, {rows_expr} do"));
             emitter.indent();
@@ -1186,6 +1248,9 @@ fn page_references_fn_name(page: &PageLayout, fn_name: &str) -> bool {
         c.pretty_name_lua_expr
             .as_ref()
             .is_some_and(|e| e.contains(&call_prefix))
+            || c.style_lua_expr
+                .as_ref()
+                .is_some_and(|e| e.contains(&call_prefix))
             || c.dynamic_repeat.as_ref().is_some_and(|rep| {
                 rep.label_lua_expr
                     .as_ref()
@@ -1195,7 +1260,15 @@ fn page_references_fn_name(page: &PageLayout, fn_name: &str) -> bool {
                         .as_ref()
                         .is_some_and(|e| e.contains(&call_prefix))
                     || rep
+                        .style_lua_expr
+                        .as_ref()
+                        .is_some_and(|e| e.contains(&call_prefix))
+                    || rep
                         .row_label_lua_expr
+                        .as_ref()
+                        .is_some_and(|e| e.contains(&call_prefix))
+                    || rep
+                        .col_label_lua_expr
                         .as_ref()
                         .is_some_and(|e| e.contains(&call_prefix))
             })

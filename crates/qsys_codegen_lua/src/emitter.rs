@@ -853,6 +853,24 @@ impl<'a> LuaEmitter<'a> {
                 )
             }
 
+            IRExpr::IfExp {
+                test,
+                test_truthiness,
+                body,
+                orelse,
+            } => {
+                let cond_str = self.emit_truthy_condition(test, *test_truthiness);
+                let body_str = self.emit_expr(body);
+                let orelse_str = self.emit_expr(orelse);
+                if matches!(body.as_ref(), IRExpr::Bool(false) | IRExpr::Nil) {
+                    format!(
+                        "(function() if {cond_str} then return {body_str} else return {orelse_str} end end)()"
+                    )
+                } else {
+                    format!("({cond_str} and {body_str} or {orelse_str})")
+                }
+            }
+
             IRExpr::RawLua(code) => code.clone(),
         }
     }
@@ -1240,6 +1258,13 @@ fn expr_references_function(expr: &IRExpr, fn_id: FunctionId, fn_name: &str) -> 
                 || expr_references_function(index, fn_id, fn_name)
         }
         IRExpr::Lambda { body, .. } => expr_references_function(body, fn_id, fn_name),
+        IRExpr::IfExp {
+            test, body, orelse, ..
+        } => {
+            expr_references_function(test, fn_id, fn_name)
+                || expr_references_function(body, fn_id, fn_name)
+                || expr_references_function(orelse, fn_id, fn_name)
+        }
         _ => false,
     }
 }
@@ -1332,6 +1357,13 @@ fn expr_references_local(expr: &IRExpr, sym_id: SymbolId) -> bool {
             expr_references_local(base, sym_id) || expr_references_local(index, sym_id)
         }
         IRExpr::Lambda { body, .. } => expr_references_local(body, sym_id),
+        IRExpr::IfExp {
+            test, body, orelse, ..
+        } => {
+            expr_references_local(test, sym_id)
+                || expr_references_local(body, sym_id)
+                || expr_references_local(orelse, sym_id)
+        }
         _ => false,
     }
 }
