@@ -1039,9 +1039,15 @@ pub fn format_count_lua_expr(spec: &str, table_var: &str) -> String {
     if spec.trim().parse::<i64>().is_ok() {
         return spec.trim().to_string();
     }
-    if spec.contains("{PROP:") {
+    let (inner_spec, is_raw_lua) =
+        if let Some(inner) = spec.strip_prefix("{LUA:").and_then(|s| s.strip_suffix('}')) {
+            (inner, true)
+        } else {
+            (spec, false)
+        };
+    if is_raw_lua || inner_spec.contains("{PROP:") {
         let mut out = String::new();
-        let mut rest = spec;
+        let mut rest = inner_spec;
         while let Some(start) = rest.find("{PROP:") {
             out.push_str(&rest[..start]);
             let after_prefix = &rest[start + 6..];
@@ -1060,7 +1066,7 @@ pub fn format_count_lua_expr(spec: &str, table_var: &str) -> String {
         out.push_str(rest);
         out
     } else {
-        format!("{table_var}[{}].Value", escape_lua_string(spec))
+        format!("{table_var}[{}].Value", escape_lua_string(inner_spec))
     }
 }
 
@@ -1105,7 +1111,7 @@ pub fn format_lua_float(f: f64) -> String {
     }
 }
 
-fn is_pure_const_expr(expr: &IRExpr) -> bool {
+pub(crate) fn is_pure_const_expr(expr: &IRExpr) -> bool {
     match expr {
         IRExpr::Int(_) | IRExpr::Float(_) | IRExpr::String(_) | IRExpr::Bool(_) | IRExpr::Nil => {
             true
@@ -1120,6 +1126,9 @@ fn is_pure_const_expr(expr: &IRExpr) -> bool {
             is_pure_const_expr(left) && is_pure_const_expr(right)
         }
         IRExpr::Unary { operand, .. } => is_pure_const_expr(operand),
+        IRExpr::IfExp {
+            test, body, orelse, ..
+        } => is_pure_const_expr(test) && is_pure_const_expr(body) && is_pure_const_expr(orelse),
         _ => false,
     }
 }

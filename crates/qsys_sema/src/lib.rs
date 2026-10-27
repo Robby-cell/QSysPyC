@@ -13,7 +13,7 @@ use rustc_hash::FxHashMap;
 
 use qsys_diagnostics::{Diagnostics, SourceFile, Span};
 use qsys_ir::{FunctionId, SymbolId};
-use qsys_model::{PageLayout, PluginInfo, is_design_time_method};
+use qsys_model::{PageLayout, PluginInfo, PropertyKind, is_design_time_method};
 use qsys_parser::{ParsedModule, ast};
 use qsys_runtime::{ExecutionContext, RuntimeEnv};
 
@@ -259,7 +259,18 @@ pub fn analyze_lossy_with_env(
             }
             for (span, prop_id) in &decls.control_property_resolutions {
                 type_map.insert_resolution(*span, ResolvedTarget::Property(*prop_id));
-                type_map.insert_type(*span, Type::Int);
+                let prop_ty = decls
+                    .properties
+                    .iter()
+                    .find(|p| p.id == *prop_id)
+                    .map(|p| match p.def.kind {
+                        PropertyKind::Integer { .. } => Type::Int,
+                        PropertyKind::Double { .. } => Type::Float,
+                        PropertyKind::String { .. } | PropertyKind::Enum { .. } => Type::String,
+                        PropertyKind::Boolean { .. } => Type::Bool,
+                    })
+                    .unwrap_or(Type::Int);
+                type_map.insert_type(*span, prop_ty);
             }
 
             scope_stack.push_scope(ScopeKind::Class {
@@ -330,149 +341,9 @@ pub fn analyze_lossy_with_env(
             let mut methods = Vec::new();
             let mut init_statements = Vec::new();
 
-            ExprAnalyzer::new(&mut scope_stack, &mut type_map, &mut diagnostics, &env)
-                .pre_upgrade_outer_vars(&decls.remaining_statements);
-
-            // 4. PASS 2: Analyze method bodies and event decorators
             for stmt in &decls.remaining_statements {
                 match &stmt.kind {
-                    ast::StmtKind::FunctionDef(f) => {
-                        let method_id = *method_ids.get(&f.name).unwrap();
-
-                        for dec in &f.decorators {
-                            if let Some(binding) = resolve_event_decorator(
-                                dec,
-                                method_id,
-                                f,
-                                &scope_stack,
-                                &mut diagnostics,
-                            ) {
-                                event_bindings.push(binding);
-                            }
-                        }
-
-                        scope_stack.push_scope(ScopeKind::Function {
-                            name: f.name.clone(),
-                        });
-
-                        let self_id = scope_stack.alloc_symbol_id();
-                        type_map.insert_symbol_name(self_id, "self");
-                        scope_stack.define(Symbol::new(
-                            self_id,
-                            "self",
-                            SymbolKind::Variable {
-                                id: self_id,
-                                ty: Type::ClassInstance {
-                                    name: class.name.clone(),
-                                },
-                            },
-                            f.span,
-                        ));
-
-                        let is_event_handler =
-                            event_bindings.iter().any(|b| b.handler_id == method_id);
-                        let mut resolved_params = Vec::new();
-                        let skip_count =
-                            usize::from(f.params.first().is_some_and(|p| p.name == "self"));
-                        let method_context = if is_design_time_method(&f.name) {
-                            ExecutionContext::DesignTime
-                        } else {
-                            ExecutionContext::Runtime
-                        };
-
-                        for (idx, param) in f.params.iter().enumerate().skip(skip_count) {
-                            let default_ty = param.default.as_ref().map(|def_expr| {
-                                let mut def_analyzer = ExprAnalyzer::new(
-                                    &mut scope_stack,
-                                    &mut type_map,
-                                    &mut diagnostics,
-                                    &env,
-                                )
-                                .with_context(method_context);
-                                def_analyzer.infer_expr(def_expr)
-                            });
-
-                            let mut param_ty = if is_event_handler && idx == 1 {
-                                Type::ControlHandle
-                            } else if is_event_handler
-                                && (idx == 2 || idx == 3)
-                                && param.type_annotation.is_none()
-                            {
-                                Type::Int
-                            } else {
-                                type_from_annotation_with_scope(
-                                    param.type_annotation.as_deref(),
-                                    &env,
-                                    &scope_stack,
-                                )
-                            };
-                            if param_ty == Type::Any
-                                && let Some(ref dt) = default_ty
-                                && !matches!(dt, Type::Any | Type::None)
-                            {
-                                param_ty = dt.clone();
-                            }
-
-                            let param_sym = scope_stack.alloc_symbol_id();
-                            type_map.insert_symbol_name(param_sym, param.name.clone());
-                            scope_stack.define(Symbol::new(
-                                param_sym,
-                                param.name.clone(),
-                                SymbolKind::Parameter {
-                                    id: param_sym,
-                                    ty: param_ty.clone(),
-                                    index: idx,
-                                },
-                                param.span,
-                            ));
-                            type_map
-                                .insert_resolution(param.span, ResolvedTarget::Local(param_sym));
-                            type_map.insert_type(param.span, param_ty);
-                            resolved_params.push((
-                                param_sym,
-                                param.name.clone(),
-                                param.default.as_deref().cloned(),
-                            ));
-                        }
-
-                        let mut analyzer = ExprAnalyzer::new(
-                            &mut scope_stack,
-                            &mut type_map,
-                            &mut diagnostics,
-                            &env,
-                        )
-                        .with_context(method_context);
-                        analyzer.analyze_statements(&f.body);
-
-                        scope_stack.pop_scope();
-
-                        let mut ret_ty = type_from_annotation_with_scope(
-                            f.return_type.as_deref(),
-                            &env,
-                            &scope_stack,
-                        );
-                        if ret_ty == Type::Any
-                            && let Some(ret_expr) = analyzer::find_first_return_expr(&f.body)
-                            && let Some(inferred) = type_map.get_type(ret_expr.span)
-                            && *inferred != Type::Any
-                        {
-                            ret_ty = inferred.clone();
-                        }
-                        type_map.insert_class_member_type(
-                            class.name.clone(),
-                            f.name.clone(),
-                            ret_ty,
-                        );
-
-                        methods.push(ResolvedMethod {
-                            id: method_id,
-                            name: f.name.clone(),
-                            params: resolved_params,
-                            body: f.body.clone(),
-                            span: f.span,
-                        });
-                    }
-                    ast::StmtKind::Pass => {}
+                    ast::StmtKind::FunctionDef(_) | ast::StmtKind::Pass => {}
                     ast::StmtKind::Expr(e) if matches!(e.kind, ast::ExprKind::String(_)) => {}
                     _ => {
                         init_statements.push(stmt.clone());
@@ -498,6 +369,139 @@ pub fn analyze_lossy_with_env(
                     ExprAnalyzer::new(&mut scope_stack, &mut type_map, &mut diagnostics, &env)
                         .with_context(ExecutionContext::Runtime);
                 analyzer.analyze_statements(&init_statements);
+            }
+
+            ExprAnalyzer::new(&mut scope_stack, &mut type_map, &mut diagnostics, &env)
+                .pre_upgrade_outer_vars(&decls.remaining_statements);
+
+            // 4. PASS 2: Analyze method bodies and event decorators
+            for stmt in &decls.remaining_statements {
+                if let ast::StmtKind::FunctionDef(f) = &stmt.kind {
+                    let method_id = *method_ids.get(&f.name).unwrap();
+
+                    for dec in &f.decorators {
+                        if let Some(binding) = resolve_event_decorator(
+                            dec,
+                            method_id,
+                            f,
+                            &scope_stack,
+                            &mut diagnostics,
+                        ) {
+                            event_bindings.push(binding);
+                        }
+                    }
+
+                    scope_stack.push_scope(ScopeKind::Function {
+                        name: f.name.clone(),
+                    });
+
+                    let self_id = scope_stack.alloc_symbol_id();
+                    type_map.insert_symbol_name(self_id, "self");
+                    scope_stack.define(Symbol::new(
+                        self_id,
+                        "self",
+                        SymbolKind::Variable {
+                            id: self_id,
+                            ty: Type::ClassInstance {
+                                name: class.name.clone(),
+                            },
+                        },
+                        f.span,
+                    ));
+
+                    let is_event_handler = event_bindings.iter().any(|b| b.handler_id == method_id);
+                    let mut resolved_params = Vec::new();
+                    let skip_count =
+                        usize::from(f.params.first().is_some_and(|p| p.name == "self"));
+                    let method_context = if is_design_time_method(&f.name) {
+                        ExecutionContext::DesignTime
+                    } else {
+                        ExecutionContext::Runtime
+                    };
+
+                    for (idx, param) in f.params.iter().enumerate().skip(skip_count) {
+                        let default_ty = param.default.as_ref().map(|def_expr| {
+                            let mut def_analyzer = ExprAnalyzer::new(
+                                &mut scope_stack,
+                                &mut type_map,
+                                &mut diagnostics,
+                                &env,
+                            )
+                            .with_context(method_context);
+                            def_analyzer.infer_expr(def_expr)
+                        });
+
+                        let mut param_ty = if is_event_handler && idx == 1 {
+                            Type::ControlHandle
+                        } else if is_event_handler
+                            && (idx == 2 || idx == 3)
+                            && param.type_annotation.is_none()
+                        {
+                            Type::Int
+                        } else {
+                            type_from_annotation_with_scope(
+                                param.type_annotation.as_deref(),
+                                &env,
+                                &scope_stack,
+                            )
+                        };
+                        if param_ty == Type::Any
+                            && let Some(ref dt) = default_ty
+                            && !matches!(dt, Type::Any | Type::None)
+                        {
+                            param_ty = dt.clone();
+                        }
+
+                        let param_sym = scope_stack.alloc_symbol_id();
+                        type_map.insert_symbol_name(param_sym, param.name.clone());
+                        scope_stack.define(Symbol::new(
+                            param_sym,
+                            param.name.clone(),
+                            SymbolKind::Parameter {
+                                id: param_sym,
+                                ty: param_ty.clone(),
+                                index: idx,
+                            },
+                            param.span,
+                        ));
+                        type_map.insert_resolution(param.span, ResolvedTarget::Local(param_sym));
+                        type_map.insert_type(param.span, param_ty);
+                        resolved_params.push((
+                            param_sym,
+                            param.name.clone(),
+                            param.default.as_deref().cloned(),
+                        ));
+                    }
+
+                    let mut analyzer =
+                        ExprAnalyzer::new(&mut scope_stack, &mut type_map, &mut diagnostics, &env)
+                            .with_context(method_context);
+                    analyzer.analyze_statements(&f.body);
+
+                    scope_stack.pop_scope();
+
+                    let mut ret_ty = type_from_annotation_with_scope(
+                        f.return_type.as_deref(),
+                        &env,
+                        &scope_stack,
+                    );
+                    if ret_ty == Type::Any
+                        && let Some(ret_expr) = analyzer::find_first_return_expr(&f.body)
+                        && let Some(inferred) = type_map.get_type(ret_expr.span)
+                        && *inferred != Type::Any
+                    {
+                        ret_ty = inferred.clone();
+                    }
+                    type_map.insert_class_member_type(class.name.clone(), f.name.clone(), ret_ty);
+
+                    methods.push(ResolvedMethod {
+                        id: method_id,
+                        name: f.name.clone(),
+                        params: resolved_params,
+                        body: f.body.clone(),
+                        span: f.span,
+                    });
+                }
             }
 
             scope_stack.pop_scope();
@@ -577,143 +581,9 @@ pub fn analyze_lossy_with_env(
             let mut methods = Vec::new();
             let mut init_statements = Vec::new();
 
-            ExprAnalyzer::new(&mut scope_stack, &mut type_map, &mut diagnostics, &env)
-                .pre_upgrade_outer_vars(&decls.remaining_statements);
-
             for stmt in &decls.remaining_statements {
                 match &stmt.kind {
-                    ast::StmtKind::FunctionDef(f) => {
-                        let method_id = *method_ids.get(&f.name).unwrap();
-
-                        for dec in &f.decorators {
-                            if let Some(binding) = resolve_event_decorator(
-                                dec,
-                                method_id,
-                                f,
-                                &scope_stack,
-                                &mut diagnostics,
-                            ) {
-                                event_bindings.push(binding);
-                            }
-                        }
-
-                        scope_stack.push_scope(ScopeKind::Function {
-                            name: f.name.clone(),
-                        });
-
-                        let self_id = scope_stack.alloc_symbol_id();
-                        type_map.insert_symbol_name(self_id, "self");
-                        scope_stack.define(Symbol::new(
-                            self_id,
-                            "self",
-                            SymbolKind::Variable {
-                                id: self_id,
-                                ty: Type::ClassInstance {
-                                    name: class.name.clone(),
-                                },
-                            },
-                            f.span,
-                        ));
-
-                        let is_event_handler =
-                            event_bindings.iter().any(|b| b.handler_id == method_id);
-                        let mut resolved_params = Vec::new();
-                        let skip_count =
-                            usize::from(f.params.first().is_some_and(|p| p.name == "self"));
-
-                        for (idx, param) in f.params.iter().enumerate().skip(skip_count) {
-                            let default_ty = param.default.as_ref().map(|def_expr| {
-                                let mut def_analyzer = ExprAnalyzer::new(
-                                    &mut scope_stack,
-                                    &mut type_map,
-                                    &mut diagnostics,
-                                    &env,
-                                )
-                                .with_context(ExecutionContext::Runtime);
-                                def_analyzer.infer_expr(def_expr)
-                            });
-
-                            let mut param_ty = if is_event_handler && idx == 1 {
-                                Type::ControlHandle
-                            } else if is_event_handler
-                                && (idx == 2 || idx == 3)
-                                && param.type_annotation.is_none()
-                            {
-                                Type::Int
-                            } else {
-                                type_from_annotation_with_scope(
-                                    param.type_annotation.as_deref(),
-                                    &env,
-                                    &scope_stack,
-                                )
-                            };
-                            if param_ty == Type::Any
-                                && let Some(ref dt) = default_ty
-                                && !matches!(dt, Type::Any | Type::None)
-                            {
-                                param_ty = dt.clone();
-                            }
-
-                            let param_sym = scope_stack.alloc_symbol_id();
-                            type_map.insert_symbol_name(param_sym, param.name.clone());
-                            scope_stack.define(Symbol::new(
-                                param_sym,
-                                param.name.clone(),
-                                SymbolKind::Parameter {
-                                    id: param_sym,
-                                    ty: param_ty.clone(),
-                                    index: idx,
-                                },
-                                param.span,
-                            ));
-                            type_map
-                                .insert_resolution(param.span, ResolvedTarget::Local(param_sym));
-                            type_map.insert_type(param.span, param_ty);
-                            resolved_params.push((
-                                param_sym,
-                                param.name.clone(),
-                                param.default.as_deref().cloned(),
-                            ));
-                        }
-
-                        let mut analyzer = ExprAnalyzer::new(
-                            &mut scope_stack,
-                            &mut type_map,
-                            &mut diagnostics,
-                            &env,
-                        )
-                        .with_context(ExecutionContext::Runtime);
-                        analyzer.analyze_statements(&f.body);
-
-                        scope_stack.pop_scope();
-
-                        let mut ret_ty = type_from_annotation_with_scope(
-                            f.return_type.as_deref(),
-                            &env,
-                            &scope_stack,
-                        );
-                        if ret_ty == Type::Any
-                            && let Some(ret_expr) = analyzer::find_first_return_expr(&f.body)
-                            && let Some(inferred) = type_map.get_type(ret_expr.span)
-                            && *inferred != Type::Any
-                        {
-                            ret_ty = inferred.clone();
-                        }
-                        type_map.insert_class_member_type(
-                            class.name.clone(),
-                            f.name.clone(),
-                            ret_ty,
-                        );
-
-                        methods.push(ResolvedMethod {
-                            id: method_id,
-                            name: f.name.clone(),
-                            params: resolved_params,
-                            body: f.body.clone(),
-                            span: f.span,
-                        });
-                    }
-                    ast::StmtKind::Pass => {}
+                    ast::StmtKind::FunctionDef(_) | ast::StmtKind::Pass => {}
                     ast::StmtKind::Expr(e) if matches!(e.kind, ast::ExprKind::String(_)) => {}
                     _ => {
                         init_statements.push(stmt.clone());
@@ -739,6 +609,133 @@ pub fn analyze_lossy_with_env(
                     ExprAnalyzer::new(&mut scope_stack, &mut type_map, &mut diagnostics, &env)
                         .with_context(ExecutionContext::Runtime);
                 analyzer.analyze_statements(&init_statements);
+            }
+
+            ExprAnalyzer::new(&mut scope_stack, &mut type_map, &mut diagnostics, &env)
+                .pre_upgrade_outer_vars(&decls.remaining_statements);
+
+            for stmt in &decls.remaining_statements {
+                if let ast::StmtKind::FunctionDef(f) = &stmt.kind {
+                    let method_id = *method_ids.get(&f.name).unwrap();
+
+                    for dec in &f.decorators {
+                        if let Some(binding) = resolve_event_decorator(
+                            dec,
+                            method_id,
+                            f,
+                            &scope_stack,
+                            &mut diagnostics,
+                        ) {
+                            event_bindings.push(binding);
+                        }
+                    }
+
+                    scope_stack.push_scope(ScopeKind::Function {
+                        name: f.name.clone(),
+                    });
+
+                    let self_id = scope_stack.alloc_symbol_id();
+                    type_map.insert_symbol_name(self_id, "self");
+                    scope_stack.define(Symbol::new(
+                        self_id,
+                        "self",
+                        SymbolKind::Variable {
+                            id: self_id,
+                            ty: Type::ClassInstance {
+                                name: class.name.clone(),
+                            },
+                        },
+                        f.span,
+                    ));
+
+                    let is_event_handler = event_bindings.iter().any(|b| b.handler_id == method_id);
+                    let mut resolved_params = Vec::new();
+                    let skip_count =
+                        usize::from(f.params.first().is_some_and(|p| p.name == "self"));
+
+                    for (idx, param) in f.params.iter().enumerate().skip(skip_count) {
+                        let default_ty = param.default.as_ref().map(|def_expr| {
+                            let mut def_analyzer = ExprAnalyzer::new(
+                                &mut scope_stack,
+                                &mut type_map,
+                                &mut diagnostics,
+                                &env,
+                            )
+                            .with_context(ExecutionContext::Runtime);
+                            def_analyzer.infer_expr(def_expr)
+                        });
+
+                        let mut param_ty = if is_event_handler && idx == 1 {
+                            Type::ControlHandle
+                        } else if is_event_handler
+                            && (idx == 2 || idx == 3)
+                            && param.type_annotation.is_none()
+                        {
+                            Type::Int
+                        } else {
+                            type_from_annotation_with_scope(
+                                param.type_annotation.as_deref(),
+                                &env,
+                                &scope_stack,
+                            )
+                        };
+                        if param_ty == Type::Any
+                            && let Some(ref dt) = default_ty
+                            && !matches!(dt, Type::Any | Type::None)
+                        {
+                            param_ty = dt.clone();
+                        }
+
+                        let param_sym = scope_stack.alloc_symbol_id();
+                        type_map.insert_symbol_name(param_sym, param.name.clone());
+                        scope_stack.define(Symbol::new(
+                            param_sym,
+                            param.name.clone(),
+                            SymbolKind::Parameter {
+                                id: param_sym,
+                                ty: param_ty.clone(),
+                                index: idx,
+                            },
+                            param.span,
+                        ));
+                        type_map.insert_resolution(param.span, ResolvedTarget::Local(param_sym));
+                        type_map.insert_type(param.span, param_ty);
+                        resolved_params.push((
+                            param_sym,
+                            param.name.clone(),
+                            param.default.as_deref().cloned(),
+                        ));
+                    }
+
+                    let mut analyzer =
+                        ExprAnalyzer::new(&mut scope_stack, &mut type_map, &mut diagnostics, &env)
+                            .with_context(ExecutionContext::Runtime);
+                    analyzer.analyze_statements(&f.body);
+
+                    scope_stack.pop_scope();
+
+                    let mut ret_ty = type_from_annotation_with_scope(
+                        f.return_type.as_deref(),
+                        &env,
+                        &scope_stack,
+                    );
+                    if ret_ty == Type::Any
+                        && let Some(ret_expr) = analyzer::find_first_return_expr(&f.body)
+                        && let Some(inferred) = type_map.get_type(ret_expr.span)
+                        && *inferred != Type::Any
+                    {
+                        ret_ty = inferred.clone();
+                    }
+                    type_map.insert_class_member_type(class.name.clone(), f.name.clone(), ret_ty);
+
+                    methods.push(ResolvedMethod {
+                        id: method_id,
+                        name: f.name.clone(),
+                        params: resolved_params,
+                        body: f.body.clone(),
+                        span: f.span,
+                    });
+                }
             }
 
             scope_stack.pop_scope();

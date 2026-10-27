@@ -2,7 +2,7 @@ use rustc_hash::FxHashMap;
 use strsim::levenshtein;
 
 use qsys_diagnostics::{DiagnosticKind, Diagnostics, Span};
-use qsys_ir::ControlId;
+use qsys_ir::{ControlId, PropertyId};
 use qsys_model::{
     Color, ControlStyle, FlexDirection, GridCellPreview, LabelPlacement, PageLayout, PropertyKind,
     UiControlSpec, UiGridSpec, UiNode, UiPageSpec,
@@ -82,6 +82,1070 @@ impl<'a> UiResolveEnv<'a> {
 
         env
     }
+
+    pub(crate) fn collect_property_resolutions(
+        &self,
+        class_name: &str,
+        expr: &ast::Expr,
+        out: &mut Vec<(Span, PropertyId)>,
+    ) {
+        match &expr.kind {
+            ast::ExprKind::Ident(name) => {
+                if let Some(prop) = self
+                    .properties
+                    .iter()
+                    .find(|p| p.ident == *name || p.def.name == *name)
+                {
+                    out.push((expr.span, prop.id));
+                }
+            }
+            ast::ExprKind::Attribute { value, attr } => {
+                if attr == "Value" {
+                    if let ast::ExprKind::Attribute {
+                        value: inner_obj,
+                        attr: prop_ident,
+                    } = &value.kind
+                        && let ast::ExprKind::Ident(obj_name) = &inner_obj.kind
+                        && (obj_name == "self" || obj_name == class_name)
+                        && let Some(prop) = self
+                            .properties
+                            .iter()
+                            .find(|p| p.ident == *prop_ident || p.def.name == *prop_ident)
+                    {
+                        out.push((expr.span, prop.id));
+                        return;
+                    }
+                    if let ast::ExprKind::Ident(prop_ident) = &value.kind
+                        && let Some(prop) = self
+                            .properties
+                            .iter()
+                            .find(|p| p.ident == *prop_ident || p.def.name == *prop_ident)
+                    {
+                        out.push((expr.span, prop.id));
+                        return;
+                    }
+                    if let ast::ExprKind::Subscript {
+                        value: inner_obj,
+                        index,
+                    } = &value.kind
+                        && matches!(
+                            &inner_obj.kind,
+                            ast::ExprKind::Ident(s) if s == "props" || s == "Properties"
+                        )
+                        && let Some(key) = eval_constant_with_env(index, &self.constants)
+                            .and_then(|c| c.as_str().map(String::from))
+                        && let Some(prop) = self
+                            .properties
+                            .iter()
+                            .find(|p| p.def.name == key || p.ident == key)
+                    {
+                        out.push((expr.span, prop.id));
+                        return;
+                    }
+                }
+                if let ast::ExprKind::Ident(obj_name) = &value.kind
+                    && (obj_name == "self" || obj_name == class_name)
+                    && let Some(prop) = self
+                        .properties
+                        .iter()
+                        .find(|p| p.ident == *attr || p.def.name == *attr)
+                {
+                    out.push((expr.span, prop.id));
+                    return;
+                }
+                self.collect_property_resolutions(class_name, value, out);
+            }
+            ast::ExprKind::Subscript { value, index } => {
+                if matches!(
+                    &value.kind,
+                    ast::ExprKind::Ident(s) if s == "props" || s == "Properties"
+                ) && let Some(key) = eval_constant_with_env(index, &self.constants)
+                    .and_then(|c| c.as_str().map(String::from))
+                    && let Some(prop) = self
+                        .properties
+                        .iter()
+                        .find(|p| p.def.name == key || p.ident == key)
+                {
+                    out.push((expr.span, prop.id));
+                    return;
+                }
+                self.collect_property_resolutions(class_name, value, out);
+                self.collect_property_resolutions(class_name, index, out);
+            }
+            ast::ExprKind::Unary { operand, .. } => {
+                self.collect_property_resolutions(class_name, operand, out);
+            }
+            ast::ExprKind::Binary { left, right, .. }
+            | ast::ExprKind::BoolOp { left, right, .. } => {
+                self.collect_property_resolutions(class_name, left, out);
+                self.collect_property_resolutions(class_name, right, out);
+            }
+            ast::ExprKind::IfExp { test, body, orelse } => {
+                self.collect_property_resolutions(class_name, test, out);
+                self.collect_property_resolutions(class_name, body, out);
+                self.collect_property_resolutions(class_name, orelse, out);
+            }
+            ast::ExprKind::Call {
+                callee,
+                args,
+                kwargs,
+            } => {
+                self.collect_property_resolutions(class_name, callee, out);
+                for arg in args {
+                    self.collect_property_resolutions(class_name, arg, out);
+                }
+                for (_, kw_val) in kwargs {
+                    self.collect_property_resolutions(class_name, kw_val, out);
+                }
+            }
+            ast::ExprKind::List(items) | ast::ExprKind::Tuple(items) => {
+                for item in items {
+                    self.collect_property_resolutions(class_name, item, out);
+                }
+            }
+            ast::ExprKind::Lambda { body, .. } => {
+                self.collect_property_resolutions(class_name, body, out);
+            }
+            _ => {}
+        }
+    }
+
+    pub(crate) fn is_dynamic_design_expr(&self, class_name: &str, expr: &ast::Expr) -> bool {
+        match &expr.kind {
+            ast::ExprKind::Int(_)
+            | ast::ExprKind::Float(_)
+            | ast::ExprKind::String(_)
+            | ast::ExprKind::Bool(_)
+            | ast::ExprKind::None => false,
+            ast::ExprKind::Ident(name) => self
+                .properties
+                .iter()
+                .any(|p| p.ident == *name || p.def.name == *name),
+            ast::ExprKind::Attribute { value, attr } => {
+                if attr == "Value" {
+                    return true;
+                }
+                if let ast::ExprKind::Ident(obj_name) = &value.kind
+                    && (obj_name == "self" || obj_name == class_name)
+                {
+                    if self
+                        .properties
+                        .iter()
+                        .any(|p| p.ident == *attr || p.def.name == *attr)
+                    {
+                        return true;
+                    }
+                    if self.constants.contains_key(attr) {
+                        return false;
+                    }
+                }
+                self.is_dynamic_design_expr(class_name, value)
+            }
+            ast::ExprKind::Subscript { value, index } => {
+                if matches!(
+                    &value.kind,
+                    ast::ExprKind::Ident(s) if s == "props" || s == "Properties"
+                ) {
+                    return true;
+                }
+                self.is_dynamic_design_expr(class_name, value)
+                    || self.is_dynamic_design_expr(class_name, index)
+            }
+            ast::ExprKind::Unary { operand, .. } => {
+                self.is_dynamic_design_expr(class_name, operand)
+            }
+            ast::ExprKind::Binary { left, right, .. }
+            | ast::ExprKind::BoolOp { left, right, .. } => {
+                self.is_dynamic_design_expr(class_name, left)
+                    || self.is_dynamic_design_expr(class_name, right)
+            }
+            ast::ExprKind::IfExp { test, body, orelse } => {
+                self.is_dynamic_design_expr(class_name, test)
+                    || self.is_dynamic_design_expr(class_name, body)
+                    || self.is_dynamic_design_expr(class_name, orelse)
+            }
+            ast::ExprKind::List(items) | ast::ExprKind::Tuple(items) => items
+                .iter()
+                .any(|i| self.is_dynamic_design_expr(class_name, i)),
+            ast::ExprKind::Call { callee, args, .. } => {
+                if let ast::ExprKind::Ident(fn_name) = &callee.kind
+                    && matches!(
+                        fn_name.as_str(),
+                        "str" | "int" | "float" | "bool" | "abs" | "min" | "max" | "round"
+                    )
+                    && !self.local_functions.contains_key(fn_name)
+                    && !self.class_methods.contains_key(fn_name)
+                    && !self.module_functions.contains_key(fn_name)
+                {
+                    return args
+                        .iter()
+                        .any(|a| self.is_dynamic_design_expr(class_name, a));
+                }
+                true
+            }
+            ast::ExprKind::Lambda { .. } => true,
+            _ => false,
+        }
+    }
+
+    pub(crate) fn eval_design_expr_preview(
+        &self,
+        class_name: &str,
+        expr: &ast::Expr,
+    ) -> Option<PreviewVal> {
+        let mut vars = FxHashMap::default();
+        for (name, val) in &self.constants {
+            vars.insert(name.clone(), PreviewVal::from_const(val));
+        }
+        self.eval_preview_expr_in_env(class_name, expr, &vars, 0)
+    }
+
+    pub(crate) fn lower_design_expr_to_lua(&self, class_name: &str, expr: &ast::Expr) -> String {
+        self.lower_ui_expr_to_lua_inner(class_name, expr, &FxHashMap::default(), false)
+    }
+
+    pub(crate) fn lower_design_expr_to_prop_template(
+        &self,
+        class_name: &str,
+        expr: &ast::Expr,
+    ) -> String {
+        self.lower_ui_expr_to_lua_inner(class_name, expr, &FxHashMap::default(), true)
+    }
+
+    fn format_prop_value_lua(prop_name: &str, prop_template_mode: bool) -> String {
+        if prop_template_mode {
+            format!("{{PROP:{prop_name}}}")
+        } else {
+            format!("props[\"{}\"].Value", escape_lua_str_content(prop_name))
+        }
+    }
+
+    fn const_val_to_lua(cval: &ConstValue) -> String {
+        match cval {
+            ConstValue::Int(i) => {
+                if *i < 0 {
+                    format!("({i})")
+                } else {
+                    i.to_string()
+                }
+            }
+            ConstValue::Float(f) => {
+                if *f < 0.0 {
+                    format!("({f})")
+                } else {
+                    f.to_string()
+                }
+            }
+            ConstValue::String(s) => format!("\"{}\"", escape_lua_str_content(s)),
+            ConstValue::Bool(b) => b.to_string(),
+            ConstValue::List(items) => {
+                let parts: Vec<String> = items.iter().map(Self::const_val_to_lua).collect();
+                format!("{{ {} }}", parts.join(", "))
+            }
+        }
+    }
+
+    pub(crate) fn lower_ui_expr_to_lua_inner(
+        &self,
+        class_name: &str,
+        expr: &ast::Expr,
+        local_map: &FxHashMap<String, String>,
+        prop_template_mode: bool,
+    ) -> String {
+        match &expr.kind {
+            ast::ExprKind::Int(i) => i.to_string(),
+            ast::ExprKind::Float(f) => f.to_string(),
+            ast::ExprKind::String(s) => format!("\"{}\"", escape_lua_str_content(s)),
+            ast::ExprKind::Bool(b) => b.to_string(),
+            ast::ExprKind::None => "nil".to_string(),
+            ast::ExprKind::Ident(name) => {
+                if let Some(mapped) = local_map.get(name) {
+                    return mapped.clone();
+                }
+                if let Some(prop) = self
+                    .properties
+                    .iter()
+                    .find(|p| p.ident == *name || p.def.name == *name)
+                {
+                    return Self::format_prop_value_lua(&prop.def.name, prop_template_mode);
+                }
+                if let Some(cval) = self.constants.get(name) {
+                    return Self::const_val_to_lua(cval);
+                }
+                name.clone()
+            }
+            ast::ExprKind::Attribute { value, attr } => {
+                if attr == "Value" {
+                    if let ast::ExprKind::Attribute {
+                        value: inner_obj,
+                        attr: prop_ident,
+                    } = &value.kind
+                        && let ast::ExprKind::Ident(obj_name) = &inner_obj.kind
+                        && (obj_name == "self" || obj_name == class_name)
+                        && let Some(prop) = self
+                            .properties
+                            .iter()
+                            .find(|p| p.ident == *prop_ident || p.def.name == *prop_ident)
+                    {
+                        return Self::format_prop_value_lua(&prop.def.name, prop_template_mode);
+                    }
+                    if let ast::ExprKind::Ident(prop_ident) = &value.kind
+                        && let Some(prop) = self
+                            .properties
+                            .iter()
+                            .find(|p| p.ident == *prop_ident || p.def.name == *prop_ident)
+                    {
+                        return Self::format_prop_value_lua(&prop.def.name, prop_template_mode);
+                    }
+                    if let ast::ExprKind::Subscript {
+                        value: inner_obj,
+                        index,
+                    } = &value.kind
+                        && let ast::ExprKind::Ident(obj) = &inner_obj.kind
+                        && (obj == "props" || obj == "Properties")
+                    {
+                        if prop_template_mode
+                            && let Some(s) = eval_constant_with_env(index, &self.constants)
+                                .and_then(|c| c.as_str().map(String::from))
+                        {
+                            return format!("{{PROP:{s}}}");
+                        }
+                        let idx_lua = self.lower_ui_expr_to_lua_inner(
+                            class_name,
+                            index,
+                            local_map,
+                            prop_template_mode,
+                        );
+                        return format!("props[{idx_lua}].Value");
+                    }
+                }
+                if let ast::ExprKind::Ident(obj_name) = &value.kind
+                    && (obj_name == "self" || obj_name == class_name)
+                {
+                    if let Some(prop) = self
+                        .properties
+                        .iter()
+                        .find(|p| p.ident == *attr || p.def.name == *attr)
+                    {
+                        return Self::format_prop_value_lua(&prop.def.name, prop_template_mode);
+                    }
+                    if let Some(cval) = self.constants.get(attr) {
+                        return Self::const_val_to_lua(cval);
+                    }
+                }
+                if let ast::ExprKind::Ident(prop_ident) = &value.kind
+                    && let Some(prop) = self
+                        .properties
+                        .iter()
+                        .find(|p| p.ident == *prop_ident || p.def.name == *prop_ident)
+                {
+                    return format!(
+                        "props[\"{}\"].{attr}",
+                        escape_lua_str_content(&prop.def.name)
+                    );
+                }
+                if let ast::ExprKind::Attribute {
+                    value: inner_obj,
+                    attr: prop_ident,
+                } = &value.kind
+                    && let ast::ExprKind::Ident(obj_name) = &inner_obj.kind
+                    && (obj_name == "self" || obj_name == class_name)
+                    && let Some(prop) = self
+                        .properties
+                        .iter()
+                        .find(|p| p.ident == *prop_ident || p.def.name == *prop_ident)
+                {
+                    return format!(
+                        "props[\"{}\"].{attr}",
+                        escape_lua_str_content(&prop.def.name)
+                    );
+                }
+                if let ast::ExprKind::Subscript {
+                    value: inner_obj,
+                    index,
+                } = &value.kind
+                    && let ast::ExprKind::Ident(obj) = &inner_obj.kind
+                    && (obj == "props" || obj == "Properties")
+                {
+                    let idx_lua = self.lower_ui_expr_to_lua_inner(
+                        class_name,
+                        index,
+                        local_map,
+                        prop_template_mode,
+                    );
+                    return format!("props[{idx_lua}].{attr}");
+                }
+                let base = self.lower_ui_expr_to_lua_inner(
+                    class_name,
+                    value,
+                    local_map,
+                    prop_template_mode,
+                );
+                format!("{base}.{attr}")
+            }
+            ast::ExprKind::Subscript { value, index } => {
+                if let ast::ExprKind::Ident(obj) = &value.kind
+                    && (obj == "props" || obj == "Properties")
+                {
+                    if prop_template_mode
+                        && let Some(s) = eval_constant_with_env(index, &self.constants)
+                            .and_then(|c| c.as_str().map(String::from))
+                    {
+                        return format!("{{PROP:{s}}}");
+                    }
+                    let idx_lua = self.lower_ui_expr_to_lua_inner(
+                        class_name,
+                        index,
+                        local_map,
+                        prop_template_mode,
+                    );
+                    return format!("props[{idx_lua}].Value");
+                }
+                let base = self.lower_ui_expr_to_lua_inner(
+                    class_name,
+                    value,
+                    local_map,
+                    prop_template_mode,
+                );
+                let idx_lua = self.lower_ui_expr_to_lua_inner(
+                    class_name,
+                    index,
+                    local_map,
+                    prop_template_mode,
+                );
+                format!("{base}[({idx_lua}) + 1]")
+            }
+            ast::ExprKind::Unary { op, operand } => {
+                let inner = self.lower_ui_expr_to_lua_inner(
+                    class_name,
+                    operand,
+                    local_map,
+                    prop_template_mode,
+                );
+                match op {
+                    ast::UnaryOp::Neg => format!("(-{inner})"),
+                    ast::UnaryOp::Pos => inner,
+                    ast::UnaryOp::Not => format!("(not {inner})"),
+                    ast::UnaryOp::BitNot => format!("(~{inner})"),
+                }
+            }
+            ast::ExprKind::Binary { left, op, right } => {
+                let l = self.lower_ui_expr_to_lua_inner(
+                    class_name,
+                    left,
+                    local_map,
+                    prop_template_mode,
+                );
+                let r = self.lower_ui_expr_to_lua_inner(
+                    class_name,
+                    right,
+                    local_map,
+                    prop_template_mode,
+                );
+                let is_str = |e: &ast::Expr| -> bool {
+                    matches!(e.kind, ast::ExprKind::String(_))
+                        || matches!(
+                            &e.kind,
+                            ast::ExprKind::Call { callee, .. }
+                                if matches!(&callee.kind, ast::ExprKind::Ident(n) if n == "str" || n == "tostring")
+                        )
+                        || matches!(
+                            self.eval_design_expr_preview(class_name, e),
+                            Some(PreviewVal::Str(_))
+                        )
+                };
+                if *op == ast::BinaryOp::Add && (is_str(left) || is_str(right)) {
+                    return format!("({l} .. {r})");
+                }
+                let op_str = match op {
+                    ast::BinaryOp::Add => "+",
+                    ast::BinaryOp::Sub => "-",
+                    ast::BinaryOp::Mul => "*",
+                    ast::BinaryOp::Div => "/",
+                    ast::BinaryOp::FloorDiv => "//",
+                    ast::BinaryOp::Mod => "%",
+                    ast::BinaryOp::Pow => "^",
+                    ast::BinaryOp::BitAnd => "&",
+                    ast::BinaryOp::BitOr => "|",
+                    ast::BinaryOp::BitXor => "~",
+                    ast::BinaryOp::LShift => "<<",
+                    ast::BinaryOp::RShift => ">>",
+                    ast::BinaryOp::Eq => "==",
+                    ast::BinaryOp::NotEq => "~=",
+                    ast::BinaryOp::Lt => "<",
+                    ast::BinaryOp::LtEq => "<=",
+                    ast::BinaryOp::Gt => ">",
+                    ast::BinaryOp::GtEq => ">=",
+                };
+                format!("({l} {op_str} {r})")
+            }
+            ast::ExprKind::BoolOp { op, left, right } => {
+                let op_str = match op {
+                    ast::LogicalOp::And => "and",
+                    ast::LogicalOp::Or => "or",
+                };
+                let l = self.lower_ui_expr_to_lua_inner(
+                    class_name,
+                    left,
+                    local_map,
+                    prop_template_mode,
+                );
+                let r = self.lower_ui_expr_to_lua_inner(
+                    class_name,
+                    right,
+                    local_map,
+                    prop_template_mode,
+                );
+                format!("({l} {op_str} {r})")
+            }
+            ast::ExprKind::IfExp { test, body, orelse } => {
+                let t = self.lower_ui_expr_to_lua_inner(
+                    class_name,
+                    test,
+                    local_map,
+                    prop_template_mode,
+                );
+                let b = self.lower_ui_expr_to_lua_inner(
+                    class_name,
+                    body,
+                    local_map,
+                    prop_template_mode,
+                );
+                let o = self.lower_ui_expr_to_lua_inner(
+                    class_name,
+                    orelse,
+                    local_map,
+                    prop_template_mode,
+                );
+                if matches!(body.kind, ast::ExprKind::Bool(false) | ast::ExprKind::None) {
+                    format!("(function() if {t} then return {b} else return {o} end end)()")
+                } else {
+                    format!("({t} and {b} or {o})")
+                }
+            }
+            ast::ExprKind::Call { callee, args, .. } => {
+                let rendered_args: Vec<String> = args
+                    .iter()
+                    .map(|a| {
+                        self.lower_ui_expr_to_lua_inner(
+                            class_name,
+                            a,
+                            local_map,
+                            prop_template_mode,
+                        )
+                    })
+                    .collect();
+                if let ast::ExprKind::Ident(fn_name) = &callee.kind {
+                    if !self.local_functions.contains_key(fn_name)
+                        && !self.module_functions.contains_key(fn_name)
+                        && !self.class_methods.contains_key(fn_name)
+                    {
+                        match fn_name.as_str() {
+                            "str" if rendered_args.len() == 1 => {
+                                return format!("tostring({})", rendered_args[0]);
+                            }
+                            "int" if rendered_args.len() == 1 => {
+                                return format!("math.floor(tonumber({}) or 0)", rendered_args[0]);
+                            }
+                            "float" if rendered_args.len() == 1 => {
+                                return format!("(tonumber({}) or 0.0)", rendered_args[0]);
+                            }
+                            "bool" if rendered_args.len() == 1 => {
+                                return format!("__py_truthy({})", rendered_args[0]);
+                            }
+                            "abs" if rendered_args.len() == 1 => {
+                                return format!("math.abs({})", rendered_args[0]);
+                            }
+                            "round" if rendered_args.len() == 1 => {
+                                return format!("math.floor(({}) + 0.5)", rendered_args[0]);
+                            }
+                            "min" if !rendered_args.is_empty() => {
+                                return format!("math.min({})", rendered_args.join(", "));
+                            }
+                            "max" if !rendered_args.is_empty() => {
+                                return format!("math.max({})", rendered_args.join(", "));
+                            }
+                            _ => {}
+                        }
+                    }
+                    if !self.local_functions.contains_key(fn_name)
+                        && !self.module_functions.contains_key(fn_name)
+                        && self.class_methods.contains_key(fn_name)
+                    {
+                        let mut all_args = vec!["nil".to_string()];
+                        all_args.extend(rendered_args);
+                        return format!("{class_name}_{fn_name}({})", all_args.join(", "));
+                    }
+                    return format!("{fn_name}({})", rendered_args.join(", "));
+                }
+                if let ast::ExprKind::Attribute { value, attr } = &callee.kind
+                    && let ast::ExprKind::Ident(obj) = &value.kind
+                    && (obj == "self" || obj == class_name)
+                {
+                    let mut all_args = vec!["nil".to_string()];
+                    all_args.extend(rendered_args);
+                    return format!("{class_name}_{attr}({})", all_args.join(", "));
+                }
+                let callee_lua = self.lower_ui_expr_to_lua_inner(
+                    class_name,
+                    callee,
+                    local_map,
+                    prop_template_mode,
+                );
+                format!("{callee_lua}({})", rendered_args.join(", "))
+            }
+            _ => "\"\"".to_string(),
+        }
+    }
+
+    pub(crate) fn eval_preview_function_in_env(
+        &self,
+        class_name: &str,
+        func: &ast::FunctionDef,
+        args: &[PreviewVal],
+        depth: usize,
+    ) -> Option<PreviewVal> {
+        if depth > 8 {
+            return None;
+        }
+        let mut vars = FxHashMap::default();
+        for (name, val) in &self.constants {
+            vars.insert(name.clone(), PreviewVal::from_const(val));
+        }
+        let skip_self = usize::from(func.params.first().is_some_and(|p| p.name == "self"));
+        for (param, arg_val) in func.params.iter().skip(skip_self).zip(args.iter()) {
+            vars.insert(param.name.clone(), arg_val.clone());
+        }
+        for param in func.params.iter().skip(skip_self + args.len()) {
+            if let Some(ref def_expr) = param.default
+                && let Some(def_val) =
+                    self.eval_preview_expr_in_env(class_name, def_expr, &vars, depth + 1)
+            {
+                vars.insert(param.name.clone(), def_val);
+            }
+        }
+        self.eval_preview_stmts_in_env(class_name, &func.body, &mut vars, depth)
+    }
+
+    fn eval_preview_stmts_in_env(
+        &self,
+        class_name: &str,
+        stmts: &[ast::Stmt],
+        vars: &mut FxHashMap<String, PreviewVal>,
+        depth: usize,
+    ) -> Option<PreviewVal> {
+        for stmt in stmts {
+            match &stmt.kind {
+                ast::StmtKind::Pass | ast::StmtKind::Global(_) | ast::StmtKind::Nonlocal(_) => {}
+                ast::StmtKind::Expr(e) if matches!(e.kind, ast::ExprKind::String(_)) => {}
+                ast::StmtKind::Assign { target, value, .. } => {
+                    let val = self.eval_preview_expr_in_env(class_name, value, vars, depth)?;
+                    match &target.kind {
+                        ast::ExprKind::Ident(name) => {
+                            vars.insert(name.clone(), val);
+                        }
+                        ast::ExprKind::Tuple(targets) | ast::ExprKind::List(targets) => {
+                            if let PreviewVal::Tuple(items) = val {
+                                for (t, item) in targets.iter().zip(items) {
+                                    if let ast::ExprKind::Ident(name) = &t.kind {
+                                        vars.insert(name.clone(), item);
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                ast::StmtKind::If {
+                    condition,
+                    then_branch,
+                    else_branch,
+                } => {
+                    let cond = self.eval_preview_expr_in_env(class_name, condition, vars, depth)?;
+                    let branch = if cond.is_truthy() {
+                        then_branch
+                    } else {
+                        else_branch
+                    };
+                    if let Some(ret) =
+                        self.eval_preview_stmts_in_env(class_name, branch, vars, depth)
+                    {
+                        return Some(ret);
+                    }
+                }
+                ast::StmtKind::Return(Some(ret_expr)) => {
+                    return self.eval_preview_expr_in_env(class_name, ret_expr, vars, depth);
+                }
+                ast::StmtKind::Return(None) => return None,
+                _ => {}
+            }
+        }
+        None
+    }
+
+    pub(crate) fn lookup_property_default(&self, ident_or_name: &str) -> Option<PreviewVal> {
+        let prop = self
+            .properties
+            .iter()
+            .find(|p| p.ident == ident_or_name || p.def.name == ident_or_name)?;
+        match &prop.def.kind {
+            PropertyKind::Integer { default, .. } => Some(PreviewVal::Int(*default)),
+            PropertyKind::Double { default, .. } => Some(PreviewVal::Float(*default)),
+            PropertyKind::String { default } | PropertyKind::Enum { default, .. } => {
+                Some(PreviewVal::Str(default.clone()))
+            }
+            PropertyKind::Boolean { default } => Some(PreviewVal::Bool(*default)),
+        }
+    }
+
+    pub(crate) fn eval_preview_expr_in_env(
+        &self,
+        class_name: &str,
+        expr: &ast::Expr,
+        vars: &FxHashMap<String, PreviewVal>,
+        depth: usize,
+    ) -> Option<PreviewVal> {
+        match &expr.kind {
+            ast::ExprKind::Int(i) => Some(PreviewVal::Int(*i)),
+            ast::ExprKind::Float(f) => Some(PreviewVal::Float(*f)),
+            ast::ExprKind::String(s) => Some(PreviewVal::Str(s.clone())),
+            ast::ExprKind::Bool(b) => Some(PreviewVal::Bool(*b)),
+            ast::ExprKind::Tuple(items) | ast::ExprKind::List(items) => {
+                let mut out = Vec::with_capacity(items.len());
+                for item in items {
+                    out.push(self.eval_preview_expr_in_env(class_name, item, vars, depth)?);
+                }
+                Some(PreviewVal::Tuple(out))
+            }
+            ast::ExprKind::Ident(name) => {
+                if let Some(v) = vars.get(name) {
+                    return Some(v.clone());
+                }
+                if let Some(cval) = self.constants.get(name) {
+                    return Some(PreviewVal::from_const(cval));
+                }
+                if let Some(prop_val) = self.lookup_property_default(name) {
+                    return Some(prop_val);
+                }
+                None
+            }
+            ast::ExprKind::Attribute { value, attr } => {
+                if attr == "Value" {
+                    if let ast::ExprKind::Attribute {
+                        value: inner_obj,
+                        attr: prop_ident,
+                    } = &value.kind
+                        && let ast::ExprKind::Ident(obj_name) = &inner_obj.kind
+                        && (obj_name == "self" || obj_name == class_name)
+                    {
+                        return self.lookup_property_default(prop_ident);
+                    }
+                    if let ast::ExprKind::Ident(prop_ident) = &value.kind
+                        && let Some(val) = self.lookup_property_default(prop_ident)
+                    {
+                        return Some(val);
+                    }
+                    if let Some(PreviewVal::Prop(prop_name)) =
+                        self.eval_preview_expr_in_env(class_name, value, vars, depth)
+                    {
+                        return self.lookup_property_default(&prop_name);
+                    }
+                }
+                if let ast::ExprKind::Ident(obj_name) = &value.kind
+                    && (obj_name == "self" || obj_name == class_name)
+                {
+                    if let Some(val) = self.lookup_property_default(attr) {
+                        return Some(val);
+                    }
+                    if let Some(cval) = self.constants.get(attr) {
+                        return Some(PreviewVal::from_const(cval));
+                    }
+                }
+                None
+            }
+            ast::ExprKind::Subscript { value, index } => {
+                if let ast::ExprKind::Ident(obj) = &value.kind
+                    && (obj == "props" || obj == "Properties")
+                    && let Some(PreviewVal::Str(prop_name)) =
+                        self.eval_preview_expr_in_env(class_name, index, vars, depth)
+                {
+                    return self
+                        .lookup_property_default(&prop_name)
+                        .or(Some(PreviewVal::Prop(prop_name)));
+                }
+                let container = self.eval_preview_expr_in_env(class_name, value, vars, depth)?;
+                let idx = self
+                    .eval_preview_expr_in_env(class_name, index, vars, depth)?
+                    .as_i64()?;
+                if let PreviewVal::Tuple(items) = container
+                    && idx >= 0
+                {
+                    return items.get(idx as usize).cloned();
+                }
+                None
+            }
+            ast::ExprKind::Unary { op, operand } => {
+                let val = self.eval_preview_expr_in_env(class_name, operand, vars, depth)?;
+                match op {
+                    ast::UnaryOp::Neg => match val {
+                        PreviewVal::Int(i) => Some(PreviewVal::Int(-i)),
+                        PreviewVal::Float(f) => Some(PreviewVal::Float(-f)),
+                        _ => None,
+                    },
+                    ast::UnaryOp::Pos => Some(val),
+                    ast::UnaryOp::Not => Some(PreviewVal::Bool(!val.is_truthy())),
+                    ast::UnaryOp::BitNot => match val {
+                        PreviewVal::Int(i) => Some(PreviewVal::Int(!i)),
+                        _ => None,
+                    },
+                }
+            }
+            ast::ExprKind::Binary { left, op, right } => {
+                let l = self.eval_preview_expr_in_env(class_name, left, vars, depth)?;
+                let r = self.eval_preview_expr_in_env(class_name, right, vars, depth)?;
+                match (l, op, r) {
+                    (PreviewVal::Str(a), ast::BinaryOp::Add, b) => {
+                        Some(PreviewVal::Str(format!("{a}{}", b.to_display_string())))
+                    }
+                    (a, ast::BinaryOp::Add, PreviewVal::Str(b)) => {
+                        Some(PreviewVal::Str(format!("{}{b}", a.to_display_string())))
+                    }
+                    (PreviewVal::Int(a), ast::BinaryOp::Add, PreviewVal::Int(b)) => {
+                        Some(PreviewVal::Int(a + b))
+                    }
+                    (PreviewVal::Int(a), ast::BinaryOp::Sub, PreviewVal::Int(b)) => {
+                        Some(PreviewVal::Int(a - b))
+                    }
+                    (PreviewVal::Int(a), ast::BinaryOp::Mul, PreviewVal::Int(b)) => {
+                        Some(PreviewVal::Int(a * b))
+                    }
+                    (PreviewVal::Int(a), ast::BinaryOp::FloorDiv, PreviewVal::Int(b)) if b != 0 => {
+                        Some(PreviewVal::Int(a.div_euclid(b)))
+                    }
+                    (PreviewVal::Int(a), ast::BinaryOp::Mod, PreviewVal::Int(b)) if b != 0 => {
+                        Some(PreviewVal::Int(a.rem_euclid(b)))
+                    }
+                    (PreviewVal::Int(a), ast::BinaryOp::Pow, PreviewVal::Int(b)) if b >= 0 => {
+                        Some(PreviewVal::Int(a.saturating_pow(b as u32)))
+                    }
+                    (PreviewVal::Int(a), ast::BinaryOp::Div, PreviewVal::Int(b)) if b != 0 => {
+                        Some(PreviewVal::Float(a as f64 / b as f64))
+                    }
+                    (PreviewVal::Int(a), ast::BinaryOp::Eq, PreviewVal::Int(b)) => {
+                        Some(PreviewVal::Bool(a == b))
+                    }
+                    (PreviewVal::Int(a), ast::BinaryOp::NotEq, PreviewVal::Int(b)) => {
+                        Some(PreviewVal::Bool(a != b))
+                    }
+                    (PreviewVal::Str(a), ast::BinaryOp::Eq, PreviewVal::Str(b)) => {
+                        Some(PreviewVal::Bool(a == b))
+                    }
+                    (PreviewVal::Str(a), ast::BinaryOp::NotEq, PreviewVal::Str(b)) => {
+                        Some(PreviewVal::Bool(a != b))
+                    }
+                    (PreviewVal::Bool(a), ast::BinaryOp::Eq, PreviewVal::Bool(b)) => {
+                        Some(PreviewVal::Bool(a == b))
+                    }
+                    (PreviewVal::Bool(a), ast::BinaryOp::NotEq, PreviewVal::Bool(b)) => {
+                        Some(PreviewVal::Bool(a != b))
+                    }
+                    (PreviewVal::Int(a), ast::BinaryOp::Lt, PreviewVal::Int(b)) => {
+                        Some(PreviewVal::Bool(a < b))
+                    }
+                    (PreviewVal::Int(a), ast::BinaryOp::LtEq, PreviewVal::Int(b)) => {
+                        Some(PreviewVal::Bool(a <= b))
+                    }
+                    (PreviewVal::Int(a), ast::BinaryOp::Gt, PreviewVal::Int(b)) => {
+                        Some(PreviewVal::Bool(a > b))
+                    }
+                    (PreviewVal::Int(a), ast::BinaryOp::GtEq, PreviewVal::Int(b)) => {
+                        Some(PreviewVal::Bool(a >= b))
+                    }
+                    (a, ast::BinaryOp::Eq, b) => Some(PreviewVal::Bool(a.as_f64()? == b.as_f64()?)),
+                    (a, ast::BinaryOp::NotEq, b) => {
+                        Some(PreviewVal::Bool(a.as_f64()? != b.as_f64()?))
+                    }
+                    (a, ast::BinaryOp::Lt, b) => Some(PreviewVal::Bool(a.as_f64()? < b.as_f64()?)),
+                    (a, ast::BinaryOp::LtEq, b) => {
+                        Some(PreviewVal::Bool(a.as_f64()? <= b.as_f64()?))
+                    }
+                    (a, ast::BinaryOp::Gt, b) => Some(PreviewVal::Bool(a.as_f64()? > b.as_f64()?)),
+                    (a, ast::BinaryOp::GtEq, b) => {
+                        Some(PreviewVal::Bool(a.as_f64()? >= b.as_f64()?))
+                    }
+                    (a, ast::BinaryOp::Add, b) => {
+                        Some(PreviewVal::Float(a.as_f64()? + b.as_f64()?))
+                    }
+                    (a, ast::BinaryOp::Sub, b) => {
+                        Some(PreviewVal::Float(a.as_f64()? - b.as_f64()?))
+                    }
+                    (a, ast::BinaryOp::Mul, b) => {
+                        Some(PreviewVal::Float(a.as_f64()? * b.as_f64()?))
+                    }
+                    (a, ast::BinaryOp::Pow, b) => {
+                        Some(PreviewVal::Float(a.as_f64()?.powf(b.as_f64()?)))
+                    }
+                    (a, ast::BinaryOp::FloorDiv, b) => {
+                        let denom = b.as_f64()?;
+                        if denom == 0.0 {
+                            None
+                        } else {
+                            Some(PreviewVal::Float((a.as_f64()? / denom).floor()))
+                        }
+                    }
+                    (a, ast::BinaryOp::Div, b) => {
+                        let denom = b.as_f64()?;
+                        if denom == 0.0 {
+                            None
+                        } else {
+                            Some(PreviewVal::Float(a.as_f64()? / denom))
+                        }
+                    }
+                    _ => None,
+                }
+            }
+            ast::ExprKind::BoolOp { op, left, right } => {
+                let l = self.eval_preview_expr_in_env(class_name, left, vars, depth)?;
+                match op {
+                    ast::LogicalOp::And => {
+                        if !l.is_truthy() {
+                            Some(l)
+                        } else {
+                            self.eval_preview_expr_in_env(class_name, right, vars, depth)
+                        }
+                    }
+                    ast::LogicalOp::Or => {
+                        if l.is_truthy() {
+                            Some(l)
+                        } else {
+                            self.eval_preview_expr_in_env(class_name, right, vars, depth)
+                        }
+                    }
+                }
+            }
+            ast::ExprKind::IfExp { test, body, orelse } => {
+                let cond = self.eval_preview_expr_in_env(class_name, test, vars, depth)?;
+                if cond.is_truthy() {
+                    self.eval_preview_expr_in_env(class_name, body, vars, depth)
+                } else {
+                    self.eval_preview_expr_in_env(class_name, orelse, vars, depth)
+                }
+            }
+            ast::ExprKind::Call { callee, args, .. } => {
+                let mut eval_args = Vec::with_capacity(args.len());
+                for arg in args {
+                    eval_args.push(self.eval_preview_expr_in_env(class_name, arg, vars, depth)?);
+                }
+                if let ast::ExprKind::Ident(fn_name) = &callee.kind {
+                    if !self.local_functions.contains_key(fn_name)
+                        && !self.class_methods.contains_key(fn_name)
+                        && !self.module_functions.contains_key(fn_name)
+                    {
+                        match fn_name.as_str() {
+                            "str" if eval_args.len() == 1 => {
+                                return Some(PreviewVal::Str(eval_args[0].to_display_string()));
+                            }
+                            "int" if eval_args.len() == 1 => {
+                                return match &eval_args[0] {
+                                    PreviewVal::Int(i) => Some(PreviewVal::Int(*i)),
+                                    PreviewVal::Float(f) => Some(PreviewVal::Int(*f as i64)),
+                                    PreviewVal::Str(s) => {
+                                        s.trim().parse::<i64>().ok().map(PreviewVal::Int)
+                                    }
+                                    PreviewVal::Bool(b) => Some(PreviewVal::Int(i64::from(*b))),
+                                    _ => None,
+                                };
+                            }
+                            "float" if eval_args.len() == 1 => {
+                                return match &eval_args[0] {
+                                    PreviewVal::Float(f) => Some(PreviewVal::Float(*f)),
+                                    PreviewVal::Int(i) => Some(PreviewVal::Float(*i as f64)),
+                                    PreviewVal::Str(s) => {
+                                        s.trim().parse::<f64>().ok().map(PreviewVal::Float)
+                                    }
+                                    PreviewVal::Bool(b) => {
+                                        Some(PreviewVal::Float(if *b { 1.0 } else { 0.0 }))
+                                    }
+                                    _ => None,
+                                };
+                            }
+                            "bool" if eval_args.len() == 1 => {
+                                return Some(PreviewVal::Bool(eval_args[0].is_truthy()));
+                            }
+                            "abs" if eval_args.len() == 1 => {
+                                return match &eval_args[0] {
+                                    PreviewVal::Int(i) => Some(PreviewVal::Int(i.abs())),
+                                    PreviewVal::Float(f) => Some(PreviewVal::Float(f.abs())),
+                                    _ => None,
+                                };
+                            }
+                            "round" if eval_args.len() == 1 => {
+                                return eval_args[0]
+                                    .as_f64()
+                                    .map(|f| PreviewVal::Int(f.round() as i64));
+                            }
+                            "min" if !eval_args.is_empty() => {
+                                if eval_args.iter().all(|a| matches!(a, PreviewVal::Int(_))) {
+                                    return eval_args
+                                        .iter()
+                                        .filter_map(PreviewVal::as_i64)
+                                        .min()
+                                        .map(PreviewVal::Int);
+                                }
+                                let mut best: Option<f64> = None;
+                                for a in &eval_args {
+                                    let f = a.as_f64()?;
+                                    best = Some(best.map_or(f, |b| b.min(f)));
+                                }
+                                return best.map(PreviewVal::Float);
+                            }
+                            "max" if !eval_args.is_empty() => {
+                                if eval_args.iter().all(|a| matches!(a, PreviewVal::Int(_))) {
+                                    return eval_args
+                                        .iter()
+                                        .filter_map(PreviewVal::as_i64)
+                                        .max()
+                                        .map(PreviewVal::Int);
+                                }
+                                let mut best: Option<f64> = None;
+                                for a in &eval_args {
+                                    let f = a.as_f64()?;
+                                    best = Some(best.map_or(f, |b| b.max(f)));
+                                }
+                                return best.map(PreviewVal::Float);
+                            }
+                            _ => {}
+                        }
+                    }
+                    let func = self
+                        .local_functions
+                        .get(fn_name)
+                        .or_else(|| self.class_methods.get(fn_name))
+                        .or_else(|| self.module_functions.get(fn_name))?;
+                    return self.eval_preview_function_in_env(
+                        class_name,
+                        func,
+                        &eval_args,
+                        depth + 1,
+                    );
+                }
+                if let ast::ExprKind::Attribute { value, attr } = &callee.kind
+                    && let ast::ExprKind::Ident(obj) = &value.kind
+                    && (obj == "self" || obj == class_name)
+                {
+                    let method = self.class_methods.get(attr)?;
+                    return self.eval_preview_function_in_env(
+                        class_name,
+                        method,
+                        &eval_args,
+                        depth + 1,
+                    );
+                }
+                None
+            }
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -98,7 +1162,7 @@ enum StyleSpec {
 }
 
 #[derive(Debug, Clone)]
-enum PreviewVal {
+pub(crate) enum PreviewVal {
     Int(i64),
     Float(f64),
     Str(String),
@@ -108,7 +1172,7 @@ enum PreviewVal {
 }
 
 impl PreviewVal {
-    fn to_display_string(&self) -> String {
+    pub(crate) fn to_display_string(&self) -> String {
         match self {
             Self::Int(i) => i.to_string(),
             Self::Float(f) => f.to_string(),
@@ -122,7 +1186,7 @@ impl PreviewVal {
         }
     }
 
-    fn as_i64(&self) -> Option<i64> {
+    pub(crate) fn as_i64(&self) -> Option<i64> {
         match self {
             Self::Int(i) => Some(*i),
             Self::Float(f) => Some(*f as i64),
@@ -130,7 +1194,7 @@ impl PreviewVal {
         }
     }
 
-    fn as_f64(&self) -> Option<f64> {
+    pub(crate) fn as_f64(&self) -> Option<f64> {
         match self {
             Self::Float(f) => Some(*f),
             Self::Int(i) => Some(*i as f64),
@@ -138,7 +1202,21 @@ impl PreviewVal {
         }
     }
 
-    fn is_truthy(&self) -> bool {
+    pub(crate) fn as_str(&self) -> Option<&str> {
+        match self {
+            Self::Str(s) => Some(s.as_str()),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn as_bool(&self) -> Option<bool> {
+        match self {
+            Self::Bool(b) => Some(*b),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn is_truthy(&self) -> bool {
         match self {
             Self::Bool(b) => *b,
             Self::Int(i) => *i != 0,
@@ -149,7 +1227,7 @@ impl PreviewVal {
         }
     }
 
-    fn from_const(c: &ConstValue) -> Self {
+    pub(crate) fn from_const(c: &ConstValue) -> Self {
         match c {
             ConstValue::Int(i) => Self::Int(*i),
             ConstValue::Float(f) => Self::Float(*f),
@@ -621,21 +1699,23 @@ impl<'a> UiParserCtx<'a> {
         kwargs: &[(String, ast::Expr)],
         _span: Span,
     ) -> UiPageSpec {
-        let mut name = get_kwarg_str(kwargs, "title")
-            .or_else(|| get_kwarg_str(kwargs, "name"))
+        let mut name = self
+            .kwarg_str(kwargs, "title")
+            .or_else(|| self.kwarg_str(kwargs, "name"))
             .unwrap_or_else(|| "Main".to_string());
 
         let mut child_start_idx = 0;
         if let Some(first) = args.first()
-            && let Some(s) = eval_constant(first).and_then(|c| c.as_str().map(String::from))
+            && !is_ui_node_or_control_expr(first, self.controls, self.class_name)
+            && let Some(s) = self.eval_str(first)
         {
             name = s;
             child_start_idx = 1;
         }
 
-        let padding = get_kwarg_f64(kwargs, "padding").unwrap_or(16.0);
-        let gap = get_kwarg_f64(kwargs, "gap").unwrap_or(12.0);
-        let width = get_kwarg_f64(kwargs, "width");
+        let padding = self.kwarg_f64(kwargs, "padding").unwrap_or(16.0);
+        let gap = self.kwarg_f64(kwargs, "gap").unwrap_or(12.0);
+        let width = self.kwarg_f64(kwargs, "width");
 
         let children = self.collect_children(&args[child_start_idx..], kwargs);
 
@@ -692,23 +1772,24 @@ impl<'a> UiParserCtx<'a> {
 
                 match tag {
                     "Row" | "HStack" => {
-                        let mut label = get_kwarg_str(kwargs, "label")
-                            .or_else(|| get_kwarg_str(kwargs, "title"))
-                            .or_else(|| get_kwarg_str(kwargs, "text"));
+                        let mut label = self
+                            .kwarg_str(kwargs, "label")
+                            .or_else(|| self.kwarg_str(kwargs, "title"))
+                            .or_else(|| self.kwarg_str(kwargs, "text"));
                         let mut child_start = 0;
                         if let Some(first) = args.first()
-                            && let Some(s) =
-                                eval_constant(first).and_then(|c| c.as_str().map(String::from))
+                            && !is_ui_node_or_control_expr(first, self.controls, self.class_name)
+                            && let Some(s) = self.eval_str(first)
                         {
                             label = Some(s);
                             child_start = 1;
                         }
-                        let gap = get_kwarg_f64(kwargs, "gap").unwrap_or(8.0);
-                        let padding = get_kwarg_f64(kwargs, "padding").unwrap_or(0.0);
+                        let gap = self.kwarg_f64(kwargs, "gap").unwrap_or(8.0);
+                        let padding = self.kwarg_f64(kwargs, "padding").unwrap_or(0.0);
                         let mut children = Vec::new();
                         if let Some(lbl_text) = label {
-                            let lbl_w = get_kwarg_f64(kwargs, "label_width");
-                            let lbl_fs = get_kwarg_u32(kwargs, "label_font_size").unwrap_or(11);
+                            let lbl_w = self.kwarg_f64(kwargs, "label_width");
+                            let lbl_fs = self.kwarg_u32(kwargs, "label_font_size").unwrap_or(11);
                             children.push(UiNode::Label {
                                 text: lbl_text,
                                 width: lbl_w,
@@ -727,23 +1808,24 @@ impl<'a> UiParserCtx<'a> {
                     }
 
                     "Col" | "Column" | "VStack" | "Div" => {
-                        let mut label = get_kwarg_str(kwargs, "label")
-                            .or_else(|| get_kwarg_str(kwargs, "title"))
-                            .or_else(|| get_kwarg_str(kwargs, "text"));
+                        let mut label = self
+                            .kwarg_str(kwargs, "label")
+                            .or_else(|| self.kwarg_str(kwargs, "title"))
+                            .or_else(|| self.kwarg_str(kwargs, "text"));
                         let mut child_start = 0;
                         if let Some(first) = args.first()
-                            && let Some(s) =
-                                eval_constant(first).and_then(|c| c.as_str().map(String::from))
+                            && !is_ui_node_or_control_expr(first, self.controls, self.class_name)
+                            && let Some(s) = self.eval_str(first)
                         {
                             label = Some(s);
                             child_start = 1;
                         }
-                        let gap = get_kwarg_f64(kwargs, "gap").unwrap_or(8.0);
-                        let padding = get_kwarg_f64(kwargs, "padding").unwrap_or(0.0);
+                        let gap = self.kwarg_f64(kwargs, "gap").unwrap_or(8.0);
+                        let padding = self.kwarg_f64(kwargs, "padding").unwrap_or(0.0);
                         let mut children = Vec::new();
                         if let Some(lbl_text) = label {
-                            let lbl_w = get_kwarg_f64(kwargs, "label_width");
-                            let lbl_fs = get_kwarg_u32(kwargs, "label_font_size").unwrap_or(11);
+                            let lbl_w = self.kwarg_f64(kwargs, "label_width");
+                            let lbl_fs = self.kwarg_u32(kwargs, "label_font_size").unwrap_or(11);
                             children.push(UiNode::Label {
                                 text: lbl_text,
                                 width: lbl_w,
@@ -762,32 +1844,36 @@ impl<'a> UiParserCtx<'a> {
                     }
 
                     "GroupBox" | "Section" | "Card" | "Panel" => {
-                        let mut title = get_kwarg_str(kwargs, "title")
-                            .or_else(|| get_kwarg_str(kwargs, "text"))
+                        let mut title = self
+                            .kwarg_str(kwargs, "title")
+                            .or_else(|| self.kwarg_str(kwargs, "text"))
                             .unwrap_or_default();
                         let mut child_start = 0;
                         if let Some(first) = args.first()
-                            && let Some(s) =
-                                eval_constant(first).and_then(|c| c.as_str().map(String::from))
+                            && !is_ui_node_or_control_expr(first, self.controls, self.class_name)
+                            && let Some(s) = self.eval_str(first)
                         {
                             title = s;
                             child_start = 1;
                         }
 
-                        let dir_str =
-                            get_kwarg_str(kwargs, "direction").unwrap_or_else(|| "col".to_string());
+                        let dir_str = self
+                            .kwarg_str(kwargs, "direction")
+                            .unwrap_or_else(|| "col".to_string());
                         let direction = match dir_str.to_ascii_lowercase().as_str() {
                             "row" | "horizontal" | "hstack" => FlexDirection::Row,
                             _ => FlexDirection::Column,
                         };
-                        let gap = get_kwarg_f64(kwargs, "gap").unwrap_or(10.0);
-                        let padding = get_kwarg_f64(kwargs, "padding").unwrap_or(12.0);
-                        let width = get_kwarg_f64(kwargs, "width");
-                        let height = get_kwarg_f64(kwargs, "height");
-                        let color = get_kwarg_color(kwargs, "color")
-                            .or_else(|| get_kwarg_color(kwargs, "fill"));
-                        let stroke = get_kwarg_u32(kwargs, "stroke")
-                            .or_else(|| get_kwarg_u32(kwargs, "stroke_width"))
+                        let gap = self.kwarg_f64(kwargs, "gap").unwrap_or(10.0);
+                        let padding = self.kwarg_f64(kwargs, "padding").unwrap_or(12.0);
+                        let width = self.kwarg_f64(kwargs, "width");
+                        let height = self.kwarg_f64(kwargs, "height");
+                        let color = self
+                            .kwarg_color(kwargs, "color")
+                            .or_else(|| self.kwarg_color(kwargs, "fill"));
+                        let stroke = self
+                            .kwarg_u32(kwargs, "stroke")
+                            .or_else(|| self.kwarg_u32(kwargs, "stroke_width"))
                             .unwrap_or(1);
 
                         let children = self.collect_children(&args[child_start..], kwargs);
@@ -807,15 +1893,14 @@ impl<'a> UiParserCtx<'a> {
                     "Header" | "H1" | "H2" => {
                         let text = args
                             .first()
-                            .and_then(eval_constant)
-                            .and_then(|c| c.as_str().map(String::from))
-                            .or_else(|| get_kwarg_str(kwargs, "text"))
-                            .or_else(|| get_kwarg_str(kwargs, "title"))
+                            .and_then(|e| self.eval_str(e))
+                            .or_else(|| self.kwarg_str(kwargs, "text"))
+                            .or_else(|| self.kwarg_str(kwargs, "title"))
                             .unwrap_or_default();
-                        let width = get_kwarg_f64(kwargs, "width");
-                        let height = get_kwarg_f64(kwargs, "height").unwrap_or(28.0);
-                        let font_size = get_kwarg_u32(kwargs, "font_size").unwrap_or(14);
-                        let color = get_kwarg_color(kwargs, "color");
+                        let width = self.kwarg_f64(kwargs, "width");
+                        let height = self.kwarg_f64(kwargs, "height").unwrap_or(28.0);
+                        let font_size = self.kwarg_u32(kwargs, "font_size").unwrap_or(14);
+                        let color = self.kwarg_color(kwargs, "color");
                         vec![UiNode::Header {
                             text,
                             width,
@@ -828,16 +1913,16 @@ impl<'a> UiParserCtx<'a> {
                     "Label" | "Text" => {
                         let text = args
                             .first()
-                            .and_then(eval_constant)
-                            .and_then(|c| c.as_str().map(String::from))
-                            .or_else(|| get_kwarg_str(kwargs, "text"))
+                            .and_then(|e| self.eval_str(e))
+                            .or_else(|| self.kwarg_str(kwargs, "text"))
                             .unwrap_or_default();
-                        let width = get_kwarg_f64(kwargs, "width");
-                        let height = get_kwarg_f64(kwargs, "height").unwrap_or(22.0);
-                        let font_size = get_kwarg_u32(kwargs, "font_size").unwrap_or(12);
-                        let h_align =
-                            get_kwarg_str(kwargs, "align").unwrap_or_else(|| "Left".to_string());
-                        let color = get_kwarg_color(kwargs, "color");
+                        let width = self.kwarg_f64(kwargs, "width");
+                        let height = self.kwarg_f64(kwargs, "height").unwrap_or(22.0);
+                        let font_size = self.kwarg_u32(kwargs, "font_size").unwrap_or(12);
+                        let h_align = self
+                            .kwarg_str(kwargs, "align")
+                            .unwrap_or_else(|| "Left".to_string());
+                        let color = self.kwarg_color(kwargs, "color");
                         vec![UiNode::Label {
                             text,
                             width,
@@ -851,17 +1936,15 @@ impl<'a> UiParserCtx<'a> {
                     "Spacer" => {
                         let width = args
                             .first()
-                            .and_then(eval_constant)
-                            .and_then(|c| c.as_f64())
-                            .or_else(|| get_kwarg_f64(kwargs, "width"))
-                            .or_else(|| get_kwarg_f64(kwargs, "size"))
+                            .and_then(|e| self.eval_f64(e))
+                            .or_else(|| self.kwarg_f64(kwargs, "width"))
+                            .or_else(|| self.kwarg_f64(kwargs, "size"))
                             .unwrap_or(12.0);
                         let height = args
                             .get(1)
-                            .and_then(eval_constant)
-                            .and_then(|c| c.as_f64())
-                            .or_else(|| get_kwarg_f64(kwargs, "height"))
-                            .or_else(|| get_kwarg_f64(kwargs, "size"))
+                            .and_then(|e| self.eval_f64(e))
+                            .or_else(|| self.kwarg_f64(kwargs, "height"))
+                            .or_else(|| self.kwarg_f64(kwargs, "size"))
                             .unwrap_or(12.0);
                         vec![UiNode::Spacer { width, height }]
                     }
@@ -1142,8 +2225,10 @@ impl<'a> UiParserCtx<'a> {
             "0",
         );
 
-        let label_pos_str = get_kwarg_str(kwargs, "label_pos").unwrap_or_else(|| "top".to_string());
-        let label_width = get_kwarg_f64(kwargs, "label_width").unwrap_or(88.0);
+        let label_pos_str = self
+            .kwarg_str(kwargs, "label_pos")
+            .unwrap_or_else(|| "top".to_string());
+        let label_width = self.kwarg_f64(kwargs, "label_width").unwrap_or(88.0);
         let label_placement = match label_pos_str.to_ascii_lowercase().as_str() {
             "left" | "inline" | "side" => LabelPlacement::Left { width: label_width },
             _ => LabelPlacement::Top,
@@ -1153,20 +2238,23 @@ impl<'a> UiParserCtx<'a> {
             .iter()
             .find(|(k, _)| k == "pretty_name")
             .and_then(|(_, v)| self.parse_label_spec(v, "pretty_name"));
-        let legend = get_kwarg_str(kwargs, "legend");
-        let size_tuple = get_kwarg_size(kwargs, "size");
-        let width = get_kwarg_f64(kwargs, "width").or_else(|| size_tuple.map(|(w, _)| w));
-        let height = get_kwarg_f64(kwargs, "height").or_else(|| size_tuple.map(|(_, h)| h));
-        let color = get_kwarg_color(kwargs, "color");
-        let margin = get_kwarg_f64(kwargs, "margin");
-        let read_only = get_kwarg_bool(kwargs, "read_only").unwrap_or(false);
-        let invisible = get_kwarg_bool(kwargs, "invisible").unwrap_or(false);
+        let legend = self.kwarg_str(kwargs, "legend");
+        let size_tuple = self.kwarg_size(kwargs, "size");
+        let width = self
+            .kwarg_f64(kwargs, "width")
+            .or_else(|| size_tuple.map(|(w, _)| w));
+        let height = self
+            .kwarg_f64(kwargs, "height")
+            .or_else(|| size_tuple.map(|(_, h)| h));
+        let color = self.kwarg_color(kwargs, "color");
+        let margin = self.kwarg_f64(kwargs, "margin");
+        let read_only = self.kwarg_bool(kwargs, "read_only").unwrap_or(false);
+        let invisible = self.kwarg_bool(kwargs, "invisible").unwrap_or(false);
 
         let kwarg_idx = kwargs
             .iter()
             .find(|(k, _)| k == "index")
-            .and_then(|(_, v)| eval_constant(v))
-            .and_then(|c| c.as_i64());
+            .and_then(|(_, v)| self.eval_i64(v));
 
         let effective_idx = if let Some(i) = kwarg_idx {
             if i < 0 || (ctl.def.count_property.is_none() && (i as usize) >= ctl.def.count) {
@@ -1318,7 +2406,9 @@ impl<'a> UiParserCtx<'a> {
         }
 
         // Check if 2D grid layout is requested or inferred for this multi-channel control
-        let dir_kwarg = get_kwarg_str(kwargs, "direction").map(|s| s.to_ascii_lowercase());
+        let dir_kwarg = self
+            .kwarg_str(kwargs, "direction")
+            .map(|s| s.to_ascii_lowercase());
         let is_dir_grid = matches!(dir_kwarg.as_deref(), Some("grid" | "2d" | "matrix"));
         let is_dir_1d = matches!(
             dir_kwarg.as_deref(),
@@ -1336,15 +2426,17 @@ impl<'a> UiParserCtx<'a> {
             .iter()
             .find(|(k, _)| matches!(k.as_str(), "row_label" | "track_label" | "y_label"))
             .and_then(|(_, v)| self.parse_label_spec(v, "row_label"));
-        let explicit_row_labels = get_kwarg_str_list(kwargs, "row_labels")
-            .or_else(|| get_kwarg_str_list(kwargs, "y_labels"));
+        let explicit_row_labels = self
+            .kwarg_str_list(kwargs, "row_labels")
+            .or_else(|| self.kwarg_str_list(kwargs, "y_labels"));
         let explicit_col_label_spec = kwargs
             .iter()
             .find(|(k, _)| matches!(k.as_str(), "col_label" | "column_label" | "x_label"))
             .and_then(|(_, v)| self.parse_label_spec(v, "col_label"));
-        let explicit_col_labels = get_kwarg_str_list(kwargs, "col_labels")
-            .or_else(|| get_kwarg_str_list(kwargs, "column_labels"))
-            .or_else(|| get_kwarg_str_list(kwargs, "x_labels"));
+        let explicit_col_labels = self
+            .kwarg_str_list(kwargs, "col_labels")
+            .or_else(|| self.kwarg_str_list(kwargs, "column_labels"))
+            .or_else(|| self.kwarg_str_list(kwargs, "x_labels"));
         let explicit_cell_label_spec = kwargs
             .iter()
             .find(|(k, _)| k == "cell_label")
@@ -1547,16 +2639,17 @@ impl<'a> UiParserCtx<'a> {
                 .max()
                 .unwrap_or(8);
             let default_row_lbl_w = ((max_rlbl_chars as f64) * 7.0 + 12.0).max(56.0);
-            let row_label_width =
-                get_kwarg_f64(kwargs, "row_label_width").unwrap_or(default_row_lbl_w);
-            let row_label_font_size = get_kwarg_u32(kwargs, "row_label_font_size").unwrap_or(11);
-            let col_label_font_size = get_kwarg_u32(kwargs, "col_label_font_size").unwrap_or(11);
-            let base_gap = get_kwarg_f64(kwargs, "gap").unwrap_or(8.0);
-            let col_gap = get_kwarg_f64(kwargs, "col_gap").unwrap_or(base_gap);
-            let row_gap = get_kwarg_f64(kwargs, "row_gap").unwrap_or(base_gap);
+            let row_label_width = self
+                .kwarg_f64(kwargs, "row_label_width")
+                .unwrap_or(default_row_lbl_w);
+            let row_label_font_size = self.kwarg_u32(kwargs, "row_label_font_size").unwrap_or(11);
+            let col_label_font_size = self.kwarg_u32(kwargs, "col_label_font_size").unwrap_or(11);
+            let base_gap = self.kwarg_f64(kwargs, "gap").unwrap_or(8.0);
+            let col_gap = self.kwarg_f64(kwargs, "col_gap").unwrap_or(base_gap);
+            let row_gap = self.kwarg_f64(kwargs, "row_gap").unwrap_or(base_gap);
 
-            let explicit_labels = get_kwarg_str_list(kwargs, "labels");
-            let explicit_pretty_names = get_kwarg_str_list(kwargs, "pretty_names");
+            let explicit_labels = self.kwarg_str_list(kwargs, "labels");
+            let explicit_pretty_names = self.kwarg_str_list(kwargs, "pretty_names");
             let has_dynamic_repeat = (ctl.def.count_property.is_some()
                 || rows_property.is_some()
                 || cols_property.is_some())
@@ -1830,8 +2923,8 @@ impl<'a> UiParserCtx<'a> {
         // Multi-channel or property-counted control referenced as a group (no index specified):
         // Automatically expand `1..=count` channels for preview, and if `count_property` is set,
         // mark channel 1 as a dynamic repeat head for `for i = 1, props["..."].Value do` in Lua!
-        let explicit_labels = get_kwarg_str_list(kwargs, "labels");
-        let explicit_pretty_names = get_kwarg_str_list(kwargs, "pretty_names");
+        let explicit_labels = self.kwarg_str_list(kwargs, "labels");
+        let explicit_pretty_names = self.kwarg_str_list(kwargs, "pretty_names");
         let has_dynamic_repeat = ctl.def.count_property.is_some()
             && explicit_labels.is_none()
             && explicit_pretty_names.is_none();
@@ -2002,8 +3095,8 @@ impl<'a> UiParserCtx<'a> {
             }));
         }
 
-        if let Some(dir_str) = get_kwarg_str(kwargs, "direction") {
-            let gap = get_kwarg_f64(kwargs, "gap").unwrap_or(8.0);
+        if let Some(dir_str) = self.kwarg_str(kwargs, "direction") {
+            let gap = self.kwarg_f64(kwargs, "gap").unwrap_or(8.0);
             match dir_str.to_ascii_lowercase().as_str() {
                 "row" | "horizontal" | "hstack" => {
                     return vec![UiNode::Row {
@@ -2046,6 +3139,23 @@ impl<'a> UiParserCtx<'a> {
                 }
             }
             ast::ExprKind::Attribute { value, attr } => {
+                if attr == "Value" {
+                    if let ast::ExprKind::Ident(prop_ident) = &value.kind
+                        && let Some(res) = lookup_prop(prop_ident)
+                    {
+                        return Some(res);
+                    }
+                    if let ast::ExprKind::Attribute {
+                        value: inner_obj,
+                        attr: prop_ident,
+                    } = &value.kind
+                        && let ast::ExprKind::Ident(obj) = &inner_obj.kind
+                        && (obj == "self" || obj == self.class_name)
+                        && let Some(res) = lookup_prop(prop_ident)
+                    {
+                        return Some(res);
+                    }
+                }
                 if let ast::ExprKind::Ident(obj) = &value.kind
                     && (obj == "self" || obj == self.class_name)
                     && let Some(res) = lookup_prop(attr)
@@ -2055,9 +3165,23 @@ impl<'a> UiParserCtx<'a> {
             }
             _ => {}
         }
-        eval_constant(expr)
-            .and_then(|c| c.as_i64())
-            .map(|i| (i.max(1) as usize, None))
+        if self.env.is_dynamic_design_expr(self.class_name, expr) {
+            let preview = self
+                .env
+                .eval_design_expr_preview(self.class_name, expr)?
+                .as_i64()?
+                .max(1) as usize;
+            let tmpl = self
+                .env
+                .lower_design_expr_to_prop_template(self.class_name, expr);
+            let spec = if tmpl.contains("{PROP:") {
+                tmpl
+            } else {
+                format!("{{LUA:{tmpl}}}")
+            };
+            return Some((preview, Some(spec)));
+        }
+        self.eval_i64(expr).map(|i| (i.max(1) as usize, None))
     }
 
     fn callable_arity(&self, fn_expr: &ast::Expr) -> usize {
@@ -2198,166 +3322,8 @@ impl<'a> UiParserCtx<'a> {
         expr: &ast::Expr,
         local_map: &FxHashMap<String, String>,
     ) -> String {
-        match &expr.kind {
-            ast::ExprKind::Int(i) => i.to_string(),
-            ast::ExprKind::Float(f) => f.to_string(),
-            ast::ExprKind::String(s) => format!("\"{}\"", escape_lua_str_content(s)),
-            ast::ExprKind::Bool(b) => b.to_string(),
-            ast::ExprKind::None => "nil".to_string(),
-            ast::ExprKind::Ident(name) => {
-                if let Some(mapped) = local_map.get(name) {
-                    return mapped.clone();
-                }
-                if let Some(prop) = self.env.properties.iter().find(|p| p.ident == *name) {
-                    return format!("props[\"{}\"]", escape_lua_str_content(&prop.def.name));
-                }
-                name.clone()
-            }
-            ast::ExprKind::Attribute { value, attr } => {
-                if attr == "Value" {
-                    if let ast::ExprKind::Attribute {
-                        value: inner_obj,
-                        attr: prop_ident,
-                    } = &value.kind
-                        && let ast::ExprKind::Ident(obj_name) = &inner_obj.kind
-                        && (obj_name == "self" || obj_name == self.class_name)
-                        && let Some(prop) =
-                            self.env.properties.iter().find(|p| p.ident == *prop_ident)
-                    {
-                        return format!(
-                            "props[\"{}\"].Value",
-                            escape_lua_str_content(&prop.def.name)
-                        );
-                    }
-                    if let ast::ExprKind::Ident(prop_ident) = &value.kind
-                        && let Some(prop) =
-                            self.env.properties.iter().find(|p| p.ident == *prop_ident)
-                    {
-                        return format!(
-                            "props[\"{}\"].Value",
-                            escape_lua_str_content(&prop.def.name)
-                        );
-                    }
-                }
-                if let ast::ExprKind::Ident(obj_name) = &value.kind
-                    && (obj_name == "self" || obj_name == self.class_name)
-                    && let Some(prop) = self.env.properties.iter().find(|p| p.ident == *attr)
-                {
-                    return format!("props[\"{}\"]", escape_lua_str_content(&prop.def.name));
-                }
-                let base = self.lower_ui_expr_to_lua(value, local_map);
-                format!("{base}.{attr}")
-            }
-            ast::ExprKind::Subscript { value, index } => {
-                if let ast::ExprKind::Ident(obj) = &value.kind
-                    && (obj == "props" || obj == "Properties")
-                {
-                    let idx_lua = self.lower_ui_expr_to_lua(index, local_map);
-                    return format!("props[{idx_lua}]");
-                }
-                let base = self.lower_ui_expr_to_lua(value, local_map);
-                let idx_lua = self.lower_ui_expr_to_lua(index, local_map);
-                format!("{base}[({idx_lua}) + 1]")
-            }
-            ast::ExprKind::Unary { op, operand } => {
-                let inner = self.lower_ui_expr_to_lua(operand, local_map);
-                match op {
-                    ast::UnaryOp::Neg => format!("(-{inner})"),
-                    ast::UnaryOp::Pos => inner,
-                    ast::UnaryOp::Not => format!("(not {inner})"),
-                    ast::UnaryOp::BitNot => format!("(~{inner})"),
-                }
-            }
-            ast::ExprKind::Binary { left, op, right } => {
-                let l = self.lower_ui_expr_to_lua(left, local_map);
-                let r = self.lower_ui_expr_to_lua(right, local_map);
-                let is_str = |e: &ast::Expr| -> bool {
-                    matches!(e.kind, ast::ExprKind::String(_))
-                        || matches!(
-                            &e.kind,
-                            ast::ExprKind::Call { callee, .. }
-                                if matches!(&callee.kind, ast::ExprKind::Ident(n) if n == "str" || n == "tostring")
-                        )
-                };
-                if *op == ast::BinaryOp::Add && (is_str(left) || is_str(right)) {
-                    return format!("({l} .. {r})");
-                }
-                let op_str = match op {
-                    ast::BinaryOp::Add => "+",
-                    ast::BinaryOp::Sub => "-",
-                    ast::BinaryOp::Mul => "*",
-                    ast::BinaryOp::Div => "/",
-                    ast::BinaryOp::FloorDiv => "//",
-                    ast::BinaryOp::Mod => "%",
-                    ast::BinaryOp::Pow => "^",
-                    ast::BinaryOp::BitAnd => "&",
-                    ast::BinaryOp::BitOr => "|",
-                    ast::BinaryOp::BitXor => "~",
-                    ast::BinaryOp::LShift => "<<",
-                    ast::BinaryOp::RShift => ">>",
-                    ast::BinaryOp::Eq => "==",
-                    ast::BinaryOp::NotEq => "~=",
-                    ast::BinaryOp::Lt => "<",
-                    ast::BinaryOp::LtEq => "<=",
-                    ast::BinaryOp::Gt => ">",
-                    ast::BinaryOp::GtEq => ">=",
-                };
-                format!("({l} {op_str} {r})")
-            }
-            ast::ExprKind::BoolOp { op, left, right } => {
-                let op_str = match op {
-                    ast::LogicalOp::And => "and",
-                    ast::LogicalOp::Or => "or",
-                };
-                let l = self.lower_ui_expr_to_lua(left, local_map);
-                let r = self.lower_ui_expr_to_lua(right, local_map);
-                format!("({l} {op_str} {r})")
-            }
-            ast::ExprKind::IfExp { test, body, orelse } => {
-                let t = self.lower_ui_expr_to_lua(test, local_map);
-                let b = self.lower_ui_expr_to_lua(body, local_map);
-                let o = self.lower_ui_expr_to_lua(orelse, local_map);
-                if matches!(body.kind, ast::ExprKind::Bool(false) | ast::ExprKind::None) {
-                    format!("(function() if {t} then return {b} else return {o} end end)()")
-                } else {
-                    format!("({t} and {b} or {o})")
-                }
-            }
-            ast::ExprKind::Call { callee, args, .. } => {
-                let rendered_args: Vec<String> = args
-                    .iter()
-                    .map(|a| self.lower_ui_expr_to_lua(a, local_map))
-                    .collect();
-                if let ast::ExprKind::Ident(fn_name) = &callee.kind {
-                    if fn_name == "str" && rendered_args.len() == 1 {
-                        return format!("tostring({})", rendered_args[0]);
-                    }
-                    if fn_name == "int" && rendered_args.len() == 1 {
-                        return format!("math.floor(tonumber({}) or 0)", rendered_args[0]);
-                    }
-                    if !self.env.local_functions.contains_key(fn_name)
-                        && !self.env.module_functions.contains_key(fn_name)
-                        && self.env.class_methods.contains_key(fn_name)
-                    {
-                        let mut all_args = vec!["nil".to_string()];
-                        all_args.extend(rendered_args);
-                        return format!("{}_{fn_name}({})", self.class_name, all_args.join(", "));
-                    }
-                    return format!("{fn_name}({})", rendered_args.join(", "));
-                }
-                if let ast::ExprKind::Attribute { value, attr } = &callee.kind
-                    && let ast::ExprKind::Ident(obj) = &value.kind
-                    && (obj == "self" || obj == self.class_name)
-                {
-                    let mut all_args = vec!["nil".to_string()];
-                    all_args.extend(rendered_args);
-                    return format!("{}_{attr}({})", self.class_name, all_args.join(", "));
-                }
-                let callee_lua = self.lower_ui_expr_to_lua(callee, local_map);
-                format!("{callee_lua}({})", rendered_args.join(", "))
-            }
-            _ => "\"\"".to_string(),
-        }
+        self.env
+            .lower_ui_expr_to_lua_inner(self.class_name, expr, local_map, false)
     }
 
     fn eval_callable_0_preview(&self, fn_expr: &ast::Expr) -> Option<String> {
@@ -2480,87 +3446,8 @@ impl<'a> UiParserCtx<'a> {
         args: &[PreviewVal],
         depth: usize,
     ) -> Option<PreviewVal> {
-        if depth > 8 {
-            return None;
-        }
-        let mut vars = FxHashMap::default();
-        for (name, val) in &self.env.constants {
-            vars.insert(name.clone(), PreviewVal::from_const(val));
-        }
-        let skip_self = usize::from(func.params.first().is_some_and(|p| p.name == "self"));
-        for (param, arg_val) in func.params.iter().skip(skip_self).zip(args.iter()) {
-            vars.insert(param.name.clone(), arg_val.clone());
-        }
-        self.eval_preview_stmts(&func.body, &mut vars, depth)
-    }
-
-    fn eval_preview_stmts(
-        &self,
-        stmts: &[ast::Stmt],
-        vars: &mut FxHashMap<String, PreviewVal>,
-        depth: usize,
-    ) -> Option<PreviewVal> {
-        for stmt in stmts {
-            match &stmt.kind {
-                ast::StmtKind::Pass | ast::StmtKind::Global(_) | ast::StmtKind::Nonlocal(_) => {}
-                ast::StmtKind::Expr(e) if matches!(e.kind, ast::ExprKind::String(_)) => {}
-                ast::StmtKind::Assign { target, value, .. } => {
-                    let val = self.eval_preview_expr(value, vars, depth)?;
-                    match &target.kind {
-                        ast::ExprKind::Ident(name) => {
-                            vars.insert(name.clone(), val);
-                        }
-                        ast::ExprKind::Tuple(targets) | ast::ExprKind::List(targets) => {
-                            if let PreviewVal::Tuple(items) = val {
-                                for (t, item) in targets.iter().zip(items) {
-                                    if let ast::ExprKind::Ident(name) = &t.kind {
-                                        vars.insert(name.clone(), item);
-                                    }
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                ast::StmtKind::If {
-                    condition,
-                    then_branch,
-                    else_branch,
-                } => {
-                    let cond = self.eval_preview_expr(condition, vars, depth)?;
-                    let branch = if cond.is_truthy() {
-                        then_branch
-                    } else {
-                        else_branch
-                    };
-                    if let Some(ret) = self.eval_preview_stmts(branch, vars, depth) {
-                        return Some(ret);
-                    }
-                }
-                ast::StmtKind::Return(Some(ret_expr)) => {
-                    return self.eval_preview_expr(ret_expr, vars, depth);
-                }
-                ast::StmtKind::Return(None) => return None,
-                _ => {}
-            }
-        }
-        None
-    }
-
-    fn lookup_property_default(&self, ident_or_name: &str) -> Option<PreviewVal> {
-        let prop = self
-            .env
-            .properties
-            .iter()
-            .find(|p| p.ident == ident_or_name || p.def.name == ident_or_name)?;
-        match &prop.def.kind {
-            PropertyKind::Integer { default, .. } => Some(PreviewVal::Int(*default)),
-            PropertyKind::Double { default, .. } => Some(PreviewVal::Float(*default)),
-            PropertyKind::String { default } | PropertyKind::Enum { default, .. } => {
-                Some(PreviewVal::Str(default.clone()))
-            }
-            PropertyKind::Boolean { default } => Some(PreviewVal::Bool(*default)),
-        }
+        self.env
+            .eval_preview_function_in_env(self.class_name, func, args, depth)
     }
 
     fn eval_preview_expr(
@@ -2569,230 +3456,8 @@ impl<'a> UiParserCtx<'a> {
         vars: &FxHashMap<String, PreviewVal>,
         depth: usize,
     ) -> Option<PreviewVal> {
-        match &expr.kind {
-            ast::ExprKind::Int(i) => Some(PreviewVal::Int(*i)),
-            ast::ExprKind::Float(f) => Some(PreviewVal::Float(*f)),
-            ast::ExprKind::String(s) => Some(PreviewVal::Str(s.clone())),
-            ast::ExprKind::Bool(b) => Some(PreviewVal::Bool(*b)),
-            ast::ExprKind::Tuple(items) | ast::ExprKind::List(items) => {
-                let mut out = Vec::with_capacity(items.len());
-                for item in items {
-                    out.push(self.eval_preview_expr(item, vars, depth)?);
-                }
-                Some(PreviewVal::Tuple(out))
-            }
-            ast::ExprKind::Ident(name) => {
-                if let Some(v) = vars.get(name) {
-                    return Some(v.clone());
-                }
-                if let Some(prop_val) = self.lookup_property_default(name) {
-                    return Some(prop_val);
-                }
-                None
-            }
-            ast::ExprKind::Attribute { value, attr } => {
-                if attr == "Value" {
-                    if let ast::ExprKind::Attribute {
-                        value: inner_obj,
-                        attr: prop_ident,
-                    } = &value.kind
-                        && let ast::ExprKind::Ident(obj_name) = &inner_obj.kind
-                        && (obj_name == "self" || obj_name == self.class_name)
-                    {
-                        return self.lookup_property_default(prop_ident);
-                    }
-                    if let ast::ExprKind::Ident(prop_ident) = &value.kind
-                        && let Some(val) = self.lookup_property_default(prop_ident)
-                    {
-                        return Some(val);
-                    }
-                    if let Some(PreviewVal::Prop(prop_name)) =
-                        self.eval_preview_expr(value, vars, depth)
-                    {
-                        return self.lookup_property_default(&prop_name);
-                    }
-                }
-                if let ast::ExprKind::Ident(obj_name) = &value.kind
-                    && (obj_name == "self" || obj_name == self.class_name)
-                {
-                    if let Some(val) = self.lookup_property_default(attr) {
-                        return Some(val);
-                    }
-                    if let Some(cval) = self.env.constants.get(attr) {
-                        return Some(PreviewVal::from_const(cval));
-                    }
-                }
-                None
-            }
-            ast::ExprKind::Subscript { value, index } => {
-                if let ast::ExprKind::Ident(obj) = &value.kind
-                    && (obj == "props" || obj == "Properties")
-                    && let Some(PreviewVal::Str(prop_name)) =
-                        self.eval_preview_expr(index, vars, depth)
-                {
-                    return Some(PreviewVal::Prop(prop_name));
-                }
-                let container = self.eval_preview_expr(value, vars, depth)?;
-                let idx = self.eval_preview_expr(index, vars, depth)?.as_i64()?;
-                if let PreviewVal::Tuple(items) = container
-                    && idx >= 0
-                {
-                    return items.get(idx as usize).cloned();
-                }
-                None
-            }
-            ast::ExprKind::Unary { op, operand } => {
-                let val = self.eval_preview_expr(operand, vars, depth)?;
-                match op {
-                    ast::UnaryOp::Neg => match val {
-                        PreviewVal::Int(i) => Some(PreviewVal::Int(-i)),
-                        PreviewVal::Float(f) => Some(PreviewVal::Float(-f)),
-                        _ => None,
-                    },
-                    ast::UnaryOp::Pos => Some(val),
-                    ast::UnaryOp::Not => Some(PreviewVal::Bool(!val.is_truthy())),
-                    ast::UnaryOp::BitNot => match val {
-                        PreviewVal::Int(i) => Some(PreviewVal::Int(!i)),
-                        _ => None,
-                    },
-                }
-            }
-            ast::ExprKind::Binary { left, op, right } => {
-                let l = self.eval_preview_expr(left, vars, depth)?;
-                let r = self.eval_preview_expr(right, vars, depth)?;
-                match (l, op, r) {
-                    (PreviewVal::Str(a), ast::BinaryOp::Add, b) => {
-                        Some(PreviewVal::Str(format!("{a}{}", b.to_display_string())))
-                    }
-                    (a, ast::BinaryOp::Add, PreviewVal::Str(b)) => {
-                        Some(PreviewVal::Str(format!("{}{b}", a.to_display_string())))
-                    }
-                    (PreviewVal::Int(a), ast::BinaryOp::Add, PreviewVal::Int(b)) => {
-                        Some(PreviewVal::Int(a + b))
-                    }
-                    (PreviewVal::Int(a), ast::BinaryOp::Sub, PreviewVal::Int(b)) => {
-                        Some(PreviewVal::Int(a - b))
-                    }
-                    (PreviewVal::Int(a), ast::BinaryOp::Mul, PreviewVal::Int(b)) => {
-                        Some(PreviewVal::Int(a * b))
-                    }
-                    (PreviewVal::Int(a), ast::BinaryOp::FloorDiv, PreviewVal::Int(b)) if b != 0 => {
-                        Some(PreviewVal::Int(a.div_euclid(b)))
-                    }
-                    (PreviewVal::Int(a), ast::BinaryOp::Mod, PreviewVal::Int(b)) if b != 0 => {
-                        Some(PreviewVal::Int(a.rem_euclid(b)))
-                    }
-                    (PreviewVal::Int(a), ast::BinaryOp::Div, PreviewVal::Int(b)) if b != 0 => {
-                        Some(PreviewVal::Float(a as f64 / b as f64))
-                    }
-                    (PreviewVal::Int(a), ast::BinaryOp::Eq, PreviewVal::Int(b)) => {
-                        Some(PreviewVal::Bool(a == b))
-                    }
-                    (PreviewVal::Int(a), ast::BinaryOp::NotEq, PreviewVal::Int(b)) => {
-                        Some(PreviewVal::Bool(a != b))
-                    }
-                    (PreviewVal::Str(a), ast::BinaryOp::Eq, PreviewVal::Str(b)) => {
-                        Some(PreviewVal::Bool(a == b))
-                    }
-                    (PreviewVal::Str(a), ast::BinaryOp::NotEq, PreviewVal::Str(b)) => {
-                        Some(PreviewVal::Bool(a != b))
-                    }
-                    (PreviewVal::Bool(a), ast::BinaryOp::Eq, PreviewVal::Bool(b)) => {
-                        Some(PreviewVal::Bool(a == b))
-                    }
-                    (PreviewVal::Bool(a), ast::BinaryOp::NotEq, PreviewVal::Bool(b)) => {
-                        Some(PreviewVal::Bool(a != b))
-                    }
-                    (PreviewVal::Int(a), ast::BinaryOp::Lt, PreviewVal::Int(b)) => {
-                        Some(PreviewVal::Bool(a < b))
-                    }
-                    (PreviewVal::Int(a), ast::BinaryOp::LtEq, PreviewVal::Int(b)) => {
-                        Some(PreviewVal::Bool(a <= b))
-                    }
-                    (PreviewVal::Int(a), ast::BinaryOp::Gt, PreviewVal::Int(b)) => {
-                        Some(PreviewVal::Bool(a > b))
-                    }
-                    (PreviewVal::Int(a), ast::BinaryOp::GtEq, PreviewVal::Int(b)) => {
-                        Some(PreviewVal::Bool(a >= b))
-                    }
-                    (a, ast::BinaryOp::Add, b) => {
-                        Some(PreviewVal::Float(a.as_f64()? + b.as_f64()?))
-                    }
-                    (a, ast::BinaryOp::Sub, b) => {
-                        Some(PreviewVal::Float(a.as_f64()? - b.as_f64()?))
-                    }
-                    (a, ast::BinaryOp::Mul, b) => {
-                        Some(PreviewVal::Float(a.as_f64()? * b.as_f64()?))
-                    }
-                    (a, ast::BinaryOp::Div, b) => {
-                        let denom = b.as_f64()?;
-                        if denom == 0.0 {
-                            None
-                        } else {
-                            Some(PreviewVal::Float(a.as_f64()? / denom))
-                        }
-                    }
-                    _ => None,
-                }
-            }
-            ast::ExprKind::BoolOp { op, left, right } => {
-                let l = self.eval_preview_expr(left, vars, depth)?;
-                match op {
-                    ast::LogicalOp::And => {
-                        if !l.is_truthy() {
-                            Some(l)
-                        } else {
-                            self.eval_preview_expr(right, vars, depth)
-                        }
-                    }
-                    ast::LogicalOp::Or => {
-                        if l.is_truthy() {
-                            Some(l)
-                        } else {
-                            self.eval_preview_expr(right, vars, depth)
-                        }
-                    }
-                }
-            }
-            ast::ExprKind::IfExp { test, body, orelse } => {
-                let cond = self.eval_preview_expr(test, vars, depth)?;
-                if cond.is_truthy() {
-                    self.eval_preview_expr(body, vars, depth)
-                } else {
-                    self.eval_preview_expr(orelse, vars, depth)
-                }
-            }
-            ast::ExprKind::Call { callee, args, .. } => {
-                let mut eval_args = Vec::with_capacity(args.len());
-                for arg in args {
-                    eval_args.push(self.eval_preview_expr(arg, vars, depth)?);
-                }
-                if let ast::ExprKind::Ident(fn_name) = &callee.kind {
-                    if fn_name == "str" && eval_args.len() == 1 {
-                        return Some(PreviewVal::Str(eval_args[0].to_display_string()));
-                    }
-                    if fn_name == "int" && eval_args.len() == 1 {
-                        return eval_args[0].as_i64().map(PreviewVal::Int);
-                    }
-                    let func = self
-                        .env
-                        .local_functions
-                        .get(fn_name)
-                        .or_else(|| self.env.class_methods.get(fn_name))
-                        .or_else(|| self.env.module_functions.get(fn_name))?;
-                    return self.eval_preview_function(func, &eval_args, depth + 1);
-                }
-                if let ast::ExprKind::Attribute { value, attr } = &callee.kind
-                    && let ast::ExprKind::Ident(obj) = &value.kind
-                    && (obj == "self" || obj == self.class_name)
-                {
-                    let method = self.env.class_methods.get(attr)?;
-                    return self.eval_preview_function(method, &eval_args, depth + 1);
-                }
-                None
-            }
-            _ => None,
-        }
+        self.env
+            .eval_preview_expr_in_env(self.class_name, expr, vars, depth)
     }
 
     fn resolve_control_ref(
@@ -2853,7 +3518,7 @@ impl<'a> UiParserCtx<'a> {
             ast::ExprKind::Subscript { value, index } => {
                 let (ctl, outer_idx) = self.resolve_control_ref(value)?;
                 let idx_val = if let Some(r_idx) = outer_idx {
-                    let Some(c_val) = eval_constant(index).and_then(|c| c.as_i64()) else {
+                    let Some(c_val) = self.eval_i64(index) else {
                         self.diagnostics.report(
                             DiagnosticKind::InvalidDeclarationArgument {
                                 name: ctl.ident.clone(),
@@ -2868,10 +3533,9 @@ impl<'a> UiParserCtx<'a> {
                 } else if let ast::ExprKind::Tuple(elts) = &index.kind
                     && elts.len() == 2
                 {
-                    let (Some(r_val), Some(c_val)) = (
-                        eval_constant(&elts[0]).and_then(|c| c.as_i64()),
-                        eval_constant(&elts[1]).and_then(|c| c.as_i64()),
-                    ) else {
+                    let (Some(r_val), Some(c_val)) =
+                        (self.eval_i64(&elts[0]), self.eval_i64(&elts[1]))
+                    else {
                         self.diagnostics.report(
                             DiagnosticKind::InvalidDeclarationArgument {
                                 name: ctl.ident.clone(),
@@ -2888,7 +3552,7 @@ impl<'a> UiParserCtx<'a> {
                         r_val * cols + c_val
                     }
                 } else {
-                    let Some(val) = eval_constant(index).and_then(|c| c.as_i64()) else {
+                    let Some(val) = self.eval_i64(index) else {
                         self.diagnostics.report(
                             DiagnosticKind::InvalidDeclarationArgument {
                                 name: ctl.ident.clone(),
@@ -2936,6 +3600,124 @@ impl<'a> UiParserCtx<'a> {
                 None
             }
         }
+    }
+
+    fn eval_str(&self, expr: &ast::Expr) -> Option<String> {
+        self.env
+            .eval_design_expr_preview(self.class_name, expr)
+            .and_then(|v| v.as_str().map(String::from))
+    }
+
+    fn eval_f64(&self, expr: &ast::Expr) -> Option<f64> {
+        self.env
+            .eval_design_expr_preview(self.class_name, expr)
+            .and_then(|v| v.as_f64())
+    }
+
+    fn eval_i64(&self, expr: &ast::Expr) -> Option<i64> {
+        self.env
+            .eval_design_expr_preview(self.class_name, expr)
+            .and_then(|v| v.as_i64())
+    }
+
+    fn eval_bool(&self, expr: &ast::Expr) -> Option<bool> {
+        self.env
+            .eval_design_expr_preview(self.class_name, expr)
+            .and_then(|v| v.as_bool())
+    }
+
+    fn kwarg_str_list(&self, kwargs: &[(String, ast::Expr)], key: &str) -> Option<Vec<String>> {
+        let (_, expr) = kwargs.iter().find(|(k, _)| k == key)?;
+        let PreviewVal::Tuple(items) = self.env.eval_design_expr_preview(self.class_name, expr)?
+        else {
+            return None;
+        };
+        let mut out = Vec::with_capacity(items.len());
+        for item in items {
+            out.push(item.as_str()?.to_string());
+        }
+        Some(out)
+    }
+
+    fn kwarg_str(&self, kwargs: &[(String, ast::Expr)], key: &str) -> Option<String> {
+        kwargs
+            .iter()
+            .find(|(k, _)| k == key)
+            .and_then(|(_, v)| self.eval_str(v))
+    }
+
+    fn kwarg_f64(&self, kwargs: &[(String, ast::Expr)], key: &str) -> Option<f64> {
+        kwargs
+            .iter()
+            .find(|(k, _)| k == key)
+            .and_then(|(_, v)| self.eval_f64(v))
+    }
+
+    fn kwarg_u32(&self, kwargs: &[(String, ast::Expr)], key: &str) -> Option<u32> {
+        kwargs
+            .iter()
+            .find(|(k, _)| k == key)
+            .and_then(|(_, v)| self.eval_i64(v))
+            .and_then(|i| u32::try_from(i).ok())
+    }
+
+    fn kwarg_bool(&self, kwargs: &[(String, ast::Expr)], key: &str) -> Option<bool> {
+        kwargs
+            .iter()
+            .find(|(k, _)| k == key)
+            .and_then(|(_, v)| self.eval_bool(v))
+    }
+
+    fn kwarg_size(&self, kwargs: &[(String, ast::Expr)], key: &str) -> Option<(f64, f64)> {
+        let (_, expr) = kwargs.iter().find(|(k, _)| k == key)?;
+        if let Some(PreviewVal::Tuple(items)) =
+            self.env.eval_design_expr_preview(self.class_name, expr)
+            && items.len() == 2
+        {
+            return Some((items[0].as_f64()?, items[1].as_f64()?));
+        }
+        None
+    }
+
+    fn kwarg_color(&self, kwargs: &[(String, ast::Expr)], key: &str) -> Option<Color> {
+        let (_, expr) = kwargs.iter().find(|(k, _)| k == key)?;
+        let val = self.env.eval_design_expr_preview(self.class_name, expr)?;
+        if let Some(s) = val.as_str() {
+            return Some(Color::parse_str(s));
+        }
+        if let PreviewVal::Tuple(items) = val
+            && items.len() == 3
+        {
+            let r = items[0].as_i64()?.clamp(0, 255) as u8;
+            let g = items[1].as_i64()?.clamp(0, 255) as u8;
+            let b = items[2].as_i64()?.clamp(0, 255) as u8;
+            return Some(Color::rgb(r, g, b));
+        }
+        None
+    }
+}
+
+fn is_ui_node_or_control_expr(
+    expr: &ast::Expr,
+    controls: &[DeclaredControl],
+    class_name: &str,
+) -> bool {
+    match &expr.kind {
+        ast::ExprKind::List(_) | ast::ExprKind::Tuple(_) => true,
+        ast::ExprKind::Call { callee, .. } => is_ui_callee(callee).is_some(),
+        ast::ExprKind::Ident(ident) => controls.iter().any(|c| c.ident == *ident),
+        ast::ExprKind::Attribute { value, attr } => {
+            if let ast::ExprKind::Ident(obj) = &value.kind
+                && (obj == "self" || obj == class_name)
+            {
+                return controls.iter().any(|c| c.ident == *attr);
+            }
+            false
+        }
+        ast::ExprKind::Subscript { value, .. } => {
+            is_ui_node_or_control_expr(value, controls, class_name)
+        }
+        _ => false,
     }
 }
 
@@ -3116,83 +3898,4 @@ fn format_channel_surface(template: &str, ch: usize) -> String {
     } else {
         format!("{template} {ch}")
     }
-}
-
-fn get_kwarg_str_list(kwargs: &[(String, ast::Expr)], key: &str) -> Option<Vec<String>> {
-    let (_, expr) = kwargs.iter().find(|(k, _)| k == key)?;
-    let ConstValue::List(items) = eval_constant(expr)? else {
-        return None;
-    };
-    let mut out = Vec::with_capacity(items.len());
-    for item in items {
-        out.push(item.as_str()?.to_string());
-    }
-    Some(out)
-}
-
-fn get_kwarg_str(kwargs: &[(String, ast::Expr)], key: &str) -> Option<String> {
-    kwargs
-        .iter()
-        .find(|(k, _)| k == key)
-        .and_then(|(_, v)| eval_constant(v))
-        .and_then(|c| c.as_str().map(String::from))
-}
-
-fn get_kwarg_f64(kwargs: &[(String, ast::Expr)], key: &str) -> Option<f64> {
-    kwargs
-        .iter()
-        .find(|(k, _)| k == key)
-        .and_then(|(_, v)| eval_constant(v))
-        .and_then(|c| c.as_f64())
-}
-
-fn get_kwarg_u32(kwargs: &[(String, ast::Expr)], key: &str) -> Option<u32> {
-    kwargs
-        .iter()
-        .find(|(k, _)| k == key)
-        .and_then(|(_, v)| eval_constant(v))
-        .and_then(|c| c.as_i64())
-        .and_then(|i| u32::try_from(i).ok())
-}
-
-fn get_kwarg_bool(kwargs: &[(String, ast::Expr)], key: &str) -> Option<bool> {
-    kwargs
-        .iter()
-        .find(|(k, _)| k == key)
-        .and_then(|(_, v)| eval_constant(v))
-        .and_then(|c| c.as_bool())
-}
-
-fn get_kwarg_size(kwargs: &[(String, ast::Expr)], key: &str) -> Option<(f64, f64)> {
-    let (_, expr) = kwargs.iter().find(|(k, _)| k == key)?;
-    if let ast::ExprKind::Tuple(elts) | ast::ExprKind::List(elts) = &expr.kind
-        && elts.len() == 2
-    {
-        let w = eval_constant(&elts[0]).and_then(|c| c.as_f64())?;
-        let h = eval_constant(&elts[1]).and_then(|c| c.as_f64())?;
-        return Some((w, h));
-    }
-    None
-}
-
-fn get_kwarg_color(kwargs: &[(String, ast::Expr)], key: &str) -> Option<Color> {
-    let (_, expr) = kwargs.iter().find(|(k, _)| k == key)?;
-    if let Some(s) = eval_constant(expr).and_then(|c| c.as_str().map(String::from)) {
-        return Some(Color::parse_str(&s));
-    }
-    if let ast::ExprKind::Tuple(elts) | ast::ExprKind::List(elts) = &expr.kind
-        && elts.len() == 3
-    {
-        let r = eval_constant(&elts[0])
-            .and_then(|c| c.as_i64())?
-            .clamp(0, 255) as u8;
-        let g = eval_constant(&elts[1])
-            .and_then(|c| c.as_i64())?
-            .clamp(0, 255) as u8;
-        let b = eval_constant(&elts[2])
-            .and_then(|c| c.as_i64())?
-            .clamp(0, 255) as u8;
-        return Some(Color::rgb(r, g, b));
-    }
-    None
 }

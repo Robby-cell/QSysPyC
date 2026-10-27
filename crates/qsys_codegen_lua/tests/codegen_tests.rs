@@ -1667,3 +1667,149 @@ class Funnel(QSysPlugin):
         "UI.Row and UI.Col leading labels must be emitted as Label graphics:\n{lua}"
     );
 }
+
+#[test]
+fn test_property_and_constant_driven_control_and_ui_parameters() {
+    let src = r#"
+from qsys import Control, ControlHandle, Property, QSysPlugin, UI
+
+BASE_MIN = -50
+BASE_MAX = 25
+CHOICES = ["Boolean", "Number", "String"]
+FIELD_WIDTH = 64
+
+class DynamicConfigPlugin(QSysPlugin):
+    SCALE = 2
+    HEADER_COLOR = "Blue"
+
+    InputType = Property.Enum(
+        "Input Type",
+        choices=CHOICES,
+        default=CHOICES[1],
+    )
+    MinLimit = Property.Integer(
+        name="Min Limit",
+        default=BASE_MIN * SCALE,
+        min=BASE_MIN * 4,
+        max=0,
+    )
+    MaxLimit = Property.Integer(
+        name="Max Limit",
+        default=BASE_MAX * SCALE,
+        min=1,
+        max=BASE_MAX * 4,
+    )
+    UseDb = Property.Boolean(name="Use dB", default=True)
+    ExposePins = Property.Boolean(name="Expose Pins", default=False)
+
+    def calc_default(self) -> float:
+        return (self.MinLimit.Value + self.MaxLimit.Value) / 2
+
+    Gain = Control.Float(
+        name="Gain",
+        min=MinLimit,
+        max=self.MaxLimit.Value,
+        default=calc_default(),
+        unit="dB" if UseDb else "Percent",
+        pins="Both" if ExposePins else "None",
+    )
+
+    Inputs = Control.Generic(
+        InputType,
+        name="Inputs",
+        min=MinLimit * 2,
+        max=MaxLimit * 2,
+        count=SCALE + 1,
+    )
+
+    layout = UI.Page(
+        "Main",
+        UI.GroupBox(
+            "Controls",
+            UI.Field("Gain", Gain, width=FIELD_WIDTH + 16, color=HEADER_COLOR),
+            UI.Field("Input {i}", Inputs, width=FIELD_WIDTH),
+        ),
+    )
+
+    def runtime(self) -> None:
+        print(self.SCALE, BASE_MIN)
+"#;
+
+    let file = SourceFile::new(FileId(1), "dynamic_config.py", src);
+    let parsed = parse_module(file).expect("Parse failed");
+    let model = analyze(&parsed).expect("Semantic analysis failed");
+    let ir = model.into_ir();
+    let backend = LuaBackend::new();
+    let (lua, diags) = backend
+        .emit(&ir, &CodegenConfig::default())
+        .expect("Codegen should succeed");
+    assert!(!diags.has_errors());
+
+    // 1. Class-body constants (`SCALE = 2`, `HEADER_COLOR = "Blue"`) and helper `DynamicConfigPlugin_calc_default`
+    //    must be hoisted before `GetControls(props)`
+    let scale_pos = lua
+        .find("local SCALE = 2")
+        .expect("Class constant SCALE = 2 should be hoisted");
+    let calc_pos = lua
+        .find("local function DynamicConfigPlugin_calc_default(self)")
+        .expect("Helper method calc_default should be hoisted");
+    let get_ctls_pos = lua
+        .find("function GetControls(props)")
+        .expect("GetControls should be emitted");
+    assert!(
+        scale_pos < calc_pos && calc_pos < get_ctls_pos,
+        "Class constants and design-time helper methods must be hoisted before GetControls(props):\n{lua}"
+    );
+
+    // 2. GetProperties() must evaluate constant expressions (`BASE_MIN * SCALE = -100`, `CHOICES`, `CHOICES[1] = "Number"`)
+    assert!(
+        lua.contains("Choices = { \"Boolean\", \"Number\", \"String\" },")
+            && lua.contains("Value = \"Number\",")
+            && lua.contains("Name = \"Min Limit\",\n        Type = \"integer\",\n        Value = -100,\n        Min = -200,\n        Max = 0,"),
+        "GetProperties must evaluate module and class constant expressions:\n{lua}"
+    );
+
+    // 3. GetControls(props) must alias `Properties = props` and emit property/expression/method Lua for Min, Max, DefaultValue, ControlUnit, PinStyle
+    assert!(
+        lua.contains(
+            "function GetControls(props)\n    if not Controls then Properties = props end"
+        ),
+        "GetControls(props) must alias Properties = props when a control uses a hoisted method:\n{lua}"
+    );
+    assert!(
+        lua.contains("Name = \"Gain\",\n        ControlType = \"Knob\",\n        ControlUnit = (props[\"Use dB\"].Value and \"dB\" or \"Percent\"),\n        Min = props[\"Min Limit\"].Value,\n        Max = props[\"Max Limit\"].Value,\n        DefaultValue = DynamicConfigPlugin_calc_default(nil),\n        PinStyle = (props[\"Expose Pins\"].Value and \"Both\" or \"None\"),"),
+        "Gain control in GetControls(props) must emit dynamic Lua expressions for unit, min, max, default, and pins:\n{lua}"
+    );
+
+    // 4. Generic control `Inputs` without explicit default must use `Min` expression `(props["Min Limit"].Value * 2)` for DefaultValue in numeric branch
+    assert!(
+        lua.contains("Min = (props[\"Min Limit\"].Value * 2),\n            Max = (props[\"Max Limit\"].Value * 2),\n            DefaultValue = (props[\"Min Limit\"].Value * 2),"),
+        "Generic control numeric branch must emit dynamic Min/Max/DefaultValue expressions:\n{lua}"
+    );
+
+    // 5. Verify static preview values in `IRPlugin` (evaluated from property defaults: MinLimit=-100, MaxLimit=50, calc_default=-25, UseDb=True)
+    if let qsys_ir::IRProgram::Plugin(plugin) = ir {
+        let gain_ctl = plugin
+            .controls
+            .iter()
+            .find(|c| c.def.name == "Gain")
+            .expect("Gain control should exist");
+        match &gain_ctl.def.kind {
+            qsys_model::ControlKind::Knob {
+                unit,
+                min,
+                max,
+                default,
+            } => {
+                assert_eq!(*unit, qsys_model::ControlUnit::Decibels);
+                assert_eq!(*min, -100.0);
+                assert_eq!(*max, 50.0);
+                assert_eq!(*default, -25.0);
+            }
+            other => panic!("Expected Knob for Gain, got {other:?}"),
+        }
+        assert_eq!(gain_ctl.def.pin_style, qsys_model::PinStyle::None);
+    } else {
+        panic!("Expected IRProgram::Plugin");
+    }
+}

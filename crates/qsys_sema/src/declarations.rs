@@ -52,6 +52,29 @@ impl ConstValue {
             _ => None,
         }
     }
+
+    pub fn is_truthy(&self) -> bool {
+        match self {
+            Self::Bool(b) => *b,
+            Self::Int(i) => *i != 0,
+            Self::Float(f) => *f != 0.0,
+            Self::String(s) => !s.is_empty(),
+            Self::List(items) => !items.is_empty(),
+        }
+    }
+
+    pub fn to_display_string(&self) -> String {
+        match self {
+            Self::Int(i) => i.to_string(),
+            Self::Float(f) => f.to_string(),
+            Self::String(s) => s.clone(),
+            Self::Bool(b) => b.to_string(),
+            Self::List(items) => {
+                let parts: Vec<String> = items.iter().map(Self::to_display_string).collect();
+                format!("[{}]", parts.join(", "))
+            }
+        }
+    }
 }
 
 pub fn eval_constant_with_env(
@@ -64,89 +87,260 @@ pub fn eval_constant_with_env(
         ast::ExprKind::String(s) => Some(ConstValue::String(s.clone())),
         ast::ExprKind::Bool(b) => Some(ConstValue::Bool(*b)),
         ast::ExprKind::Ident(name) => env.get(name).cloned(),
-        ast::ExprKind::Unary {
-            op: ast::UnaryOp::Neg,
-            operand,
-        } => match eval_constant_with_env(operand, env)? {
-            ConstValue::Int(i) => Some(ConstValue::Int(-i)),
-            ConstValue::Float(f) => Some(ConstValue::Float(-f)),
-            _ => None,
-        },
+        ast::ExprKind::Attribute { value, attr } => {
+            if let ast::ExprKind::Ident(obj) = &value.kind
+                && obj == "self"
+            {
+                return env.get(attr).cloned();
+            }
+            None
+        }
+        ast::ExprKind::List(items) | ast::ExprKind::Tuple(items) => {
+            let mut list = Vec::with_capacity(items.len());
+            for item in items {
+                list.push(eval_constant_with_env(item, env)?);
+            }
+            Some(ConstValue::List(list))
+        }
+        ast::ExprKind::Subscript { value, index } => {
+            let ConstValue::List(items) = eval_constant_with_env(value, env)? else {
+                return None;
+            };
+            let idx = eval_constant_with_env(index, env)?.as_i64()?;
+            if idx >= 0 {
+                items.get(idx as usize).cloned()
+            } else {
+                None
+            }
+        }
+        ast::ExprKind::Unary { op, operand } => {
+            let val = eval_constant_with_env(operand, env)?;
+            match op {
+                ast::UnaryOp::Neg => match val {
+                    ConstValue::Int(i) => Some(ConstValue::Int(i.saturating_neg())),
+                    ConstValue::Float(f) => Some(ConstValue::Float(-f)),
+                    _ => None,
+                },
+                ast::UnaryOp::Pos => match val {
+                    ConstValue::Int(_) | ConstValue::Float(_) => Some(val),
+                    _ => None,
+                },
+                ast::UnaryOp::Not => Some(ConstValue::Bool(!val.is_truthy())),
+                ast::UnaryOp::BitNot => match val {
+                    ConstValue::Int(i) => Some(ConstValue::Int(!i)),
+                    _ => None,
+                },
+            }
+        }
+        ast::ExprKind::Binary { left, op, right } => {
+            let l = eval_constant_with_env(left, env)?;
+            let r = eval_constant_with_env(right, env)?;
+            match (l, op, r) {
+                (ConstValue::String(a), ast::BinaryOp::Add, b) => {
+                    Some(ConstValue::String(format!("{a}{}", b.to_display_string())))
+                }
+                (a, ast::BinaryOp::Add, ConstValue::String(b)) => {
+                    Some(ConstValue::String(format!("{}{b}", a.to_display_string())))
+                }
+                (ConstValue::Int(a), ast::BinaryOp::Add, ConstValue::Int(b)) => {
+                    Some(ConstValue::Int(a.saturating_add(b)))
+                }
+                (ConstValue::Int(a), ast::BinaryOp::Sub, ConstValue::Int(b)) => {
+                    Some(ConstValue::Int(a.saturating_sub(b)))
+                }
+                (ConstValue::Int(a), ast::BinaryOp::Mul, ConstValue::Int(b)) => {
+                    Some(ConstValue::Int(a.saturating_mul(b)))
+                }
+                (ConstValue::Int(a), ast::BinaryOp::FloorDiv, ConstValue::Int(b)) if b != 0 => {
+                    Some(ConstValue::Int(a.div_euclid(b)))
+                }
+                (ConstValue::Int(a), ast::BinaryOp::Mod, ConstValue::Int(b)) if b != 0 => {
+                    Some(ConstValue::Int(a.rem_euclid(b)))
+                }
+                (ConstValue::Int(a), ast::BinaryOp::Pow, ConstValue::Int(b)) if b >= 0 => {
+                    Some(ConstValue::Int(a.saturating_pow(b as u32)))
+                }
+                (ConstValue::Int(a), ast::BinaryOp::Div, ConstValue::Int(b)) if b != 0 => {
+                    Some(ConstValue::Float(a as f64 / b as f64))
+                }
+                (ConstValue::Int(a), ast::BinaryOp::BitAnd, ConstValue::Int(b)) => {
+                    Some(ConstValue::Int(a & b))
+                }
+                (ConstValue::Int(a), ast::BinaryOp::BitOr, ConstValue::Int(b)) => {
+                    Some(ConstValue::Int(a | b))
+                }
+                (ConstValue::Int(a), ast::BinaryOp::BitXor, ConstValue::Int(b)) => {
+                    Some(ConstValue::Int(a ^ b))
+                }
+                (ConstValue::Int(a), ast::BinaryOp::LShift, ConstValue::Int(b))
+                    if (0..64).contains(&b) =>
+                {
+                    Some(ConstValue::Int(a << b))
+                }
+                (ConstValue::Int(a), ast::BinaryOp::RShift, ConstValue::Int(b))
+                    if (0..64).contains(&b) =>
+                {
+                    Some(ConstValue::Int(a >> b))
+                }
+                (ConstValue::Int(a), ast::BinaryOp::Eq, ConstValue::Int(b)) => {
+                    Some(ConstValue::Bool(a == b))
+                }
+                (ConstValue::Int(a), ast::BinaryOp::NotEq, ConstValue::Int(b)) => {
+                    Some(ConstValue::Bool(a != b))
+                }
+                (ConstValue::Int(a), ast::BinaryOp::Lt, ConstValue::Int(b)) => {
+                    Some(ConstValue::Bool(a < b))
+                }
+                (ConstValue::Int(a), ast::BinaryOp::LtEq, ConstValue::Int(b)) => {
+                    Some(ConstValue::Bool(a <= b))
+                }
+                (ConstValue::Int(a), ast::BinaryOp::Gt, ConstValue::Int(b)) => {
+                    Some(ConstValue::Bool(a > b))
+                }
+                (ConstValue::Int(a), ast::BinaryOp::GtEq, ConstValue::Int(b)) => {
+                    Some(ConstValue::Bool(a >= b))
+                }
+                (ConstValue::String(a), ast::BinaryOp::Eq, ConstValue::String(b)) => {
+                    Some(ConstValue::Bool(a == b))
+                }
+                (ConstValue::String(a), ast::BinaryOp::NotEq, ConstValue::String(b)) => {
+                    Some(ConstValue::Bool(a != b))
+                }
+                (ConstValue::Bool(a), ast::BinaryOp::Eq, ConstValue::Bool(b)) => {
+                    Some(ConstValue::Bool(a == b))
+                }
+                (ConstValue::Bool(a), ast::BinaryOp::NotEq, ConstValue::Bool(b)) => {
+                    Some(ConstValue::Bool(a != b))
+                }
+                (l_val, op, r_val) => {
+                    let a = l_val.as_f64()?;
+                    let b = r_val.as_f64()?;
+                    match op {
+                        ast::BinaryOp::Add => Some(ConstValue::Float(a + b)),
+                        ast::BinaryOp::Sub => Some(ConstValue::Float(a - b)),
+                        ast::BinaryOp::Mul => Some(ConstValue::Float(a * b)),
+                        ast::BinaryOp::Div if b != 0.0 => Some(ConstValue::Float(a / b)),
+                        ast::BinaryOp::FloorDiv if b != 0.0 => {
+                            Some(ConstValue::Float((a / b).floor()))
+                        }
+                        ast::BinaryOp::Mod if b != 0.0 => Some(ConstValue::Float(a.rem_euclid(b))),
+                        ast::BinaryOp::Pow => Some(ConstValue::Float(a.powf(b))),
+                        ast::BinaryOp::Eq => Some(ConstValue::Bool((a - b).abs() < f64::EPSILON)),
+                        ast::BinaryOp::NotEq => {
+                            Some(ConstValue::Bool((a - b).abs() >= f64::EPSILON))
+                        }
+                        ast::BinaryOp::Lt => Some(ConstValue::Bool(a < b)),
+                        ast::BinaryOp::LtEq => Some(ConstValue::Bool(a <= b)),
+                        ast::BinaryOp::Gt => Some(ConstValue::Bool(a > b)),
+                        ast::BinaryOp::GtEq => Some(ConstValue::Bool(a >= b)),
+                        _ => None,
+                    }
+                }
+            }
+        }
+        ast::ExprKind::BoolOp { op, left, right } => {
+            let l = eval_constant_with_env(left, env)?;
+            match op {
+                ast::LogicalOp::And => {
+                    if !l.is_truthy() {
+                        Some(l)
+                    } else {
+                        eval_constant_with_env(right, env)
+                    }
+                }
+                ast::LogicalOp::Or => {
+                    if l.is_truthy() {
+                        Some(l)
+                    } else {
+                        eval_constant_with_env(right, env)
+                    }
+                }
+            }
+        }
+        ast::ExprKind::IfExp { test, body, orelse } => {
+            let cond = eval_constant_with_env(test, env)?;
+            if cond.is_truthy() {
+                eval_constant_with_env(body, env)
+            } else {
+                eval_constant_with_env(orelse, env)
+            }
+        }
+        ast::ExprKind::Call { callee, args, .. } => {
+            let ast::ExprKind::Ident(fn_name) = &callee.kind else {
+                return None;
+            };
+            let mut eval_args = Vec::with_capacity(args.len());
+            for a in args {
+                eval_args.push(eval_constant_with_env(a, env)?);
+            }
+            match fn_name.as_str() {
+                "str" if eval_args.len() == 1 => {
+                    Some(ConstValue::String(eval_args[0].to_display_string()))
+                }
+                "int" if eval_args.len() == 1 => match &eval_args[0] {
+                    ConstValue::Int(i) => Some(ConstValue::Int(*i)),
+                    ConstValue::Float(f) => Some(ConstValue::Int(*f as i64)),
+                    ConstValue::Bool(b) => Some(ConstValue::Int(i64::from(*b))),
+                    ConstValue::String(s) => s.trim().parse::<i64>().ok().map(ConstValue::Int),
+                    ConstValue::List(_) => None,
+                },
+                "float" if eval_args.len() == 1 => match &eval_args[0] {
+                    ConstValue::Float(f) => Some(ConstValue::Float(*f)),
+                    ConstValue::Int(i) => Some(ConstValue::Float(*i as f64)),
+                    ConstValue::Bool(b) => Some(ConstValue::Float(if *b { 1.0 } else { 0.0 })),
+                    ConstValue::String(s) => s.trim().parse::<f64>().ok().map(ConstValue::Float),
+                    ConstValue::List(_) => None,
+                },
+                "bool" if eval_args.len() == 1 => Some(ConstValue::Bool(eval_args[0].is_truthy())),
+                "abs" if eval_args.len() == 1 => match eval_args[0] {
+                    ConstValue::Int(i) => Some(ConstValue::Int(i.abs())),
+                    ConstValue::Float(f) => Some(ConstValue::Float(f.abs())),
+                    _ => None,
+                },
+                "round" if eval_args.len() == 1 => match eval_args[0] {
+                    ConstValue::Int(i) => Some(ConstValue::Int(i)),
+                    ConstValue::Float(f) => Some(ConstValue::Int(f.round() as i64)),
+                    _ => None,
+                },
+                "min" if !eval_args.is_empty() => {
+                    if eval_args.iter().all(|v| matches!(v, ConstValue::Int(_))) {
+                        eval_args
+                            .iter()
+                            .filter_map(ConstValue::as_i64)
+                            .min()
+                            .map(ConstValue::Int)
+                    } else {
+                        eval_args
+                            .iter()
+                            .filter_map(ConstValue::as_f64)
+                            .reduce(f64::min)
+                            .map(ConstValue::Float)
+                    }
+                }
+                "max" if !eval_args.is_empty() => {
+                    if eval_args.iter().all(|v| matches!(v, ConstValue::Int(_))) {
+                        eval_args
+                            .iter()
+                            .filter_map(ConstValue::as_i64)
+                            .max()
+                            .map(ConstValue::Int)
+                    } else {
+                        eval_args
+                            .iter()
+                            .filter_map(ConstValue::as_f64)
+                            .reduce(f64::max)
+                            .map(ConstValue::Float)
+                    }
+                }
+                _ => None,
+            }
+        }
         _ => None,
     }
 }
 
 pub fn eval_constant(expr: &ast::Expr) -> Option<ConstValue> {
-    match &expr.kind {
-        ast::ExprKind::Int(i) => Some(ConstValue::Int(*i)),
-        ast::ExprKind::Float(f) => Some(ConstValue::Float(*f)),
-        ast::ExprKind::String(s) => Some(ConstValue::String(s.clone())),
-        ast::ExprKind::Bool(b) => Some(ConstValue::Bool(*b)),
-        ast::ExprKind::List(items) | ast::ExprKind::Tuple(items) => {
-            let mut list = Vec::new();
-            for item in items {
-                list.push(eval_constant(item)?);
-            }
-            Some(ConstValue::List(list))
-        }
-        ast::ExprKind::Unary {
-            op: ast::UnaryOp::Neg,
-            operand,
-        } => match eval_constant(operand)? {
-            ConstValue::Int(i) => Some(ConstValue::Int(-i)),
-            ConstValue::Float(f) => Some(ConstValue::Float(-f)),
-            _ => None,
-        },
-        ast::ExprKind::Unary {
-            op: ast::UnaryOp::Pos,
-            operand,
-        } => eval_constant(operand),
-        ast::ExprKind::Binary { left, op, right } => {
-            let l = eval_constant(left)?;
-            let r = eval_constant(right)?;
-            match (l, op, r) {
-                (ConstValue::Int(a), ast::BinaryOp::Add, ConstValue::Int(b)) => {
-                    Some(ConstValue::Int(a + b))
-                }
-                (ConstValue::Int(a), ast::BinaryOp::Sub, ConstValue::Int(b)) => {
-                    Some(ConstValue::Int(a - b))
-                }
-                (ConstValue::Int(a), ast::BinaryOp::Mul, ConstValue::Int(b)) => {
-                    Some(ConstValue::Int(a * b))
-                }
-                (ConstValue::Float(a), ast::BinaryOp::Add, ConstValue::Float(b)) => {
-                    Some(ConstValue::Float(a + b))
-                }
-                (ConstValue::Float(a), ast::BinaryOp::Sub, ConstValue::Float(b)) => {
-                    Some(ConstValue::Float(a - b))
-                }
-                (ConstValue::Float(a), ast::BinaryOp::Mul, ConstValue::Float(b)) => {
-                    Some(ConstValue::Float(a * b))
-                }
-                (ConstValue::String(a), ast::BinaryOp::Add, ConstValue::String(b)) => {
-                    Some(ConstValue::String(format!("{a}{b}")))
-                }
-                _ => None,
-            }
-        }
-        ast::ExprKind::Call { callee, args, .. } => {
-            if let ast::ExprKind::Ident(fn_name) = &callee.kind
-                && fn_name == "str"
-                && args.len() == 1
-            {
-                match eval_constant(&args[0])? {
-                    ConstValue::Int(i) => Some(ConstValue::String(i.to_string())),
-                    ConstValue::Float(f) => Some(ConstValue::String(f.to_string())),
-                    ConstValue::String(s) => Some(ConstValue::String(s)),
-                    ConstValue::Bool(b) => Some(ConstValue::String(b.to_string())),
-                    ConstValue::List(_) => None,
-                }
-            } else {
-                None
-            }
-        }
-        _ => None,
-    }
+    eval_constant_with_env(expr, &FxHashMap::default())
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -193,6 +387,16 @@ pub fn extract_class_declarations_with_module(
     let mut seen_properties = FxHashSet::default();
     let mut pending_controls: Vec<(String, ast::Expr, Span)> = Vec::new();
     let mut pending_ui_exprs: Vec<ast::Expr> = Vec::new();
+    let mut constants: FxHashMap<String, ConstValue> = FxHashMap::default();
+
+    for stmt in module_statements {
+        if let ast::StmtKind::Assign { target, value, .. } = &stmt.kind
+            && let ast::ExprKind::Ident(name) = &target.kind
+            && let Some(cval) = eval_constant_with_env(value, &constants)
+        {
+            constants.insert(name.clone(), cval);
+        }
+    }
 
     declarations.plugin_info.name = class.name.clone();
 
@@ -218,7 +422,7 @@ pub fn extract_class_declarations_with_module(
                 }
 
                 if let Some(property_def) =
-                    try_parse_property(&var_name, value, stmt.span, diagnostics)
+                    try_parse_property(&var_name, value, stmt.span, &constants, diagnostics)
                 {
                     if !seen_properties.insert(var_name.clone()) {
                         diagnostics.report(
@@ -238,8 +442,12 @@ pub fn extract_class_declarations_with_module(
                     continue;
                 }
 
-                if try_parse_metadata(&var_name, value, &mut declarations.plugin_info) {
+                if try_parse_metadata(&var_name, value, &constants, &mut declarations.plugin_info) {
                     continue;
+                }
+
+                if let Some(cval) = eval_constant_with_env(value, &constants) {
+                    constants.insert(var_name.clone(), cval);
                 }
 
                 declarations.remaining_statements.push(stmt.clone());
@@ -257,13 +465,20 @@ pub fn extract_class_declarations_with_module(
         }
     }
 
-    // Parse Control.* declarations now that all Property.* declarations are available
+    let ui_env = UiResolveEnv::from_class_and_module(
+        &class.body,
+        module_statements,
+        &declarations.properties,
+    );
+
+    // Parse Control.* declarations now that all Property.* declarations and constants/methods are available
     for (var_name, value, span) in pending_controls {
         if let Some(control_def) = try_parse_control(
+            &class.name,
             &var_name,
             &value,
             span,
-            &declarations.properties,
+            &ui_env,
             &mut declarations.control_property_resolutions,
             diagnostics,
         ) {
@@ -284,12 +499,6 @@ pub fn extract_class_declarations_with_module(
             }
         }
     }
-
-    let ui_env = UiResolveEnv::from_class_and_module(
-        &class.body,
-        module_statements,
-        &declarations.properties,
-    );
 
     // Second pass: resolve declarative UI.* trees now that all controls are registered
     for ui_expr in &pending_ui_exprs {
@@ -466,13 +675,15 @@ fn resolve_type_property_arg(
 }
 
 fn eval_count_expr(
+    class_name: &str,
     expr: &ast::Expr,
     control_name: &str,
-    properties: &[DeclaredProperty],
+    ui_env: &UiResolveEnv<'_>,
     prop_resolutions: &mut Vec<(Span, PropertyId)>,
     diagnostics: &mut Diagnostics,
     reported_error: &mut bool,
 ) -> Option<(i64, String, bool)> {
+    let properties = ui_env.properties;
     match &expr.kind {
         ast::ExprKind::Int(i) => return Some((*i, i.to_string(), false)),
         ast::ExprKind::Unary {
@@ -480,9 +691,10 @@ fn eval_count_expr(
             operand,
         } => {
             return eval_count_expr(
+                class_name,
                 operand,
                 control_name,
-                properties,
+                ui_env,
                 prop_resolutions,
                 diagnostics,
                 reported_error,
@@ -493,28 +705,42 @@ fn eval_count_expr(
             operand,
         } => {
             let (v, s, has_p) = eval_count_expr(
+                class_name,
                 operand,
                 control_name,
-                properties,
+                ui_env,
                 prop_resolutions,
                 diagnostics,
                 reported_error,
             )?;
             return Some((v.saturating_neg(), format!("(-{s})"), has_p));
         }
-        ast::ExprKind::Binary { left, op, right } => {
+        ast::ExprKind::Binary { left, op, right }
+            if matches!(
+                op,
+                ast::BinaryOp::Add
+                    | ast::BinaryOp::Sub
+                    | ast::BinaryOp::Mul
+                    | ast::BinaryOp::FloorDiv
+                    | ast::BinaryOp::Div
+                    | ast::BinaryOp::Mod
+                    | ast::BinaryOp::Pow
+            ) =>
+        {
             let (lv, ls, lp) = eval_count_expr(
+                class_name,
                 left,
                 control_name,
-                properties,
+                ui_env,
                 prop_resolutions,
                 diagnostics,
                 reported_error,
             )?;
             let (rv, rs, rp) = eval_count_expr(
+                class_name,
                 right,
                 control_name,
-                properties,
+                ui_env,
                 prop_resolutions,
                 diagnostics,
                 reported_error,
@@ -560,12 +786,23 @@ fn eval_count_expr(
         ast::ExprKind::Ident(id) => {
             prop_ident_opt = Some(id.as_str());
         }
-        ast::ExprKind::Attribute { value, attr } if matches!(&value.kind, ast::ExprKind::Ident(s) if s == "self") =>
+        ast::ExprKind::Attribute { value, attr }
+            if matches!(
+                &value.kind,
+                ast::ExprKind::Ident(s) if s == "self" || s == class_name
+            ) =>
         {
             prop_ident_opt = Some(attr.as_str());
         }
-        ast::ExprKind::Subscript { value, index } if matches!(&value.kind, ast::ExprKind::Ident(s) if s == "props" || s == "Properties") => {
-            if let Some(s) = eval_constant(index).and_then(|c| c.as_str().map(String::from)) {
+        ast::ExprKind::Subscript { value, index }
+            if matches!(
+                &value.kind,
+                ast::ExprKind::Ident(s) if s == "props" || s == "Properties"
+            ) =>
+        {
+            if let Some(s) = eval_constant_with_env(index, &ui_env.constants)
+                .and_then(|c| c.as_str().map(String::from))
+            {
                 prop_key_opt = Some(s);
             }
         }
@@ -628,6 +865,23 @@ fn eval_count_expr(
         return Some((1, format!("{{PROP:{prop_key}}}"), true));
     }
 
+    if !ui_env.is_dynamic_design_expr(class_name, expr) {
+        if let Some(i) = eval_constant_with_env(expr, &ui_env.constants).and_then(|c| c.as_i64()) {
+            return Some((i, i.to_string(), false));
+        }
+    } else if let Some(pv) = ui_env.eval_design_expr_preview(class_name, expr)
+        && let Some(i) = pv.as_i64()
+    {
+        ui_env.collect_property_resolutions(class_name, expr, prop_resolutions);
+        let tmpl = ui_env.lower_design_expr_to_prop_template(class_name, expr);
+        let spec = if tmpl.contains("{PROP:") {
+            tmpl
+        } else {
+            format!("{{LUA:{tmpl}}}")
+        };
+        return Some((i, spec, true));
+    }
+
     None
 }
 
@@ -639,7 +893,9 @@ pub(crate) fn combine_2d_count_specs(
 ) -> Option<String> {
     let to_token = |val: usize, prop: &Option<String>| -> String {
         if let Some(p) = prop {
-            if p.contains("{PROP:") {
+            if let Some(inner) = p.strip_prefix("{LUA:").and_then(|s| s.strip_suffix('}')) {
+                format!("({inner})")
+            } else if p.contains("{PROP:") {
                 if p.contains(' ') {
                     format!("({p})")
                 } else {
@@ -657,11 +913,14 @@ pub(crate) fn combine_2d_count_specs(
         (false, false) => None,
         (true, false) if c_val == 1 => r_prop.clone(),
         (false, true) if r_val == 1 => c_prop.clone(),
-        _ => Some(format!(
-            "{} * {}",
-            to_token(r_val, r_prop),
-            to_token(c_val, c_prop)
-        )),
+        _ => {
+            let combined = format!("{} * {}", to_token(r_val, r_prop), to_token(c_val, c_prop));
+            if combined.contains("{PROP:") {
+                Some(combined)
+            } else {
+                Some(format!("{{LUA:{combined}}}"))
+            }
+        }
     }
 }
 
@@ -713,17 +972,19 @@ fn should_swap_mul_dims(
 }
 
 pub(crate) fn resolve_count_arg(
+    class_name: &str,
     val: &ast::Expr,
     control_name: &str,
-    properties: &[DeclaredProperty],
+    ui_env: &UiResolveEnv<'_>,
     prop_resolutions: &mut Vec<(Span, PropertyId)>,
     diagnostics: &mut Diagnostics,
 ) -> Option<(usize, Option<String>)> {
     let mut reported_error = false;
     if let Some((evaluated_val, template, has_prop)) = eval_count_expr(
+        class_name,
         val,
         control_name,
-        properties,
+        ui_env,
         prop_resolutions,
         diagnostics,
         &mut reported_error,
@@ -767,14 +1028,86 @@ pub(crate) fn resolve_count_arg(
     None
 }
 
+fn resolve_design_num_arg(
+    class_name: &str,
+    expr: &ast::Expr,
+    control_name: &str,
+    arg_label: &str,
+    ui_env: &UiResolveEnv<'_>,
+    prop_resolutions: &mut Vec<(Span, PropertyId)>,
+    diagnostics: &mut Diagnostics,
+) -> Option<(f64, Option<String>)> {
+    ui_env.collect_property_resolutions(class_name, expr, prop_resolutions);
+    if !ui_env.is_dynamic_design_expr(class_name, expr) {
+        if let Some(m) = eval_constant_with_env(expr, &ui_env.constants).and_then(|c| c.as_f64()) {
+            return Some((m, None));
+        }
+    } else if let Some(pv) = ui_env.eval_design_expr_preview(class_name, expr)
+        && let Some(m) = pv.as_f64()
+    {
+        let lua = ui_env.lower_design_expr_to_lua(class_name, expr);
+        return Some((m, Some(lua)));
+    }
+    diagnostics.report(
+        DiagnosticKind::InvalidDeclarationArgument {
+            name: control_name.to_string(),
+            message: format!("'{arg_label}' must be a numeric literal"),
+        },
+        expr.span,
+    );
+    None
+}
+
+fn resolve_design_str_arg(
+    class_name: &str,
+    expr: &ast::Expr,
+    ui_env: &UiResolveEnv<'_>,
+    prop_resolutions: &mut Vec<(Span, PropertyId)>,
+) -> Option<(String, Option<String>)> {
+    ui_env.collect_property_resolutions(class_name, expr, prop_resolutions);
+    if !ui_env.is_dynamic_design_expr(class_name, expr) {
+        if let Some(s) = eval_constant_with_env(expr, &ui_env.constants)
+            .and_then(|c| c.as_str().map(String::from))
+        {
+            return Some((s, None));
+        }
+    } else if let Some(pv) = ui_env.eval_design_expr_preview(class_name, expr) {
+        let s = pv.to_display_string();
+        let lua = ui_env.lower_design_expr_to_lua(class_name, expr);
+        return Some((s, Some(lua)));
+    }
+    None
+}
+
+fn resolve_design_bool_arg(
+    class_name: &str,
+    expr: &ast::Expr,
+    ui_env: &UiResolveEnv<'_>,
+    prop_resolutions: &mut Vec<(Span, PropertyId)>,
+) -> Option<(bool, Option<String>)> {
+    ui_env.collect_property_resolutions(class_name, expr, prop_resolutions);
+    if !ui_env.is_dynamic_design_expr(class_name, expr) {
+        if let Some(b) = eval_constant_with_env(expr, &ui_env.constants).and_then(|c| c.as_bool()) {
+            return Some((b, None));
+        }
+    } else if let Some(pv) = ui_env.eval_design_expr_preview(class_name, expr) {
+        let b = pv.is_truthy();
+        let lua = ui_env.lower_design_expr_to_lua(class_name, expr);
+        return Some((b, Some(lua)));
+    }
+    None
+}
+
 fn try_parse_control(
+    class_name: &str,
     var_name: &str,
     expr: &ast::Expr,
     span: Span,
-    properties: &[DeclaredProperty],
+    ui_env: &UiResolveEnv<'_>,
     prop_resolutions: &mut Vec<(Span, PropertyId)>,
     diagnostics: &mut Diagnostics,
 ) -> Option<ControlDef> {
+    let properties = ui_env.properties;
     let (kind_str, subscript_type_expr, args, kwargs) = match &expr.kind {
         ast::ExprKind::Call {
             callee,
@@ -812,7 +1145,9 @@ fn try_parse_control(
     // 3. Fall back to built-in Q-SYS standard names ("IPAddress", "MACAddress")
     // 4. Fall back to variable identifier name (e.g. `Gain = ...` -> "Gain")
     let control_name = match kwargs.iter().find(|(k, _)| k == "name") {
-        Some((_, val)) => match eval_constant(val).and_then(|c| c.as_str().map(String::from)) {
+        Some((_, val)) => match eval_constant_with_env(val, &ui_env.constants)
+            .and_then(|c| c.as_str().map(String::from))
+        {
             Some(s) => s,
             None => {
                 diagnostics.report(
@@ -826,7 +1161,9 @@ fn try_parse_control(
             }
         },
         None => match positional_name_arg {
-            Some(val) => match eval_constant(val).and_then(|c| c.as_str().map(String::from)) {
+            Some(val) => match eval_constant_with_env(val, &ui_env.constants)
+                .and_then(|c| c.as_str().map(String::from))
+            {
                 Some(s) => s,
                 None => {
                     diagnostics.report(
@@ -858,16 +1195,18 @@ fn try_parse_control(
         Some((_, val)) => match &val.kind {
             ast::ExprKind::Tuple(items) | ast::ExprKind::List(items) if items.len() == 2 => {
                 let (r_val, r_prop) = resolve_count_arg(
+                    class_name,
                     &items[0],
                     &control_name,
-                    properties,
+                    ui_env,
                     prop_resolutions,
                     diagnostics,
                 )?;
                 let (c_val, c_prop) = resolve_count_arg(
+                    class_name,
                     &items[1],
                     &control_name,
-                    properties,
+                    ui_env,
                     prop_resolutions,
                     diagnostics,
                 )?;
@@ -882,9 +1221,10 @@ fn try_parse_control(
             }
             _ => {
                 let (total, total_prop) = resolve_count_arg(
+                    class_name,
                     val,
                     &control_name,
-                    properties,
+                    ui_env,
                     prop_resolutions,
                     diagnostics,
                 )?;
@@ -898,16 +1238,18 @@ fn try_parse_control(
                     let mut dummy_diags = Diagnostics::new();
                     if let (Some((l_val, l_prop)), Some((r_val, r_prop))) = (
                         resolve_count_arg(
+                            class_name,
                             left,
                             &control_name,
-                            properties,
+                            ui_env,
                             &mut dummy_res,
                             &mut dummy_diags,
                         ),
                         resolve_count_arg(
+                            class_name,
                             right,
                             &control_name,
-                            properties,
+                            ui_env,
                             &mut dummy_res,
                             &mut dummy_diags,
                         ),
@@ -933,9 +1275,10 @@ fn try_parse_control(
 
     if let Some((_, r_expr)) = kwargs.iter().find(|(k, _)| k == "rows") {
         let (r_val, r_prop) = resolve_count_arg(
+            class_name,
             r_expr,
             &control_name,
-            properties,
+            ui_env,
             prop_resolutions,
             diagnostics,
         )?;
@@ -945,9 +1288,10 @@ fn try_parse_control(
     }
     if let Some((_, c_expr)) = kwargs.iter().find(|(k, _)| k == "cols" || k == "columns") {
         let (c_val, c_prop) = resolve_count_arg(
+            class_name,
             c_expr,
             &control_name,
-            properties,
+            ui_env,
             prop_resolutions,
             diagnostics,
         )?;
@@ -964,56 +1308,74 @@ fn try_parse_control(
         count_property = combine_2d_count_specs(r_val, &rows_property, c_val, &cols_property);
     }
 
-    let pin_style = match kwargs.iter().find(|(k, _)| k == "pins") {
+    let (pin_style, pin_style_lua_expr) = match kwargs.iter().find(|(k, _)| k == "pins") {
         Some((_, val)) => {
-            match eval_constant(val).and_then(|c| c.as_str().map(String::from)) {
-                Some(ref s) if s == "None" => PinStyle::None,
-                Some(ref s) if s == "Input" => PinStyle::Input,
-                Some(ref s) if s == "Output" => PinStyle::Output,
-                Some(ref s) if s == "Both" => PinStyle::Both,
-                _ => {
-                    diagnostics.report(
-                    DiagnosticKind::InvalidDeclarationArgument {
-                        name: control_name.clone(),
-                        message: "Invalid 'pins' value. Expected 'None', 'Input', 'Output', or 'Both'".to_string(),
-                    },
-                    val.span,
-                );
-                    return None;
-                }
-            }
-        }
-        None => PinStyle::Both,
-    };
-
-    let user_pin = match kwargs.iter().find(|(k, _)| k == "user_pin") {
-        Some((_, val)) => match eval_constant(val).and_then(|c| c.as_bool()) {
-            Some(b) => b,
-            None => {
+            let Some((s, lua_opt)) =
+                resolve_design_str_arg(class_name, val, ui_env, prop_resolutions)
+            else {
                 diagnostics.report(
                     DiagnosticKind::InvalidDeclarationArgument {
                         name: control_name.clone(),
-                        message: "'user_pin' must be a boolean literal".to_string(),
+                        message:
+                            "Invalid 'pins' value. Expected 'None', 'Input', 'Output', or 'Both'"
+                                .to_string(),
                     },
                     val.span,
                 );
                 return None;
+            };
+            let parsed = match s.as_str() {
+                "None" => Some(PinStyle::None),
+                "Input" => Some(PinStyle::Input),
+                "Output" => Some(PinStyle::Output),
+                "Both" => Some(PinStyle::Both),
+                _ => None,
+            };
+            match (parsed, lua_opt) {
+                (Some(ps), lua) => (ps, lua),
+                (None, Some(lua)) => (PinStyle::Both, Some(lua)),
+                (None, None) => {
+                    diagnostics.report(
+                        DiagnosticKind::InvalidDeclarationArgument {
+                            name: control_name.clone(),
+                            message: "Invalid 'pins' value. Expected 'None', 'Input', 'Output', or 'Both'".to_string(),
+                        },
+                        val.span,
+                    );
+                    return None;
+                }
             }
-        },
-        None => true,
+        }
+        None => (PinStyle::Both, None),
     };
 
-    let parse_unit = |diagnostics: &mut Diagnostics| -> Option<ControlUnit> {
+    let (user_pin, user_pin_lua_expr) = match kwargs.iter().find(|(k, _)| k == "user_pin") {
+        Some((_, val)) => {
+            match resolve_design_bool_arg(class_name, val, ui_env, prop_resolutions) {
+                Some(pair) => pair,
+                None => {
+                    diagnostics.report(
+                        DiagnosticKind::InvalidDeclarationArgument {
+                            name: control_name.clone(),
+                            message: "'user_pin' must be a boolean literal".to_string(),
+                        },
+                        val.span,
+                    );
+                    return None;
+                }
+            }
+        }
+        None => (true, None),
+    };
+
+    let parse_unit = |prop_resolutions: &mut Vec<(Span, PropertyId)>,
+                      diagnostics: &mut Diagnostics|
+     -> Option<(ControlUnit, Option<String>)> {
         match kwargs.iter().find(|(k, _)| k == "unit") {
-            Some((_, val)) => match eval_constant(val).and_then(|c| c.as_str().map(String::from)) {
-                Some(ref s) if s == "Float" => Some(ControlUnit::Float),
-                Some(ref s) if s == "Integer" => Some(ControlUnit::Integer),
-                Some(ref s) if s == "dB" || s == "Decibels" => Some(ControlUnit::Decibels),
-                Some(ref s) if s == "Hz" || s == "Hertz" => Some(ControlUnit::Hertz),
-                Some(ref s) if s == "Percent" => Some(ControlUnit::Percent),
-                Some(ref s) if s == "Seconds" => Some(ControlUnit::Seconds),
-                Some(ref s) if s == "Pan" => Some(ControlUnit::Pan),
-                _ => {
+            Some((_, val)) => {
+                let Some((s, lua_opt)) =
+                    resolve_design_str_arg(class_name, val, ui_env, prop_resolutions)
+                else {
                     diagnostics.report(
                             DiagnosticKind::InvalidDeclarationArgument {
                                 name: control_name.clone(),
@@ -1021,88 +1383,121 @@ fn try_parse_control(
                             },
                             val.span,
                         );
-                    None
+                    return None;
+                };
+                let parsed = match s.as_str() {
+                    "Float" => Some(ControlUnit::Float),
+                    "Integer" => Some(ControlUnit::Integer),
+                    "dB" | "Decibels" => Some(ControlUnit::Decibels),
+                    "Hz" | "Hertz" => Some(ControlUnit::Hertz),
+                    "Percent" => Some(ControlUnit::Percent),
+                    "Seconds" => Some(ControlUnit::Seconds),
+                    "Pan" => Some(ControlUnit::Pan),
+                    _ => None,
+                };
+                match (parsed, lua_opt) {
+                    (Some(u), lua) => Some((u, lua)),
+                    (None, Some(lua)) => Some((ControlUnit::Float, Some(lua))),
+                    (None, None) => {
+                        diagnostics.report(
+                                DiagnosticKind::InvalidDeclarationArgument {
+                                    name: control_name.clone(),
+                                    message: "Invalid 'unit'. Expected 'Float', 'Integer', 'dB', 'Hz', 'Percent', 'Seconds', or 'Pan'".to_string(),
+                                },
+                                val.span,
+                            );
+                        None
+                    }
                 }
-            },
-            None => Some(ControlUnit::Float),
+            }
+            None => Some((ControlUnit::Float, None)),
         }
     };
 
+    let mut min_lua_expr: Option<String> = None;
+    let mut max_lua_expr: Option<String> = None;
+    let mut default_lua_expr: Option<String> = None;
+    let mut unit_lua_expr: Option<String> = None;
+    let mut button_type_lua_expr: Option<String> = None;
+    let mut text_type_lua_expr: Option<String> = None;
+
     let kind = match kind_str {
         "Float" | "Knob" | "Fader" => {
-            let unit = parse_unit(diagnostics)?;
+            let (unit, u_lua) = parse_unit(prop_resolutions, diagnostics)?;
+            unit_lua_expr = u_lua;
 
-            let min = match kwargs.iter().find(|(k, _)| k == "min") {
-                Some((_, val)) => match eval_constant(val).and_then(|c| c.as_f64()) {
-                    Some(m) => m,
-                    None => {
-                        diagnostics.report(
-                            DiagnosticKind::InvalidDeclarationArgument {
-                                name: control_name.clone(),
-                                message: "'min' must be a numeric literal".to_string(),
-                            },
-                            val.span,
-                        );
-                        return None;
-                    }
-                },
-                None => 0.0,
+            let (min, m_lua) = match kwargs.iter().find(|(k, _)| k == "min") {
+                Some((_, val)) => resolve_design_num_arg(
+                    class_name,
+                    val,
+                    &control_name,
+                    "min",
+                    ui_env,
+                    prop_resolutions,
+                    diagnostics,
+                )?,
+                None => (0.0, None),
             };
+            min_lua_expr = m_lua;
 
-            let max = match kwargs.iter().find(|(k, _)| k == "max") {
-                Some((_, val)) => match eval_constant(val).and_then(|c| c.as_f64()) {
-                    Some(m) => m,
-                    None => {
-                        diagnostics.report(
-                            DiagnosticKind::InvalidDeclarationArgument {
-                                name: control_name.clone(),
-                                message: "'max' must be a numeric literal".to_string(),
-                            },
-                            val.span,
-                        );
-                        return None;
-                    }
-                },
-                None => 1.0,
+            let (mut max, mx_lua) = match kwargs.iter().find(|(k, _)| k == "max") {
+                Some((_, val)) => resolve_design_num_arg(
+                    class_name,
+                    val,
+                    &control_name,
+                    "max",
+                    ui_env,
+                    prop_resolutions,
+                    diagnostics,
+                )?,
+                None => (1.0, None),
             };
+            max_lua_expr = mx_lua;
 
-            let default = match kwargs.iter().find(|(k, _)| k == "default") {
-                Some((_, val)) => match eval_constant(val).and_then(|c| c.as_f64()) {
-                    Some(d) => d,
-                    None => {
-                        diagnostics.report(
-                            DiagnosticKind::InvalidDeclarationArgument {
-                                name: control_name.clone(),
-                                message: "'default' must be a numeric literal".to_string(),
-                            },
-                            val.span,
-                        );
-                        return None;
-                    }
-                },
-                None => min,
+            let (mut default, def_lua) = match kwargs.iter().find(|(k, _)| k == "default") {
+                Some((_, val)) => resolve_design_num_arg(
+                    class_name,
+                    val,
+                    &control_name,
+                    "default",
+                    ui_env,
+                    prop_resolutions,
+                    diagnostics,
+                )?,
+                None => (min, min_lua_expr.clone()),
             };
+            default_lua_expr = def_lua;
 
-            if min > max {
-                diagnostics.report(
-                    DiagnosticKind::InvalidDeclarationArgument {
-                        name: control_name.clone(),
-                        message: format!("'min' ({min}) cannot be greater than 'max' ({max})"),
-                    },
-                    span,
-                );
-                return None;
-            }
+            let has_dynamic_range = min_lua_expr.is_some() || max_lua_expr.is_some();
+            if !has_dynamic_range {
+                if min > max {
+                    diagnostics.report(
+                        DiagnosticKind::InvalidDeclarationArgument {
+                            name: control_name.clone(),
+                            message: format!("'min' ({min}) cannot be greater than 'max' ({max})"),
+                        },
+                        span,
+                    );
+                    return None;
+                }
 
-            if default < min || default > max {
-                diagnostics.report(
-                    DiagnosticKind::InvalidDeclarationArgument {
-                        name: control_name.clone(),
-                        message: format!("'default' ({default}) is outside range [{min}, {max}]"),
-                    },
-                    span,
-                );
-                return None;
+                if default_lua_expr.is_none() && (default < min || default > max) {
+                    diagnostics.report(
+                        DiagnosticKind::InvalidDeclarationArgument {
+                            name: control_name.clone(),
+                            message: format!(
+                                "'default' ({default}) is outside range [{min}, {max}]"
+                            ),
+                        },
+                        span,
+                    );
+                    return None;
+                }
+            } else {
+                if max < min {
+                    max = min;
+                }
+                default = default.clamp(min, max);
             }
 
             if kind_str == "Fader" {
@@ -1130,11 +1525,34 @@ fn try_parse_control(
             };
             let btn_type = match kwargs.iter().find(|(k, _)| k == "type") {
                 Some((_, val)) => {
-                    match eval_constant(val).and_then(|c| c.as_str().map(String::from)) {
-                        Some(ref s) if s == "Momentary" => ButtonType::Momentary,
-                        Some(ref s) if s == "Trigger" => ButtonType::Trigger,
-                        Some(ref s) if s == "Toggle" => ButtonType::Toggle,
-                        _ => {
+                    let Some((s, lua_opt)) =
+                        resolve_design_str_arg(class_name, val, ui_env, prop_resolutions)
+                    else {
+                        diagnostics.report(
+                            DiagnosticKind::InvalidDeclarationArgument {
+                                name: control_name.clone(),
+                                message: "Invalid button 'type'. Expected 'Momentary', 'Toggle', or 'Trigger'".to_string(),
+                            },
+                            val.span,
+                        );
+                        return None;
+                    };
+                    let parsed = match s.as_str() {
+                        "Momentary" => Some(ButtonType::Momentary),
+                        "Trigger" => Some(ButtonType::Trigger),
+                        "Toggle" => Some(ButtonType::Toggle),
+                        _ => None,
+                    };
+                    match (parsed, lua_opt) {
+                        (Some(bt), lua) => {
+                            button_type_lua_expr = lua;
+                            bt
+                        }
+                        (None, Some(lua)) => {
+                            button_type_lua_expr = Some(lua);
+                            default_btn_type
+                        }
+                        (None, None) => {
                             diagnostics.report(
                                 DiagnosticKind::InvalidDeclarationArgument {
                                     name: control_name.clone(),
@@ -1156,8 +1574,11 @@ fn try_parse_control(
         "Text" => {
             let default = match kwargs.iter().find(|(k, _)| k == "default") {
                 Some((_, val)) => {
-                    match eval_constant(val).and_then(|c| c.as_str().map(String::from)) {
-                        Some(s) => s,
+                    match resolve_design_str_arg(class_name, val, ui_env, prop_resolutions) {
+                        Some((s, lua_opt)) => {
+                            default_lua_expr = lua_opt;
+                            s
+                        }
                         None => {
                             diagnostics.report(
                                 DiagnosticKind::InvalidDeclarationArgument {
@@ -1174,10 +1595,34 @@ fn try_parse_control(
             };
             let text_type = match kwargs.iter().find(|(k, _)| k == "type") {
                 Some((_, val)) => {
-                    match eval_constant(val).and_then(|c| c.as_str().map(String::from)) {
-                        Some(ref s) if s == "Text" => TextType::Text,
-                        Some(ref s) if s == "ReadOnly" => TextType::ReadOnly,
-                        _ => {
+                    let Some((s, lua_opt)) =
+                        resolve_design_str_arg(class_name, val, ui_env, prop_resolutions)
+                    else {
+                        diagnostics.report(
+                            DiagnosticKind::InvalidDeclarationArgument {
+                                name: control_name.clone(),
+                                message: "Invalid text 'type'. Expected 'Text' or 'ReadOnly'"
+                                    .to_string(),
+                            },
+                            val.span,
+                        );
+                        return None;
+                    };
+                    let parsed = match s.as_str() {
+                        "Text" => Some(TextType::Text),
+                        "ReadOnly" => Some(TextType::ReadOnly),
+                        _ => None,
+                    };
+                    match (parsed, lua_opt) {
+                        (Some(tt), lua) => {
+                            text_type_lua_expr = lua;
+                            tt
+                        }
+                        (None, Some(lua)) => {
+                            text_type_lua_expr = Some(lua);
+                            TextType::Text
+                        }
+                        (None, None) => {
                             diagnostics.report(
                                 DiagnosticKind::InvalidDeclarationArgument {
                                     name: control_name.clone(),
@@ -1196,7 +1641,8 @@ fn try_parse_control(
         }
 
         "Indicator" => {
-            let unit = parse_unit(diagnostics)?;
+            let (unit, u_lua) = parse_unit(prop_resolutions, diagnostics)?;
+            unit_lua_expr = u_lua;
             ControlKind::Indicator { unit }
         }
 
@@ -1205,8 +1651,12 @@ fn try_parse_control(
             let default = kwargs
                 .iter()
                 .find(|(k, _)| k == "default")
-                .and_then(|(_, v)| eval_constant(v))
-                .and_then(|c| c.as_str().map(String::from))
+                .and_then(|(_, v)| {
+                    let (s, lua_opt) =
+                        resolve_design_str_arg(class_name, v, ui_env, prop_resolutions)?;
+                    default_lua_expr = lua_opt;
+                    Some(s)
+                })
                 .unwrap_or_else(|| "255.255.255.255".to_string());
 
             ControlKind::Text {
@@ -1220,8 +1670,12 @@ fn try_parse_control(
             let default = kwargs
                 .iter()
                 .find(|(k, _)| k == "default")
-                .and_then(|(_, v)| eval_constant(v))
-                .and_then(|c| c.as_str().map(String::from))
+                .and_then(|(_, v)| {
+                    let (s, lua_opt) =
+                        resolve_design_str_arg(class_name, v, ui_env, prop_resolutions)?;
+                    default_lua_expr = lua_opt;
+                    Some(s)
+                })
                 .unwrap_or_else(|| "00:00:00:00:00:00".to_string());
 
             ControlKind::Text {
@@ -1260,31 +1714,69 @@ fn try_parse_control(
                 diagnostics,
             )?;
 
-            let unit = parse_unit(diagnostics)?;
-            let min = kwargs
-                .iter()
-                .find(|(k, _)| k == "min")
-                .and_then(|(_, v)| eval_constant(v))
-                .and_then(|c| c.as_f64())
-                .unwrap_or(0.0);
-            let max = kwargs
-                .iter()
-                .find(|(k, _)| k == "max")
-                .and_then(|(_, v)| eval_constant(v))
-                .and_then(|c| c.as_f64())
-                .unwrap_or(100.0);
+            let (unit, u_lua) = parse_unit(prop_resolutions, diagnostics)?;
+            unit_lua_expr = u_lua;
 
+            let min = match kwargs.iter().find(|(k, _)| k == "min") {
+                Some((_, val)) => {
+                    let (m, m_lua) = resolve_design_num_arg(
+                        class_name,
+                        val,
+                        &control_name,
+                        "min",
+                        ui_env,
+                        prop_resolutions,
+                        diagnostics,
+                    )?;
+                    min_lua_expr = m_lua;
+                    m
+                }
+                None => 0.0,
+            };
+            let max = match kwargs.iter().find(|(k, _)| k == "max") {
+                Some((_, val)) => {
+                    let (m, mx_lua) = resolve_design_num_arg(
+                        class_name,
+                        val,
+                        &control_name,
+                        "max",
+                        ui_env,
+                        prop_resolutions,
+                        diagnostics,
+                    )?;
+                    max_lua_expr = mx_lua;
+                    m
+                }
+                None => 100.0,
+            };
+
+            let mut has_explicit_default = false;
             let (default_num, default_str) = match kwargs.iter().find(|(k, _)| k == "default") {
-                Some((_, val)) => match eval_constant(val) {
-                    Some(ConstValue::Float(f)) => (f, f.to_string()),
-                    Some(ConstValue::Int(i)) => (i as f64, i.to_string()),
-                    Some(ConstValue::String(s)) => {
-                        let num = s.parse::<f64>().unwrap_or(min);
-                        (num, s)
+                Some((_, val)) => {
+                    has_explicit_default = true;
+                    ui_env.collect_property_resolutions(class_name, val, prop_resolutions);
+                    if !ui_env.is_dynamic_design_expr(class_name, val) {
+                        match eval_constant_with_env(val, &ui_env.constants) {
+                            Some(ConstValue::Float(f)) => (f, f.to_string()),
+                            Some(ConstValue::Int(i)) => (i as f64, i.to_string()),
+                            Some(ConstValue::String(s)) => {
+                                let num = s.parse::<f64>().unwrap_or(min);
+                                (num, s)
+                            }
+                            Some(ConstValue::Bool(b)) => (if b { 1.0 } else { 0.0 }, b.to_string()),
+                            _ => (min, String::new()),
+                        }
+                    } else {
+                        default_lua_expr = Some(ui_env.lower_design_expr_to_lua(class_name, val));
+                        if let Some(pv) = ui_env.eval_design_expr_preview(class_name, val) {
+                            let s = pv.to_display_string();
+                            let num = pv.as_f64().or_else(|| s.parse::<f64>().ok()).unwrap_or(min);
+                            (num, s)
+                        } else {
+                            (min, String::new())
+                        }
                     }
-                    Some(ConstValue::Bool(b)) => (if b { 1.0 } else { 0.0 }, b.to_string()),
-                    _ => (min, String::new()),
-                },
+                }
                 None => (min, String::new()),
             };
 
@@ -1297,6 +1789,7 @@ fn try_parse_control(
                 max,
                 default_num,
                 default_str,
+                has_explicit_default,
                 button_type: ButtonType::Toggle,
                 text_type: TextType::Text,
             };
@@ -1308,6 +1801,14 @@ fn try_parse_control(
                 .with_count_property(count_property)
                 .with_grid_dimensions(rows, cols, rows_property, cols_property, explicit_2d)
                 .with_generic_spec(Some(gspec));
+            def.min_lua_expr = min_lua_expr;
+            def.max_lua_expr = max_lua_expr;
+            def.default_lua_expr = default_lua_expr;
+            def.unit_lua_expr = unit_lua_expr;
+            def.pin_style_lua_expr = pin_style_lua_expr;
+            def.user_pin_lua_expr = user_pin_lua_expr;
+            def.button_type_lua_expr = button_type_lua_expr;
+            def.text_type_lua_expr = text_type_lua_expr;
             if count > 1 {
                 def = def.with_count(count);
             }
@@ -1328,6 +1829,14 @@ fn try_parse_control(
         .with_user_pin(user_pin)
         .with_count_property(count_property)
         .with_grid_dimensions(rows, cols, rows_property, cols_property, explicit_2d);
+    def.min_lua_expr = min_lua_expr;
+    def.max_lua_expr = max_lua_expr;
+    def.default_lua_expr = default_lua_expr;
+    def.unit_lua_expr = unit_lua_expr;
+    def.pin_style_lua_expr = pin_style_lua_expr;
+    def.user_pin_lua_expr = user_pin_lua_expr;
+    def.button_type_lua_expr = button_type_lua_expr;
+    def.text_type_lua_expr = text_type_lua_expr;
     if count > 1 {
         def = def.with_count(count);
     }
@@ -1338,6 +1847,7 @@ fn try_parse_property(
     var_name: &str,
     expr: &ast::Expr,
     span: Span,
+    constants: &FxHashMap<String, ConstValue>,
     diagnostics: &mut Diagnostics,
 ) -> Option<PropertyDef> {
     let (kind_str, args, kwargs) = match &expr.kind {
@@ -1358,11 +1868,11 @@ fn try_parse_property(
     let prop_name = kwargs
         .iter()
         .find(|(k, _)| k == "name")
-        .and_then(|(_, v)| eval_constant(v))
+        .and_then(|(_, v)| eval_constant_with_env(v, constants))
         .and_then(|c| c.as_str().map(String::from))
         .or_else(|| {
             args.first()
-                .and_then(eval_constant)
+                .and_then(|e| eval_constant_with_env(e, constants))
                 .and_then(|c| c.as_str().map(String::from))
         })
         .unwrap_or_else(|| var_name.to_string());
@@ -1370,7 +1880,7 @@ fn try_parse_property(
     let description = kwargs
         .iter()
         .find(|(k, _)| k == "description")
-        .and_then(|(_, v)| eval_constant(v))
+        .and_then(|(_, v)| eval_constant_with_env(v, constants))
         .and_then(|c| c.as_str().map(String::from));
 
     let prop = match kind_str {
@@ -1378,18 +1888,18 @@ fn try_parse_property(
             let default = kwargs
                 .iter()
                 .find(|(k, _)| k == "default")
-                .and_then(|(_, v)| eval_constant(v))
+                .and_then(|(_, v)| eval_constant_with_env(v, constants))
                 .and_then(|c| c.as_i64())
                 .unwrap_or(0);
             let min = kwargs
                 .iter()
                 .find(|(k, _)| k == "min")
-                .and_then(|(_, v)| eval_constant(v))
+                .and_then(|(_, v)| eval_constant_with_env(v, constants))
                 .and_then(|c| c.as_i64());
             let max = kwargs
                 .iter()
                 .find(|(k, _)| k == "max")
-                .and_then(|(_, v)| eval_constant(v))
+                .and_then(|(_, v)| eval_constant_with_env(v, constants))
                 .and_then(|c| c.as_i64());
             PropertyDef::integer(prop_name, default, min, max)
         }
@@ -1398,18 +1908,18 @@ fn try_parse_property(
             let default = kwargs
                 .iter()
                 .find(|(k, _)| k == "default")
-                .and_then(|(_, v)| eval_constant(v))
+                .and_then(|(_, v)| eval_constant_with_env(v, constants))
                 .and_then(|c| c.as_f64())
                 .unwrap_or(0.0);
             let min = kwargs
                 .iter()
                 .find(|(k, _)| k == "min")
-                .and_then(|(_, v)| eval_constant(v))
+                .and_then(|(_, v)| eval_constant_with_env(v, constants))
                 .and_then(|c| c.as_f64());
             let max = kwargs
                 .iter()
                 .find(|(k, _)| k == "max")
-                .and_then(|(_, v)| eval_constant(v))
+                .and_then(|(_, v)| eval_constant_with_env(v, constants))
                 .and_then(|c| c.as_f64());
             PropertyDef::double(prop_name, default, min, max)
         }
@@ -1418,7 +1928,7 @@ fn try_parse_property(
             let default = kwargs
                 .iter()
                 .find(|(k, _)| k == "default")
-                .and_then(|(_, v)| eval_constant(v))
+                .and_then(|(_, v)| eval_constant_with_env(v, constants))
                 .and_then(|c| c.as_str().map(String::from))
                 .unwrap_or_default();
             PropertyDef::string(prop_name, default)
@@ -1428,7 +1938,7 @@ fn try_parse_property(
             let default = kwargs
                 .iter()
                 .find(|(k, _)| k == "default")
-                .and_then(|(_, v)| eval_constant(v))
+                .and_then(|(_, v)| eval_constant_with_env(v, constants))
                 .and_then(|c| c.as_bool())
                 .unwrap_or(false);
             PropertyDef::boolean(prop_name, default)
@@ -1436,7 +1946,7 @@ fn try_parse_property(
 
         "Enum" => {
             let choices = match kwargs.iter().find(|(k, _)| k == "choices") {
-                Some((_, val)) => match eval_constant(val) {
+                Some((_, val)) => match eval_constant_with_env(val, constants) {
                     Some(ConstValue::List(items)) => {
                         let mut strings = Vec::new();
                         for item in items {
@@ -1491,7 +2001,9 @@ fn try_parse_property(
 
             let default = match kwargs.iter().find(|(k, _)| k == "default") {
                 Some((_, val)) => {
-                    match eval_constant(val).and_then(|c| c.as_str().map(String::from)) {
+                    match eval_constant_with_env(val, constants)
+                        .and_then(|c| c.as_str().map(String::from))
+                    {
                         Some(d) => {
                             if !choices.contains(&d) {
                                 diagnostics.report(
@@ -1542,8 +2054,13 @@ fn try_parse_property(
     })
 }
 
-fn try_parse_metadata(var_name: &str, value: &ast::Expr, info: &mut PluginInfo) -> bool {
-    let const_val = eval_constant(value);
+fn try_parse_metadata(
+    var_name: &str,
+    value: &ast::Expr,
+    constants: &FxHashMap<String, ConstValue>,
+    info: &mut PluginInfo,
+) -> bool {
+    let const_val = eval_constant_with_env(value, constants);
     match var_name {
         "name" => {
             if let Some(s) = const_val.and_then(|c| c.as_str().map(String::from)) {

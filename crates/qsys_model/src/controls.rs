@@ -134,6 +134,8 @@ pub struct GenericControlSpec {
     pub max: f64,
     pub default_num: f64,
     pub default_str: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub has_explicit_default: bool,
     pub button_type: ButtonType,
     pub text_type: TextType,
 }
@@ -205,6 +207,22 @@ pub struct ControlDef {
     pub generic_spec: Option<GenericControlSpec>,
     pub pin_style: PinStyle,
     pub user_pin: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_lua_expr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_lua_expr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_lua_expr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit_lua_expr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pin_style_lua_expr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_pin_lua_expr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub button_type_lua_expr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_type_lua_expr: Option<String>,
 }
 
 impl ControlDef {
@@ -222,6 +240,14 @@ impl ControlDef {
             generic_spec: None,
             pin_style: PinStyle::Both,
             user_pin: true,
+            min_lua_expr: None,
+            max_lua_expr: None,
+            default_lua_expr: None,
+            unit_lua_expr: None,
+            pin_style_lua_expr: None,
+            user_pin_lua_expr: None,
+            button_type_lua_expr: None,
+            text_type_lua_expr: None,
         }
     }
 

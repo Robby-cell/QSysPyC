@@ -8,7 +8,7 @@ use qsys_model::{
 
 use crate::context::CodegenContext;
 use crate::emitter::{
-    LuaEmitter, escape_lua_string, format_count_lua_expr, format_lua_float,
+    LuaEmitter, escape_lua_string, format_count_lua_expr, format_lua_float, is_pure_const_expr,
     stmts_reference_function,
 };
 
@@ -45,8 +45,36 @@ pub fn emit_plugin(plugin: &IRPlugin, ctx: &mut CodegenContext) -> String {
     // Emit top-level statements and helper classes with declaration hoisting
     emitter.emit_hoisted_statements(&plugin.top_level_stmts);
 
+    // Hoist pure constant class-body assignments so both design-time and runtime methods can reference them
+    let mut hoisted_init_indices = HashSet::new();
+    for (idx, stmt) in plugin.init_body.iter().enumerate() {
+        if let IRStmt::Assign {
+            target: IRExpr::Local(_),
+            value,
+            ..
+        } = stmt
+            && is_pure_const_expr(value)
+        {
+            emitter.emit_statements(std::slice::from_ref(stmt));
+            hoisted_init_indices.insert(idx);
+        }
+    }
+    if !hoisted_init_indices.is_empty() {
+        emitter.write_line("");
+    }
+
     // Emit PluginInfo
     emit_plugin_info(&mut emitter, &plugin.info);
+
+    let hoisted_method_ids = collect_design_time_hoisted_methods(plugin);
+    if !hoisted_method_ids.is_empty() {
+        let hoisted_methods: Vec<&IRFunction> = plugin
+            .methods
+            .iter()
+            .filter(|m| hoisted_method_ids.contains(&m.id))
+            .collect();
+        emit_method_group(&mut emitter, &plugin.class_name, &hoisted_methods);
+    }
 
     if let Some(m) = plugin.methods.iter().find(|m| m.name == "get_properties") {
         emit_lifecycle_method(&mut emitter, "GetProperties", m);
@@ -77,20 +105,27 @@ pub fn emit_plugin(plugin: &IRPlugin, ctx: &mut CodegenContext) -> String {
         emit_get_pages(&mut emitter, &plugin.pages);
     }
 
-    if let Some(m) = plugin.methods.iter().find(|m| m.name == "get_controls") {
-        emit_lifecycle_method(&mut emitter, "GetControls", m);
-    } else {
-        emit_get_controls(&mut emitter, &plugin.controls);
-    }
+    let controls_use_hoisted_methods = !hoisted_method_ids.is_empty()
+        && plugin.controls.iter().any(|c| {
+            plugin
+                .methods
+                .iter()
+                .filter(|m| hoisted_method_ids.contains(&m.id))
+                .any(|m| {
+                    let fn_name = format!("{}_{}", plugin.class_name, m.name);
+                    control_references_fn_name(&c.def, &fn_name)
+                })
+        });
 
-    let hoisted_method_ids = collect_design_time_hoisted_methods(plugin);
-    if !hoisted_method_ids.is_empty() {
-        let hoisted_methods: Vec<&IRFunction> = plugin
-            .methods
-            .iter()
-            .filter(|m| hoisted_method_ids.contains(&m.id))
-            .collect();
-        emit_method_group(&mut emitter, &plugin.class_name, &hoisted_methods);
+    if let Some(m) = plugin.methods.iter().find(|m| m.name == "get_controls") {
+        emit_lifecycle_method_with_alias(
+            &mut emitter,
+            "GetControls",
+            m,
+            !hoisted_method_ids.is_empty(),
+        );
+    } else {
+        emit_get_controls(&mut emitter, &plugin.controls, controls_use_hoisted_methods);
     }
 
     if let Some(m) = plugin
@@ -266,10 +301,17 @@ pub fn emit_plugin(plugin: &IRPlugin, ctx: &mut CodegenContext) -> String {
         }
     }
 
-    // Emit plugin initialization statements
-    if !plugin.init_body.is_empty() {
+    // Emit plugin initialization statements (excluding already-hoisted pure constants)
+    let remaining_init_body: Vec<IRStmt> = plugin
+        .init_body
+        .iter()
+        .enumerate()
+        .filter(|(idx, _)| !hoisted_init_indices.contains(idx))
+        .map(|(_, s)| s.clone())
+        .collect();
+    if !remaining_init_body.is_empty() {
         emitter.write_line("-- Plugin initialization");
-        emitter.emit_statements(&plugin.init_body);
+        emitter.emit_statements(&remaining_init_body);
     }
 
     // Invoke runtime(self) if implemented
@@ -388,10 +430,14 @@ fn emit_control_table_insert(
 
     match kind {
         ControlKind::Button { button_type } => {
-            emitter.write_line(&format!(
-                "ButtonType = {},",
-                escape_lua_string(button_type.as_str())
-            ));
+            if let Some(ref expr) = c.def.button_type_lua_expr {
+                emitter.write_line(&format!("ButtonType = {expr},"));
+            } else {
+                emitter.write_line(&format!(
+                    "ButtonType = {},",
+                    escape_lua_string(button_type.as_str())
+                ));
+            }
         }
         ControlKind::Knob {
             unit,
@@ -405,34 +451,85 @@ fn emit_control_table_insert(
             max,
             default,
         } => {
-            emitter.write_line(&format!(
-                "ControlUnit = {},",
-                escape_lua_string(unit.as_str())
-            ));
-            emitter.write_line(&format!("Min = {},", format_lua_float(*min)));
-            emitter.write_line(&format!("Max = {},", format_lua_float(*max)));
-            emitter.write_line(&format!("DefaultValue = {},", format_lua_float(*default)));
+            if let Some(ref expr) = c.def.unit_lua_expr {
+                emitter.write_line(&format!("ControlUnit = {expr},"));
+            } else {
+                emitter.write_line(&format!(
+                    "ControlUnit = {},",
+                    escape_lua_string(unit.as_str())
+                ));
+            }
+            if let Some(ref expr) = c.def.min_lua_expr {
+                emitter.write_line(&format!("Min = {expr},"));
+            } else {
+                emitter.write_line(&format!("Min = {},", format_lua_float(*min)));
+            }
+            if let Some(ref expr) = c.def.max_lua_expr {
+                emitter.write_line(&format!("Max = {expr},"));
+            } else {
+                emitter.write_line(&format!("Max = {},", format_lua_float(*max)));
+            }
+            let default_expr = c.def.default_lua_expr.as_deref().or_else(|| {
+                if c.def
+                    .generic_spec
+                    .as_ref()
+                    .is_some_and(|g| !g.has_explicit_default)
+                {
+                    c.def.min_lua_expr.as_deref()
+                } else {
+                    None
+                }
+            });
+            if let Some(expr) = default_expr {
+                emitter.write_line(&format!("DefaultValue = {expr},"));
+            } else {
+                emitter.write_line(&format!("DefaultValue = {},", format_lua_float(*default)));
+            }
         }
         ControlKind::Text { text_type, default } => {
-            emitter.write_line(&format!(
-                "TextType = {},",
-                escape_lua_string(text_type.as_str())
-            ));
-            emitter.write_line(&format!("String = {},", escape_lua_string(default)));
+            if let Some(ref expr) = c.def.text_type_lua_expr {
+                emitter.write_line(&format!("TextType = {expr},"));
+            } else {
+                emitter.write_line(&format!(
+                    "TextType = {},",
+                    escape_lua_string(text_type.as_str())
+                ));
+            }
+            if let Some(ref expr) = c.def.default_lua_expr {
+                if c.def.generic_spec.is_some() {
+                    emitter.write_line(&format!("String = tostring({expr}),"));
+                } else {
+                    emitter.write_line(&format!("String = {expr},"));
+                }
+            } else {
+                emitter.write_line(&format!("String = {},", escape_lua_string(default)));
+            }
         }
         ControlKind::Indicator { unit } => {
-            emitter.write_line(&format!(
-                "ControlUnit = {},",
-                escape_lua_string(unit.as_str())
-            ));
+            if let Some(ref expr) = c.def.unit_lua_expr {
+                emitter.write_line(&format!("ControlUnit = {expr},"));
+            } else {
+                emitter.write_line(&format!(
+                    "ControlUnit = {},",
+                    escape_lua_string(unit.as_str())
+                ));
+            }
         }
     }
 
-    emitter.write_line(&format!(
-        "PinStyle = {},",
-        escape_lua_string(c.def.pin_style.as_str())
-    ));
-    emitter.write_line(&format!("UserPin = {},", c.def.user_pin));
+    if let Some(ref expr) = c.def.pin_style_lua_expr {
+        emitter.write_line(&format!("PinStyle = {expr},"));
+    } else {
+        emitter.write_line(&format!(
+            "PinStyle = {},",
+            escape_lua_string(c.def.pin_style.as_str())
+        ));
+    }
+    if let Some(ref expr) = c.def.user_pin_lua_expr {
+        emitter.write_line(&format!("UserPin = {expr},"));
+    } else {
+        emitter.write_line(&format!("UserPin = {},", c.def.user_pin));
+    }
     if let Some(ref prop_name) = c.def.count_property {
         emitter.write_line(&format!(
             "Count = {},",
@@ -446,9 +543,16 @@ fn emit_control_table_insert(
     emitter.write_line("})");
 }
 
-fn emit_get_controls(emitter: &mut LuaEmitter<'_>, controls: &[IRControlBinding]) {
+fn emit_get_controls(
+    emitter: &mut LuaEmitter<'_>,
+    controls: &[IRControlBinding],
+    needs_props_alias: bool,
+) {
     emitter.write_line("function GetControls(props)");
     emitter.indent();
+    if needs_props_alias {
+        emitter.write_line("if not Controls then Properties = props end");
+    }
     emitter.write_line("local ctls = {}");
 
     for c in controls {
@@ -1294,6 +1398,53 @@ fn stmts_emit_page_referencing_fn_name(stmts: &[IRStmt], fn_name: &str) -> bool 
     })
 }
 
+fn control_references_fn_name(def: &qsys_model::ControlDef, fn_name: &str) -> bool {
+    let call_prefix = format!("{fn_name}(");
+    def.count_property
+        .as_ref()
+        .is_some_and(|e| e.contains(&call_prefix))
+        || def
+            .rows_property
+            .as_ref()
+            .is_some_and(|e| e.contains(&call_prefix))
+        || def
+            .cols_property
+            .as_ref()
+            .is_some_and(|e| e.contains(&call_prefix))
+        || def
+            .min_lua_expr
+            .as_ref()
+            .is_some_and(|e| e.contains(&call_prefix))
+        || def
+            .max_lua_expr
+            .as_ref()
+            .is_some_and(|e| e.contains(&call_prefix))
+        || def
+            .default_lua_expr
+            .as_ref()
+            .is_some_and(|e| e.contains(&call_prefix))
+        || def
+            .unit_lua_expr
+            .as_ref()
+            .is_some_and(|e| e.contains(&call_prefix))
+        || def
+            .pin_style_lua_expr
+            .as_ref()
+            .is_some_and(|e| e.contains(&call_prefix))
+        || def
+            .user_pin_lua_expr
+            .as_ref()
+            .is_some_and(|e| e.contains(&call_prefix))
+        || def
+            .button_type_lua_expr
+            .as_ref()
+            .is_some_and(|e| e.contains(&call_prefix))
+        || def
+            .text_type_lua_expr
+            .as_ref()
+            .is_some_and(|e| e.contains(&call_prefix))
+}
+
 fn collect_design_time_hoisted_methods(plugin: &IRPlugin) -> HashSet<FunctionId> {
     let mut hoisted = HashSet::new();
 
@@ -1302,6 +1453,10 @@ fn collect_design_time_hoisted_methods(plugin: &IRPlugin) -> HashSet<FunctionId>
             continue;
         }
         let fn_name = format!("{}_{}", plugin.class_name, cand.name);
+        let used_in_controls = plugin
+            .controls
+            .iter()
+            .any(|c| control_references_fn_name(&c.def, &fn_name));
         let used_in_pages = plugin
             .pages
             .iter()
@@ -1315,7 +1470,7 @@ fn collect_design_time_hoisted_methods(plugin: &IRPlugin) -> HashSet<FunctionId>
                     || stmts_emit_page_referencing_fn_name(&m.body, &fn_name)
             });
 
-        if used_in_pages || used_in_lifecycle {
+        if used_in_controls || used_in_pages || used_in_lifecycle {
             hoisted.insert(cand.id);
         }
     }
