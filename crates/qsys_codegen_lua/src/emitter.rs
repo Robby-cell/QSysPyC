@@ -77,18 +77,33 @@ impl<'a> LuaEmitter<'a> {
 
         // 2. Emit pure constant assignments (`CONST = 42`) before classes and functions
         let mut emitted_const_indices = HashSet::new();
+        let mut non_const_assigned_locals = HashSet::new();
         for (idx, stmt) in stmts.iter().enumerate() {
             if let IRStmt::Assign { target, value, .. } = stmt {
+                let mut target_syms = Vec::new();
                 let is_local_target = match target {
-                    IRExpr::Local(_) => true,
+                    IRExpr::Local(id) => {
+                        target_syms.push(*id);
+                        true
+                    }
                     IRExpr::Tuple(items) => {
-                        !items.is_empty() && items.iter().all(|i| matches!(i, IRExpr::Local(_)))
+                        for item in items {
+                            if let IRExpr::Local(id) = item {
+                                target_syms.push(*id);
+                            }
+                        }
+                        !items.is_empty() && target_syms.len() == items.len()
                     }
                     _ => false,
                 };
-                if is_local_target && is_pure_const_expr(value) {
+                let already_tainted = target_syms
+                    .iter()
+                    .any(|id| non_const_assigned_locals.contains(id));
+                if is_local_target && !already_tainted && is_pure_const_expr(value) {
                     self.emit_stmt(stmt);
                     emitted_const_indices.insert(idx);
+                } else {
+                    non_const_assigned_locals.extend(target_syms);
                 }
             }
         }
@@ -326,6 +341,7 @@ impl<'a> LuaEmitter<'a> {
                 target_id,
                 target_name,
                 iterable,
+                is_dict,
                 body,
                 ..
             } => {
@@ -335,7 +351,10 @@ impl<'a> LuaEmitter<'a> {
                 self.ctx.declared_locals.insert(*target_id);
                 let var_name = self.ctx.get_symbol_name(*target_id);
 
-                if let IRExpr::Call {
+                if *is_dict {
+                    let iter_str = self.emit_expr(iterable);
+                    self.write_line(&format!("for {var_name} in pairs({iter_str}) do"));
+                } else if let IRExpr::Call {
                     callee,
                     args,
                     kwargs,
@@ -368,6 +387,48 @@ impl<'a> LuaEmitter<'a> {
                             self.write_line(&format!("for _, {var_name} in ipairs({iter_str}) do"));
                         }
                     }
+                } else if let IRExpr::Call {
+                    callee,
+                    args,
+                    kwargs,
+                } = iterable
+                    && kwargs.is_empty()
+                    && (1..=2).contains(&args.len())
+                    && matches!(callee.as_ref(), IRExpr::Global(g) if g == "enumerate")
+                {
+                    let inner_str = self.emit_expr(&args[0]);
+                    let start_offset = if args.len() == 2 {
+                        self.emit_expr(&args[1])
+                    } else {
+                        "0".to_string()
+                    };
+                    let parts: Vec<&str> = target_name
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                    if parts.len() == 2 {
+                        let idx_name = parts[0];
+                        let val_name = parts[1];
+                        self.write_line(&format!("for _idx, {val_name} in ipairs({inner_str}) do"));
+                        self.indent();
+                        self.write_line(&format!(
+                            "local {idx_name} = (_idx - 1) + ({start_offset})"
+                        ));
+                        self.emit_statements(body);
+                        self.dedent();
+                        self.write_line("end");
+                        return;
+                    }
+                    self.write_line(&format!("for _idx, _val in ipairs({inner_str}) do"));
+                    self.indent();
+                    self.write_line(&format!(
+                        "local {var_name} = {{ (_idx - 1) + ({start_offset}), _val }}"
+                    ));
+                    self.emit_statements(body);
+                    self.dedent();
+                    self.write_line("end");
+                    return;
                 } else if let IRExpr::Control(ctl_id) = iterable {
                     self.ctx.local_controls.insert(*target_id, *ctl_id);
                     if let Some(def) = self.ctx.controls.get(ctl_id)
@@ -382,6 +443,15 @@ impl<'a> LuaEmitter<'a> {
                         let iter_str = self.emit_expr(iterable);
                         self.write_line(&format!("for _, {var_name} in ipairs({iter_str}) do"));
                     }
+                } else if target_name.contains(',') {
+                    let iter_str = self.emit_expr(iterable);
+                    self.write_line(&format!("for _, _item in ipairs({iter_str}) do"));
+                    self.indent();
+                    self.write_line(&format!("local {var_name} = table.unpack(_item)"));
+                    self.emit_statements(body);
+                    self.dedent();
+                    self.write_line("end");
+                    return;
                 } else {
                     let iter_str = self.emit_expr(iterable);
                     self.write_line(&format!("for _, {var_name} in ipairs({iter_str}) do"));
@@ -871,6 +941,123 @@ impl<'a> LuaEmitter<'a> {
                 }
             }
 
+            IRExpr::ListComp { elt, generators } => {
+                let mut header = String::from("(function() local _comp = {}");
+                let mut closers = String::new();
+                for g in generators {
+                    for (t_id, t_name) in &g.targets {
+                        self.ctx.symbol_names.insert(*t_id, t_name.clone());
+                        self.ctx.declared_locals.insert(*t_id);
+                    }
+                    let first_name = g.targets.first().map(|(_, n)| n.as_str()).unwrap_or("_x");
+                    if let IRExpr::Call {
+                        callee,
+                        args,
+                        kwargs,
+                    } = &g.iterable
+                        && kwargs.is_empty()
+                        && matches!(callee.as_ref(), IRExpr::Global(n) if n == "range")
+                    {
+                        match args.as_slice() {
+                            [end_expr] => {
+                                let end_str = self.emit_expr(end_expr);
+                                header.push_str(&format!(
+                                    " for {first_name} = 0, ({end_str}) - 1 do"
+                                ));
+                            }
+                            [start_expr, end_expr] => {
+                                let start_str = self.emit_expr(start_expr);
+                                let end_str = self.emit_expr(end_expr);
+                                header.push_str(&format!(
+                                    " for {first_name} = {start_str}, ({end_str}) - 1 do"
+                                ));
+                            }
+                            [start_expr, end_expr, step_expr] => {
+                                let start_str = self.emit_expr(start_expr);
+                                let end_str = self.emit_expr(end_expr);
+                                let step_str = self.emit_expr(step_expr);
+                                let bound_op = match step_expr {
+                                    IRExpr::Unary {
+                                        op: IRUnaryOp::Neg, ..
+                                    } => "+",
+                                    IRExpr::Int(s) if *s < 0 => "+",
+                                    _ => "-",
+                                };
+                                header.push_str(&format!(
+                                    " for {first_name} = {start_str}, ({end_str}) {bound_op} 1, {step_str} do"
+                                ));
+                            }
+                            _ => {
+                                let iter_str = self.emit_expr(&g.iterable);
+                                header.push_str(&format!(
+                                    " for _, {first_name} in ipairs({iter_str}) do"
+                                ));
+                            }
+                        }
+                        closers.push_str(" end");
+                    } else if let IRExpr::Call {
+                        callee,
+                        args,
+                        kwargs,
+                    } = &g.iterable
+                        && kwargs.is_empty()
+                        && (1..=2).contains(&args.len())
+                        && matches!(callee.as_ref(), IRExpr::Global(n) if n == "enumerate")
+                    {
+                        let inner_str = self.emit_expr(&args[0]);
+                        let start_offset = if args.len() == 2 {
+                            self.emit_expr(&args[1])
+                        } else {
+                            "0".to_string()
+                        };
+                        if g.targets.len() == 2 {
+                            let idx_name = &g.targets[0].1;
+                            let val_name = &g.targets[1].1;
+                            header.push_str(&format!(
+                                " for _idx, {val_name} in ipairs({inner_str}) do local {idx_name} = (_idx - 1) + ({start_offset})"
+                            ));
+                        } else {
+                            header.push_str(&format!(
+                                " for _idx, _val in ipairs({inner_str}) do local {first_name} = {{ (_idx - 1) + ({start_offset}), _val }}"
+                            ));
+                        }
+                        closers.push_str(" end");
+                    } else if g.is_dict {
+                        let iter_str = self.emit_expr(&g.iterable);
+                        let names: Vec<&str> = g.targets.iter().map(|(_, n)| n.as_str()).collect();
+                        let targets_str = if names.is_empty() {
+                            "_k".to_string()
+                        } else {
+                            names.join(", ")
+                        };
+                        header.push_str(&format!(" for {targets_str} in pairs({iter_str}) do"));
+                        closers.push_str(" end");
+                    } else {
+                        let iter_str = self.emit_expr(&g.iterable);
+                        if g.targets.len() > 1 {
+                            let names: Vec<&str> =
+                                g.targets.iter().map(|(_, n)| n.as_str()).collect();
+                            header.push_str(&format!(
+                                " for _, _item in ipairs({iter_str}) do local {} = table.unpack(_item)",
+                                names.join(", ")
+                            ));
+                        } else {
+                            header.push_str(&format!(
+                                " for _, {first_name} in ipairs({iter_str}) do"
+                            ));
+                        }
+                        closers.push_str(" end");
+                    }
+                    for (cond_expr, truthiness) in &g.ifs {
+                        let cond_str = self.emit_truthy_condition(cond_expr, *truthiness);
+                        header.push_str(&format!(" if {cond_str} then"));
+                        closers.push_str(" end");
+                    }
+                }
+                let elt_str = self.emit_expr(elt);
+                format!("{header} table.insert(_comp, {elt_str}){closers} return _comp end)()")
+            }
+
             IRExpr::RawLua(code) => code.clone(),
         }
     }
@@ -1274,6 +1461,15 @@ fn expr_references_function(expr: &IRExpr, fn_id: FunctionId, fn_name: &str) -> 
                 || expr_references_function(body, fn_id, fn_name)
                 || expr_references_function(orelse, fn_id, fn_name)
         }
+        IRExpr::ListComp { elt, generators } => {
+            expr_references_function(elt, fn_id, fn_name)
+                || generators.iter().any(|g| {
+                    expr_references_function(&g.iterable, fn_id, fn_name)
+                        || g.ifs
+                            .iter()
+                            .any(|(c, _)| expr_references_function(c, fn_id, fn_name))
+                })
+        }
         _ => false,
     }
 }
@@ -1372,6 +1568,13 @@ fn expr_references_local(expr: &IRExpr, sym_id: SymbolId) -> bool {
             expr_references_local(test, sym_id)
                 || expr_references_local(body, sym_id)
                 || expr_references_local(orelse, sym_id)
+        }
+        IRExpr::ListComp { elt, generators } => {
+            expr_references_local(elt, sym_id)
+                || generators.iter().any(|g| {
+                    expr_references_local(&g.iterable, sym_id)
+                        || g.ifs.iter().any(|(c, _)| expr_references_local(c, sym_id))
+                })
         }
         _ => false,
     }

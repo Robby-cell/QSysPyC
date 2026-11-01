@@ -120,6 +120,8 @@ pub enum IRStmt {
         target_name: String,
         iterable: IRExpr,
         body: Vec<IRStmt>,
+        #[serde(default)]
+        is_dict: bool,
         span: Span,
     },
     Return {
@@ -240,8 +242,21 @@ pub enum IRExpr {
         body: Box<IRExpr>,
         orelse: Box<IRExpr>,
     },
+    ListComp {
+        elt: Box<IRExpr>,
+        generators: Vec<IRComprehension>,
+    },
 
     RawLua(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IRComprehension {
+    pub targets: Vec<(SymbolId, String)>,
+    pub iterable: IRExpr,
+    pub ifs: Vec<(IRExpr, IRTruthiness)>,
+    #[serde(default)]
+    pub is_dict: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

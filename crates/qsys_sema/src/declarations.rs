@@ -4,7 +4,7 @@ use qsys_diagnostics::{DiagnosticKind, Diagnostics, Span};
 use qsys_ir::{ControlId, PropertyId};
 use qsys_model::{
     ButtonType, ControlDef, ControlKind, ControlUnit, GenericControlSpec, PageLayout, PinStyle,
-    PluginInfo, PropertyDef, TextType,
+    PluginInfo, PropertyDef, PropertyKind, TextType,
 };
 use qsys_parser::ast;
 
@@ -21,6 +21,8 @@ pub enum ConstValue {
     String(String),
     Bool(bool),
     List(Vec<ConstValue>),
+    Dict(Vec<(ConstValue, ConstValue)>),
+    Symbol(String),
 }
 
 impl ConstValue {
@@ -60,6 +62,8 @@ impl ConstValue {
             Self::Float(f) => *f != 0.0,
             Self::String(s) => !s.is_empty(),
             Self::List(items) => !items.is_empty(),
+            Self::Dict(pairs) => !pairs.is_empty(),
+            Self::Symbol(_) => true,
         }
     }
 
@@ -73,6 +77,14 @@ impl ConstValue {
                 let parts: Vec<String> = items.iter().map(Self::to_display_string).collect();
                 format!("[{}]", parts.join(", "))
             }
+            Self::Dict(pairs) => {
+                let parts: Vec<String> = pairs
+                    .iter()
+                    .map(|(k, v)| format!("{}: {}", k.to_display_string(), v.to_display_string()))
+                    .collect();
+                format!("{{{}}}", parts.join(", "))
+            }
+            Self::Symbol(name) => name.clone(),
         }
     }
 }
@@ -88,10 +100,16 @@ pub fn eval_constant_with_env(
         ast::ExprKind::Bool(b) => Some(ConstValue::Bool(*b)),
         ast::ExprKind::Ident(name) => env.get(name).cloned(),
         ast::ExprKind::Attribute { value, attr } => {
-            if let ast::ExprKind::Ident(obj) = &value.kind
-                && obj == "self"
-            {
-                return env.get(attr).cloned();
+            if let ast::ExprKind::Ident(obj) = &value.kind {
+                if obj == "self" {
+                    return env.get(attr).cloned();
+                }
+                if let Some(cval) = env.get(&format!("{obj}.{attr}")) {
+                    return Some(cval.clone());
+                }
+            }
+            if attr == "Value" {
+                return eval_constant_with_env(value, env);
             }
             None
         }
@@ -102,17 +120,47 @@ pub fn eval_constant_with_env(
             }
             Some(ConstValue::List(list))
         }
-        ast::ExprKind::Subscript { value, index } => {
-            let ConstValue::List(items) = eval_constant_with_env(value, env)? else {
-                return None;
-            };
-            let idx = eval_constant_with_env(index, env)?.as_i64()?;
-            if idx >= 0 {
-                items.get(idx as usize).cloned()
-            } else {
-                None
+        ast::ExprKind::Dict(pairs) => {
+            let mut out = Vec::with_capacity(pairs.len());
+            for (k, v) in pairs {
+                let k_val = eval_constant_with_env(k, env)?;
+                let v_val = eval_constant_with_env(v, env)
+                    .unwrap_or_else(|| ConstValue::Symbol("<expr>".to_string()));
+                if let Some(existing) = out.iter_mut().find(|(ek, _)| *ek == k_val) {
+                    existing.1 = v_val;
+                } else {
+                    out.push((k_val, v_val));
+                }
             }
+            Some(ConstValue::Dict(out))
         }
+        ast::ExprKind::ListComp { elt, generators } => {
+            let mut out = Vec::new();
+            eval_const_comprehension(elt, generators, env, &mut out)?;
+            Some(ConstValue::List(out))
+        }
+        ast::ExprKind::Subscript { value, index } => match eval_constant_with_env(value, env)? {
+            ConstValue::List(items) => {
+                let idx = eval_constant_with_env(index, env)?.as_i64()?;
+                let resolved = if idx < 0 {
+                    items.len() as i64 + idx
+                } else {
+                    idx
+                };
+                if resolved >= 0 {
+                    items.get(resolved as usize).cloned()
+                } else {
+                    None
+                }
+            }
+            ConstValue::Dict(pairs) => {
+                let key = eval_constant_with_env(index, env)?;
+                pairs
+                    .into_iter()
+                    .find_map(|(k, v)| if k == key { Some(v) } else { None })
+            }
+            _ => None,
+        },
         ast::ExprKind::Unary { op, operand } => {
             let val = eval_constant_with_env(operand, env)?;
             match op {
@@ -135,108 +183,7 @@ pub fn eval_constant_with_env(
         ast::ExprKind::Binary { left, op, right } => {
             let l = eval_constant_with_env(left, env)?;
             let r = eval_constant_with_env(right, env)?;
-            match (l, op, r) {
-                (ConstValue::String(a), ast::BinaryOp::Add, b) => {
-                    Some(ConstValue::String(format!("{a}{}", b.to_display_string())))
-                }
-                (a, ast::BinaryOp::Add, ConstValue::String(b)) => {
-                    Some(ConstValue::String(format!("{}{b}", a.to_display_string())))
-                }
-                (ConstValue::Int(a), ast::BinaryOp::Add, ConstValue::Int(b)) => {
-                    Some(ConstValue::Int(a.saturating_add(b)))
-                }
-                (ConstValue::Int(a), ast::BinaryOp::Sub, ConstValue::Int(b)) => {
-                    Some(ConstValue::Int(a.saturating_sub(b)))
-                }
-                (ConstValue::Int(a), ast::BinaryOp::Mul, ConstValue::Int(b)) => {
-                    Some(ConstValue::Int(a.saturating_mul(b)))
-                }
-                (ConstValue::Int(a), ast::BinaryOp::FloorDiv, ConstValue::Int(b)) if b != 0 => {
-                    Some(ConstValue::Int(a.div_euclid(b)))
-                }
-                (ConstValue::Int(a), ast::BinaryOp::Mod, ConstValue::Int(b)) if b != 0 => {
-                    Some(ConstValue::Int(a.rem_euclid(b)))
-                }
-                (ConstValue::Int(a), ast::BinaryOp::Pow, ConstValue::Int(b)) if b >= 0 => {
-                    Some(ConstValue::Int(a.saturating_pow(b as u32)))
-                }
-                (ConstValue::Int(a), ast::BinaryOp::Div, ConstValue::Int(b)) if b != 0 => {
-                    Some(ConstValue::Float(a as f64 / b as f64))
-                }
-                (ConstValue::Int(a), ast::BinaryOp::BitAnd, ConstValue::Int(b)) => {
-                    Some(ConstValue::Int(a & b))
-                }
-                (ConstValue::Int(a), ast::BinaryOp::BitOr, ConstValue::Int(b)) => {
-                    Some(ConstValue::Int(a | b))
-                }
-                (ConstValue::Int(a), ast::BinaryOp::BitXor, ConstValue::Int(b)) => {
-                    Some(ConstValue::Int(a ^ b))
-                }
-                (ConstValue::Int(a), ast::BinaryOp::LShift, ConstValue::Int(b))
-                    if (0..64).contains(&b) =>
-                {
-                    Some(ConstValue::Int(a << b))
-                }
-                (ConstValue::Int(a), ast::BinaryOp::RShift, ConstValue::Int(b))
-                    if (0..64).contains(&b) =>
-                {
-                    Some(ConstValue::Int(a >> b))
-                }
-                (ConstValue::Int(a), ast::BinaryOp::Eq, ConstValue::Int(b)) => {
-                    Some(ConstValue::Bool(a == b))
-                }
-                (ConstValue::Int(a), ast::BinaryOp::NotEq, ConstValue::Int(b)) => {
-                    Some(ConstValue::Bool(a != b))
-                }
-                (ConstValue::Int(a), ast::BinaryOp::Lt, ConstValue::Int(b)) => {
-                    Some(ConstValue::Bool(a < b))
-                }
-                (ConstValue::Int(a), ast::BinaryOp::LtEq, ConstValue::Int(b)) => {
-                    Some(ConstValue::Bool(a <= b))
-                }
-                (ConstValue::Int(a), ast::BinaryOp::Gt, ConstValue::Int(b)) => {
-                    Some(ConstValue::Bool(a > b))
-                }
-                (ConstValue::Int(a), ast::BinaryOp::GtEq, ConstValue::Int(b)) => {
-                    Some(ConstValue::Bool(a >= b))
-                }
-                (ConstValue::String(a), ast::BinaryOp::Eq, ConstValue::String(b)) => {
-                    Some(ConstValue::Bool(a == b))
-                }
-                (ConstValue::String(a), ast::BinaryOp::NotEq, ConstValue::String(b)) => {
-                    Some(ConstValue::Bool(a != b))
-                }
-                (ConstValue::Bool(a), ast::BinaryOp::Eq, ConstValue::Bool(b)) => {
-                    Some(ConstValue::Bool(a == b))
-                }
-                (ConstValue::Bool(a), ast::BinaryOp::NotEq, ConstValue::Bool(b)) => {
-                    Some(ConstValue::Bool(a != b))
-                }
-                (l_val, op, r_val) => {
-                    let a = l_val.as_f64()?;
-                    let b = r_val.as_f64()?;
-                    match op {
-                        ast::BinaryOp::Add => Some(ConstValue::Float(a + b)),
-                        ast::BinaryOp::Sub => Some(ConstValue::Float(a - b)),
-                        ast::BinaryOp::Mul => Some(ConstValue::Float(a * b)),
-                        ast::BinaryOp::Div if b != 0.0 => Some(ConstValue::Float(a / b)),
-                        ast::BinaryOp::FloorDiv if b != 0.0 => {
-                            Some(ConstValue::Float((a / b).floor()))
-                        }
-                        ast::BinaryOp::Mod if b != 0.0 => Some(ConstValue::Float(a.rem_euclid(b))),
-                        ast::BinaryOp::Pow => Some(ConstValue::Float(a.powf(b))),
-                        ast::BinaryOp::Eq => Some(ConstValue::Bool((a - b).abs() < f64::EPSILON)),
-                        ast::BinaryOp::NotEq => {
-                            Some(ConstValue::Bool((a - b).abs() >= f64::EPSILON))
-                        }
-                        ast::BinaryOp::Lt => Some(ConstValue::Bool(a < b)),
-                        ast::BinaryOp::LtEq => Some(ConstValue::Bool(a <= b)),
-                        ast::BinaryOp::Gt => Some(ConstValue::Bool(a > b)),
-                        ast::BinaryOp::GtEq => Some(ConstValue::Bool(a >= b)),
-                        _ => None,
-                    }
-                }
-            }
+            eval_const_binary_op(l, *op, r)
         }
         ast::ExprKind::BoolOp { op, left, right } => {
             let l = eval_constant_with_env(left, env)?;
@@ -266,14 +213,85 @@ pub fn eval_constant_with_env(
             }
         }
         ast::ExprKind::Call { callee, args, .. } => {
+            if let ast::ExprKind::Attribute { value: recv, attr } = &callee.kind {
+                let recv_val = eval_constant_with_env(recv, env)?;
+                let mut eval_args = Vec::with_capacity(args.len());
+                for a in args {
+                    eval_args.push(eval_constant_with_env(a, env)?);
+                }
+                match recv_val {
+                    ConstValue::String(s) => {
+                        return match attr.as_str() {
+                            "upper" if eval_args.is_empty() => {
+                                Some(ConstValue::String(s.to_uppercase()))
+                            }
+                            "lower" if eval_args.is_empty() => {
+                                Some(ConstValue::String(s.to_lowercase()))
+                            }
+                            "strip" if eval_args.is_empty() => {
+                                Some(ConstValue::String(s.trim().to_string()))
+                            }
+                            "replace" if eval_args.len() == 2 => {
+                                let from = eval_args[0].as_str()?;
+                                let to = eval_args[1].as_str()?;
+                                Some(ConstValue::String(s.replace(from, to)))
+                            }
+                            _ => None,
+                        };
+                    }
+                    ConstValue::Dict(pairs) => {
+                        return match attr.as_str() {
+                            "keys" if eval_args.is_empty() => Some(ConstValue::List(
+                                pairs.into_iter().map(|(k, _)| k).collect(),
+                            )),
+                            "values" if eval_args.is_empty() => Some(ConstValue::List(
+                                pairs.into_iter().map(|(_, v)| v).collect(),
+                            )),
+                            "items" if eval_args.is_empty() => Some(ConstValue::List(
+                                pairs
+                                    .into_iter()
+                                    .map(|(k, v)| ConstValue::List(vec![k, v]))
+                                    .collect(),
+                            )),
+                            "get" if (1..=2).contains(&eval_args.len()) => {
+                                let key = &eval_args[0];
+                                pairs
+                                    .into_iter()
+                                    .find_map(|(k, v)| if &k == key { Some(v) } else { None })
+                                    .or_else(|| eval_args.get(1).cloned())
+                            }
+                            _ => None,
+                        };
+                    }
+                    ConstValue::List(items) => {
+                        return match attr.as_str() {
+                            "copy" if eval_args.is_empty() => Some(ConstValue::List(items)),
+                            _ => None,
+                        };
+                    }
+                    _ => return None,
+                }
+            }
             let ast::ExprKind::Ident(fn_name) = &callee.kind else {
                 return None;
             };
+            if fn_name == "list"
+                && args.len() == 1
+                && let Some(items) = eval_const_iterable(&args[0], env)
+            {
+                return Some(ConstValue::List(items));
+            }
             let mut eval_args = Vec::with_capacity(args.len());
             for a in args {
                 eval_args.push(eval_constant_with_env(a, env)?);
             }
             match fn_name.as_str() {
+                "len" if eval_args.len() == 1 => match &eval_args[0] {
+                    ConstValue::List(items) => Some(ConstValue::Int(items.len() as i64)),
+                    ConstValue::Dict(pairs) => Some(ConstValue::Int(pairs.len() as i64)),
+                    ConstValue::String(s) => Some(ConstValue::Int(s.chars().count() as i64)),
+                    _ => None,
+                },
                 "str" if eval_args.len() == 1 => {
                     Some(ConstValue::String(eval_args[0].to_display_string()))
                 }
@@ -282,14 +300,14 @@ pub fn eval_constant_with_env(
                     ConstValue::Float(f) => Some(ConstValue::Int(*f as i64)),
                     ConstValue::Bool(b) => Some(ConstValue::Int(i64::from(*b))),
                     ConstValue::String(s) => s.trim().parse::<i64>().ok().map(ConstValue::Int),
-                    ConstValue::List(_) => None,
+                    ConstValue::List(_) | ConstValue::Dict(_) | ConstValue::Symbol(_) => None,
                 },
                 "float" if eval_args.len() == 1 => match &eval_args[0] {
                     ConstValue::Float(f) => Some(ConstValue::Float(*f)),
                     ConstValue::Int(i) => Some(ConstValue::Float(*i as f64)),
                     ConstValue::Bool(b) => Some(ConstValue::Float(if *b { 1.0 } else { 0.0 })),
                     ConstValue::String(s) => s.trim().parse::<f64>().ok().map(ConstValue::Float),
-                    ConstValue::List(_) => None,
+                    ConstValue::List(_) | ConstValue::Dict(_) | ConstValue::Symbol(_) => None,
                 },
                 "bool" if eval_args.len() == 1 => Some(ConstValue::Bool(eval_args[0].is_truthy())),
                 "abs" if eval_args.len() == 1 => match eval_args[0] {
@@ -337,6 +355,561 @@ pub fn eval_constant_with_env(
         }
         _ => None,
     }
+}
+
+pub fn eval_const_binary_op(l: ConstValue, op: ast::BinaryOp, r: ConstValue) -> Option<ConstValue> {
+    match (l, op, r) {
+        (ConstValue::List(mut a), ast::BinaryOp::Add, ConstValue::List(b)) => {
+            a.extend(b);
+            Some(ConstValue::List(a))
+        }
+        (ConstValue::List(a), ast::BinaryOp::Mul, ConstValue::Int(n))
+        | (ConstValue::Int(n), ast::BinaryOp::Mul, ConstValue::List(a)) => {
+            if n <= 0 {
+                return Some(ConstValue::List(Vec::new()));
+            }
+            let count = (n as usize).min(10_000);
+            let mut out = Vec::with_capacity(a.len().saturating_mul(count));
+            for _ in 0..count {
+                out.extend(a.iter().cloned());
+            }
+            Some(ConstValue::List(out))
+        }
+        (ConstValue::String(a), ast::BinaryOp::Mul, ConstValue::Int(n))
+        | (ConstValue::Int(n), ast::BinaryOp::Mul, ConstValue::String(a)) => {
+            if n <= 0 {
+                return Some(ConstValue::String(String::new()));
+            }
+            let count = (n as usize).min(10_000);
+            Some(ConstValue::String(a.repeat(count)))
+        }
+        (ConstValue::String(a), ast::BinaryOp::Add, b) => {
+            Some(ConstValue::String(format!("{a}{}", b.to_display_string())))
+        }
+        (a, ast::BinaryOp::Add, ConstValue::String(b)) => {
+            Some(ConstValue::String(format!("{}{b}", a.to_display_string())))
+        }
+        (ConstValue::Int(a), ast::BinaryOp::Add, ConstValue::Int(b)) => {
+            Some(ConstValue::Int(a.saturating_add(b)))
+        }
+        (ConstValue::Int(a), ast::BinaryOp::Sub, ConstValue::Int(b)) => {
+            Some(ConstValue::Int(a.saturating_sub(b)))
+        }
+        (ConstValue::Int(a), ast::BinaryOp::Mul, ConstValue::Int(b)) => {
+            Some(ConstValue::Int(a.saturating_mul(b)))
+        }
+        (ConstValue::Int(a), ast::BinaryOp::FloorDiv, ConstValue::Int(b)) if b != 0 => {
+            Some(ConstValue::Int(a.div_euclid(b)))
+        }
+        (ConstValue::Int(a), ast::BinaryOp::Mod, ConstValue::Int(b)) if b != 0 => {
+            Some(ConstValue::Int(a.rem_euclid(b)))
+        }
+        (ConstValue::Int(a), ast::BinaryOp::Pow, ConstValue::Int(b)) if b >= 0 => {
+            Some(ConstValue::Int(a.saturating_pow(b as u32)))
+        }
+        (ConstValue::Int(a), ast::BinaryOp::Div, ConstValue::Int(b)) if b != 0 => {
+            Some(ConstValue::Float(a as f64 / b as f64))
+        }
+        (ConstValue::Int(a), ast::BinaryOp::BitAnd, ConstValue::Int(b)) => {
+            Some(ConstValue::Int(a & b))
+        }
+        (ConstValue::Int(a), ast::BinaryOp::BitOr, ConstValue::Int(b)) => {
+            Some(ConstValue::Int(a | b))
+        }
+        (ConstValue::Int(a), ast::BinaryOp::BitXor, ConstValue::Int(b)) => {
+            Some(ConstValue::Int(a ^ b))
+        }
+        (ConstValue::Int(a), ast::BinaryOp::LShift, ConstValue::Int(b)) if (0..64).contains(&b) => {
+            Some(ConstValue::Int(a << b))
+        }
+        (ConstValue::Int(a), ast::BinaryOp::RShift, ConstValue::Int(b)) if (0..64).contains(&b) => {
+            Some(ConstValue::Int(a >> b))
+        }
+        (ConstValue::Int(a), ast::BinaryOp::Eq, ConstValue::Int(b)) => {
+            Some(ConstValue::Bool(a == b))
+        }
+        (ConstValue::Int(a), ast::BinaryOp::NotEq, ConstValue::Int(b)) => {
+            Some(ConstValue::Bool(a != b))
+        }
+        (ConstValue::Int(a), ast::BinaryOp::Lt, ConstValue::Int(b)) => {
+            Some(ConstValue::Bool(a < b))
+        }
+        (ConstValue::Int(a), ast::BinaryOp::LtEq, ConstValue::Int(b)) => {
+            Some(ConstValue::Bool(a <= b))
+        }
+        (ConstValue::Int(a), ast::BinaryOp::Gt, ConstValue::Int(b)) => {
+            Some(ConstValue::Bool(a > b))
+        }
+        (ConstValue::Int(a), ast::BinaryOp::GtEq, ConstValue::Int(b)) => {
+            Some(ConstValue::Bool(a >= b))
+        }
+        (ConstValue::String(a), ast::BinaryOp::Eq, ConstValue::String(b)) => {
+            Some(ConstValue::Bool(a == b))
+        }
+        (ConstValue::String(a), ast::BinaryOp::NotEq, ConstValue::String(b)) => {
+            Some(ConstValue::Bool(a != b))
+        }
+        (ConstValue::Bool(a), ast::BinaryOp::Eq, ConstValue::Bool(b)) => {
+            Some(ConstValue::Bool(a == b))
+        }
+        (ConstValue::Bool(a), ast::BinaryOp::NotEq, ConstValue::Bool(b)) => {
+            Some(ConstValue::Bool(a != b))
+        }
+        (l_val, op, r_val) => {
+            let a = l_val.as_f64()?;
+            let b = r_val.as_f64()?;
+            match op {
+                ast::BinaryOp::Add => Some(ConstValue::Float(a + b)),
+                ast::BinaryOp::Sub => Some(ConstValue::Float(a - b)),
+                ast::BinaryOp::Mul => Some(ConstValue::Float(a * b)),
+                ast::BinaryOp::Div if b != 0.0 => Some(ConstValue::Float(a / b)),
+                ast::BinaryOp::FloorDiv if b != 0.0 => Some(ConstValue::Float((a / b).floor())),
+                ast::BinaryOp::Mod if b != 0.0 => Some(ConstValue::Float(a.rem_euclid(b))),
+                ast::BinaryOp::Pow => Some(ConstValue::Float(a.powf(b))),
+                ast::BinaryOp::Eq => Some(ConstValue::Bool((a - b).abs() < f64::EPSILON)),
+                ast::BinaryOp::NotEq => Some(ConstValue::Bool((a - b).abs() >= f64::EPSILON)),
+                ast::BinaryOp::Lt => Some(ConstValue::Bool(a < b)),
+                ast::BinaryOp::LtEq => Some(ConstValue::Bool(a <= b)),
+                ast::BinaryOp::Gt => Some(ConstValue::Bool(a > b)),
+                ast::BinaryOp::GtEq => Some(ConstValue::Bool(a >= b)),
+                _ => None,
+            }
+        }
+    }
+}
+
+pub fn eval_const_iterable(
+    iter_expr: &ast::Expr,
+    env: &FxHashMap<String, ConstValue>,
+) -> Option<Vec<ConstValue>> {
+    eval_const_iterable_with_arity(iter_expr, 1, env)
+}
+
+pub fn eval_const_iterable_with_arity(
+    iter_expr: &ast::Expr,
+    target_arity: usize,
+    env: &FxHashMap<String, ConstValue>,
+) -> Option<Vec<ConstValue>> {
+    if let ast::ExprKind::Call {
+        callee,
+        args,
+        kwargs,
+    } = &iter_expr.kind
+        && kwargs.is_empty()
+        && let ast::ExprKind::Ident(fn_name) = &callee.kind
+    {
+        match fn_name.as_str() {
+            "range" => {
+                let (start, end, step) = match args.as_slice() {
+                    [end] => (0, eval_constant_with_env(end, env)?.as_i64()?, 1),
+                    [start, end] => (
+                        eval_constant_with_env(start, env)?.as_i64()?,
+                        eval_constant_with_env(end, env)?.as_i64()?,
+                        1,
+                    ),
+                    [start, end, step] => (
+                        eval_constant_with_env(start, env)?.as_i64()?,
+                        eval_constant_with_env(end, env)?.as_i64()?,
+                        eval_constant_with_env(step, env)?.as_i64()?,
+                    ),
+                    _ => return None,
+                };
+                if step == 0 {
+                    return None;
+                }
+                let mut out = Vec::new();
+                let mut cur = start;
+                while (step > 0 && cur < end) || (step < 0 && cur > end) {
+                    if out.len() >= 10_000 {
+                        return None;
+                    }
+                    out.push(ConstValue::Int(cur));
+                    cur = cur.saturating_add(step);
+                }
+                return Some(out);
+            }
+            "enumerate" if (1..=2).contains(&args.len()) => {
+                let inner = eval_const_iterable(&args[0], env)?;
+                let start = if args.len() == 2 {
+                    eval_constant_with_env(&args[1], env)?.as_i64()?
+                } else {
+                    0
+                };
+                let mut out = Vec::with_capacity(inner.len());
+                for (idx, item) in inner.into_iter().enumerate() {
+                    out.push(ConstValue::List(vec![
+                        ConstValue::Int(start.saturating_add(idx as i64)),
+                        item,
+                    ]));
+                }
+                return Some(out);
+            }
+            "reversed" if args.len() == 1 => {
+                let mut inner = eval_const_iterable(&args[0], env)?;
+                inner.reverse();
+                return Some(inner);
+            }
+            _ => {}
+        }
+    }
+
+    match eval_constant_with_env(iter_expr, env)? {
+        ConstValue::List(items) => Some(items),
+        ConstValue::Dict(pairs) => {
+            if target_arity >= 2 {
+                Some(
+                    pairs
+                        .into_iter()
+                        .map(|(k, v)| ConstValue::List(vec![k, v]))
+                        .collect(),
+                )
+            } else {
+                Some(pairs.into_iter().map(|(k, _)| k).collect())
+            }
+        }
+        ConstValue::String(s) => Some(
+            s.chars()
+                .map(|c| ConstValue::String(c.to_string()))
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
+pub fn bind_const_targets(
+    targets: &[(String, Span)],
+    val: ConstValue,
+    env: &mut FxHashMap<String, ConstValue>,
+) -> bool {
+    if targets.len() == 1 {
+        env.insert(targets[0].0.clone(), val);
+        return true;
+    }
+    if let ConstValue::List(items) = val
+        && items.len() == targets.len()
+    {
+        for ((name, _), item) in targets.iter().zip(items) {
+            env.insert(name.clone(), item);
+        }
+        return true;
+    }
+    false
+}
+
+fn eval_const_comprehension(
+    elt: &ast::Expr,
+    generators: &[ast::Comprehension],
+    env: &FxHashMap<String, ConstValue>,
+    out: &mut Vec<ConstValue>,
+) -> Option<()> {
+    let Some((first, rest)) = generators.split_first() else {
+        out.push(eval_constant_with_env(elt, env)?);
+        return Some(());
+    };
+    let iter_items = eval_const_iterable_with_arity(&first.iter, first.targets.len(), env)?;
+    let mut local_env = env.clone();
+    for item in iter_items {
+        if !bind_const_targets(&first.targets, item, &mut local_env) {
+            return None;
+        }
+        let mut cond_ok = true;
+        for cond in &first.ifs {
+            if !eval_constant_with_env(cond, &local_env)?.is_truthy() {
+                cond_ok = false;
+                break;
+            }
+        }
+        if cond_ok {
+            eval_const_comprehension(elt, rest, &local_env, out)?;
+        }
+    }
+    Some(())
+}
+
+fn extract_const_var_name(expr: &ast::Expr) -> Option<String> {
+    match &expr.kind {
+        ast::ExprKind::Ident(name) => Some(name.clone()),
+        ast::ExprKind::Attribute { value, attr } if matches!(&value.kind, ast::ExprKind::Ident(obj) if obj == "self") => {
+            Some(attr.clone())
+        }
+        _ => None,
+    }
+}
+
+/// Evaluates a statement at compile time into `env`, supporting variable assignments,
+/// list/dict mutations (`append`, `extend`, `insert`, `pop`, `remove`, `clear`, `reverse`, `+=`, `list[i] = v`, `dict[k] = v`),
+/// `for` loops, `if`/`else` branches, bounded `while` loops, and class/function/module symbols.
+/// Returns `true` if a `break` statement was encountered inside a loop.
+pub fn eval_const_stmt(stmt: &ast::Stmt, env: &mut FxHashMap<String, ConstValue>) -> bool {
+    match &stmt.kind {
+        ast::StmtKind::Break => return true,
+        ast::StmtKind::ClassDef(c) => {
+            env.insert(c.name.clone(), ConstValue::Symbol(c.name.clone()));
+        }
+        ast::StmtKind::FunctionDef(f) => {
+            env.insert(f.name.clone(), ConstValue::Symbol(f.name.clone()));
+        }
+        ast::StmtKind::ModuleDef { name, body, .. } => {
+            let mut mod_env = FxHashMap::default();
+            for s in body {
+                eval_const_stmt(s, &mut mod_env);
+            }
+            for (k, v) in mod_env {
+                env.insert(format!("{name}.{k}"), v);
+            }
+        }
+        ast::StmtKind::ImportFrom {
+            module, aliases, ..
+        } => {
+            if module != "qsys" && !module.starts_with("qsys.") {
+                let mod_stem = module
+                    .trim_start_matches('.')
+                    .rsplit('.')
+                    .next()
+                    .unwrap_or(module.as_str());
+                let prefix = format!("{mod_stem}.");
+                for (orig_name, alias_opt) in aliases {
+                    if orig_name == "*" {
+                        let exported: Vec<(String, ConstValue)> = env
+                            .iter()
+                            .filter_map(|(k, v)| {
+                                k.strip_prefix(&prefix)
+                                    .map(|member| (member.to_string(), v.clone()))
+                            })
+                            .collect();
+                        for (member, val) in exported {
+                            env.insert(member, val);
+                        }
+                    } else {
+                        let bound = alias_opt.clone().unwrap_or_else(|| orig_name.clone());
+                        let key = format!("{mod_stem}.{orig_name}");
+                        let val = env
+                            .get(&key)
+                            .cloned()
+                            .unwrap_or_else(|| ConstValue::Symbol(bound.clone()));
+                        env.insert(bound, val);
+                    }
+                }
+            }
+        }
+        ast::StmtKind::Assign { target, value, .. } => {
+            if let Some(name) = extract_const_var_name(target) {
+                if let Some(cval) = eval_constant_with_env(value, env) {
+                    env.insert(name, cval);
+                }
+            } else if let ast::ExprKind::Tuple(targets) | ast::ExprKind::List(targets) =
+                &target.kind
+            {
+                if let Some(ConstValue::List(items)) = eval_constant_with_env(value, env)
+                    && items.len() == targets.len()
+                {
+                    for (t, item) in targets.iter().zip(items) {
+                        if let Some(name) = extract_const_var_name(t) {
+                            env.insert(name, item);
+                        }
+                    }
+                }
+            } else if let ast::ExprKind::Subscript {
+                value: container_expr,
+                index,
+            } = &target.kind
+                && let Some(var_name) = extract_const_var_name(container_expr)
+                && let Some(idx_val) = eval_constant_with_env(index, env)
+            {
+                let rhs = eval_constant_with_env(value, env)
+                    .unwrap_or_else(|| ConstValue::Symbol("<expr>".to_string()));
+                match env.get_mut(&var_name) {
+                    Some(ConstValue::List(items)) => {
+                        if let Some(idx) = idx_val.as_i64() {
+                            let resolved = if idx < 0 {
+                                items.len() as i64 + idx
+                            } else {
+                                idx
+                            };
+                            if resolved >= 0 && (resolved as usize) < items.len() {
+                                items[resolved as usize] = rhs;
+                            }
+                        }
+                    }
+                    Some(ConstValue::Dict(pairs)) => {
+                        if let Some(existing) = pairs.iter_mut().find(|(k, _)| *k == idx_val) {
+                            existing.1 = rhs;
+                        } else {
+                            pairs.push((idx_val, rhs));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        ast::StmtKind::AugAssign { target, op, value } => {
+            if let Some(var_name) = extract_const_var_name(target)
+                && let Some(rhs) = eval_constant_with_env(value, env)
+                && let Some(lhs) = env.get(&var_name).cloned()
+                && let Some(res) = eval_const_binary_op(lhs, *op, rhs)
+            {
+                env.insert(var_name, res);
+            }
+        }
+        ast::StmtKind::Expr(expr) => {
+            if let ast::ExprKind::Call {
+                callee,
+                args,
+                kwargs,
+            } = &expr.kind
+                && kwargs.is_empty()
+                && let ast::ExprKind::Attribute { value: recv, attr } = &callee.kind
+                && let Some(var_name) = extract_const_var_name(recv)
+            {
+                let mut eval_args = Vec::with_capacity(args.len());
+                for a in args {
+                    let Some(v) = eval_constant_with_env(a, env) else {
+                        return false;
+                    };
+                    eval_args.push(v);
+                }
+                match env.get_mut(&var_name) {
+                    Some(ConstValue::List(items)) => match attr.as_str() {
+                        "append" if eval_args.len() == 1 => {
+                            items.push(eval_args.into_iter().next().unwrap());
+                        }
+                        "extend" if eval_args.len() == 1 => {
+                            if let ConstValue::List(more) = eval_args.into_iter().next().unwrap() {
+                                items.extend(more);
+                            }
+                        }
+                        "insert" if eval_args.len() == 2 => {
+                            if let Some(idx) = eval_args[0].as_i64() {
+                                let len = items.len() as i64;
+                                let pos = if idx < 0 {
+                                    (len + idx).max(0) as usize
+                                } else {
+                                    (idx as usize).min(items.len())
+                                };
+                                items.insert(pos, eval_args[1].clone());
+                            }
+                        }
+                        "pop" => {
+                            if eval_args.is_empty() {
+                                items.pop();
+                            } else if eval_args.len() == 1
+                                && let Some(idx) = eval_args[0].as_i64()
+                            {
+                                let len = items.len() as i64;
+                                let resolved = if idx < 0 { len + idx } else { idx };
+                                if resolved >= 0 && (resolved as usize) < items.len() {
+                                    items.remove(resolved as usize);
+                                }
+                            }
+                        }
+                        "remove" if eval_args.len() == 1 => {
+                            if let Some(pos) = items.iter().position(|x| x == &eval_args[0]) {
+                                items.remove(pos);
+                            }
+                        }
+                        "clear" if eval_args.is_empty() => {
+                            items.clear();
+                        }
+                        "reverse" if eval_args.is_empty() => {
+                            items.reverse();
+                        }
+                        _ => {}
+                    },
+                    Some(ConstValue::Dict(pairs)) => match attr.as_str() {
+                        "clear" if eval_args.is_empty() => {
+                            pairs.clear();
+                        }
+                        "pop" if !eval_args.is_empty() => {
+                            if let Some(pos) = pairs.iter().position(|(k, _)| k == &eval_args[0]) {
+                                pairs.remove(pos);
+                            }
+                        }
+                        _ => {}
+                    },
+                    _ => {}
+                }
+            }
+        }
+        ast::StmtKind::If {
+            condition,
+            then_branch,
+            else_branch,
+        } => {
+            if let Some(cond) = eval_constant_with_env(condition, env) {
+                let branch = if cond.is_truthy() {
+                    then_branch
+                } else {
+                    else_branch
+                };
+                for s in branch {
+                    if eval_const_stmt(s, env) {
+                        return true;
+                    }
+                }
+            }
+        }
+        ast::StmtKind::For {
+            target,
+            iterable,
+            body,
+        } => {
+            let targets: Vec<&str> = target
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect();
+            let arity = targets.len().max(1);
+            if let Some(items) = eval_const_iterable_with_arity(iterable, arity, env) {
+                for item in items {
+                    if targets.len() <= 1 {
+                        env.insert(target.clone(), item);
+                    } else if let ConstValue::List(parts) = item
+                        && parts.len() == targets.len()
+                    {
+                        for (t_name, part) in targets.iter().zip(parts) {
+                            env.insert((*t_name).to_string(), part);
+                        }
+                    } else {
+                        continue;
+                    }
+                    let mut broke = false;
+                    for s in body {
+                        if eval_const_stmt(s, env) {
+                            broke = true;
+                            break;
+                        }
+                    }
+                    if broke {
+                        break;
+                    }
+                }
+            }
+        }
+        ast::StmtKind::While { condition, body } => {
+            let mut iters = 0usize;
+            while iters < 1024 {
+                let Some(cond) = eval_constant_with_env(condition, env) else {
+                    break;
+                };
+                if !cond.is_truthy() {
+                    break;
+                }
+                iters += 1;
+                let mut broke = false;
+                for s in body {
+                    if eval_const_stmt(s, env) {
+                        broke = true;
+                        break;
+                    }
+                }
+                if broke {
+                    break;
+                }
+            }
+        }
+        _ => {}
+    }
+    false
 }
 
 pub fn eval_constant(expr: &ast::Expr) -> Option<ConstValue> {
@@ -388,28 +961,58 @@ pub fn extract_class_declarations_with_module(
     let mut pending_controls: Vec<(String, ast::Expr, Span)> = Vec::new();
     let mut pending_ui_exprs: Vec<ast::Expr> = Vec::new();
     let mut constants: FxHashMap<String, ConstValue> = FxHashMap::default();
+    let mut scope_types = scope_stack.collect_variable_types();
 
     for stmt in module_statements {
-        if let ast::StmtKind::Assign { target, value, .. } = &stmt.kind
-            && let ast::ExprKind::Ident(name) = &target.kind
-            && let Some(cval) = eval_constant_with_env(value, &constants)
-        {
-            constants.insert(name.clone(), cval);
+        match &stmt.kind {
+            ast::StmtKind::Assign {
+                target,
+                type_annotation: Some(ann),
+                ..
+            } => {
+                if let ast::ExprKind::Ident(name) = &target.kind {
+                    scope_types.insert(name.clone(), crate::parse_simple_type_annotation(ann));
+                }
+            }
+            ast::StmtKind::FunctionDef(f) => {
+                if let Some(ret_ann) = &f.return_type {
+                    scope_types
+                        .insert(f.name.clone(), crate::parse_simple_type_annotation(ret_ann));
+                }
+            }
+            ast::StmtKind::ClassDef(cls) => {
+                scope_types.insert(
+                    cls.name.clone(),
+                    crate::types::Type::UserClass {
+                        name: cls.name.clone(),
+                    },
+                );
+            }
+            _ => {}
         }
+        eval_const_stmt(stmt, &mut constants);
     }
 
     declarations.plugin_info.name = class.name.clone();
 
     for stmt in &class.body {
         match &stmt.kind {
-            ast::StmtKind::Assign { target, value, .. } => {
+            ast::StmtKind::Assign {
+                target,
+                value,
+                type_annotation,
+            } => {
                 let var_name = match &target.kind {
                     ast::ExprKind::Ident(name) => name.clone(),
                     _ => {
+                        eval_const_stmt(stmt, &mut constants);
                         declarations.remaining_statements.push(stmt.clone());
                         continue;
                     }
                 };
+                if let Some(ann) = type_annotation {
+                    scope_types.insert(var_name.clone(), crate::parse_simple_type_annotation(ann));
+                }
 
                 if var_name == "layout" || var_name == "pages" || is_ui_layout_expr(value) {
                     pending_ui_exprs.push(value.clone());
@@ -421,9 +1024,15 @@ pub fn extract_class_declarations_with_module(
                     continue;
                 }
 
-                if let Some(property_def) =
-                    try_parse_property(&var_name, value, stmt.span, &constants, diagnostics)
-                {
+                if let Some(property_def) = try_parse_property(
+                    &class.name,
+                    &var_name,
+                    value,
+                    stmt.span,
+                    &constants,
+                    &scope_types,
+                    diagnostics,
+                ) {
                     if !seen_properties.insert(var_name.clone()) {
                         diagnostics.report(
                             DiagnosticKind::syntax_error(format!(
@@ -432,6 +1041,16 @@ pub fn extract_class_declarations_with_module(
                             stmt.span,
                         );
                     } else {
+                        let default_cval = match &property_def.kind {
+                            PropertyKind::Integer { default, .. } => ConstValue::Int(*default),
+                            PropertyKind::Double { default, .. } => ConstValue::Float(*default),
+                            PropertyKind::Boolean { default } => ConstValue::Bool(*default),
+                            PropertyKind::String { default }
+                            | PropertyKind::Enum { default, .. } => {
+                                ConstValue::String(default.clone())
+                            }
+                        };
+                        constants.entry(var_name.clone()).or_insert(default_cval);
                         let id = scope_stack.alloc_property_id();
                         declarations.properties.push(DeclaredProperty {
                             id,
@@ -446,30 +1065,40 @@ pub fn extract_class_declarations_with_module(
                     continue;
                 }
 
-                if let Some(cval) = eval_constant_with_env(value, &constants) {
-                    constants.insert(var_name.clone(), cval);
-                }
+                eval_const_stmt(stmt, &mut constants);
 
                 declarations.remaining_statements.push(stmt.clone());
             }
 
-            ast::StmtKind::FunctionDef(f) if f.name == "get_control_layout" => {
-                if let Some(ui_expr) = extract_declarative_layout_from_method(&f.body) {
+            ast::StmtKind::FunctionDef(f) => {
+                if let Some(ret_ann) = &f.return_type {
+                    scope_types
+                        .insert(f.name.clone(), crate::parse_simple_type_annotation(ret_ann));
+                }
+                if f.name == "get_control_layout"
+                    && let Some(ui_expr) = extract_declarative_layout_from_method(&f.body)
+                {
                     pending_ui_exprs.push(ui_expr);
                 } else {
                     declarations.remaining_statements.push(stmt.clone());
                 }
             }
 
-            _ => declarations.remaining_statements.push(stmt.clone()),
+            _ => {
+                eval_const_stmt(stmt, &mut constants);
+                declarations.remaining_statements.push(stmt.clone());
+            }
         }
     }
 
-    let ui_env = UiResolveEnv::from_class_and_module(
+    let mut ui_env = UiResolveEnv::from_class_and_module(
         &class.body,
         module_statements,
         &declarations.properties,
     );
+    for (k, v) in scope_types {
+        ui_env.scope_types.entry(k).or_insert(v);
+    }
 
     // Parse Control.* declarations now that all Property.* declarations and constants/methods are available
     for (var_name, value, span) in pending_controls {
@@ -882,6 +1511,20 @@ fn eval_count_expr(
         return Some((i, spec, true));
     }
 
+    if matches!(
+        ui_env.infer_expr_type(class_name, expr),
+        Some(crate::types::Type::Int)
+    ) {
+        ui_env.collect_property_resolutions(class_name, expr, prop_resolutions);
+        let tmpl = ui_env.lower_design_expr_to_prop_template(class_name, expr);
+        let spec = if tmpl.contains("{PROP:") {
+            tmpl
+        } else {
+            format!("{{LUA:{tmpl}}}")
+        };
+        return Some((1, spec, true));
+    }
+
     None
 }
 
@@ -1048,6 +1691,13 @@ fn resolve_design_num_arg(
         let lua = ui_env.lower_design_expr_to_lua(class_name, expr);
         return Some((m, Some(lua)));
     }
+    if matches!(
+        ui_env.infer_expr_type(class_name, expr),
+        Some(crate::types::Type::Int | crate::types::Type::Float)
+    ) {
+        let lua = ui_env.lower_design_expr_to_lua(class_name, expr);
+        return Some((0.0, Some(lua)));
+    }
     diagnostics.report(
         DiagnosticKind::InvalidDeclarationArgument {
             name: control_name.to_string(),
@@ -1076,6 +1726,13 @@ fn resolve_design_str_arg(
         let lua = ui_env.lower_design_expr_to_lua(class_name, expr);
         return Some((s, Some(lua)));
     }
+    if matches!(
+        ui_env.infer_expr_type(class_name, expr),
+        Some(crate::types::Type::String)
+    ) {
+        let lua = ui_env.lower_design_expr_to_lua(class_name, expr);
+        return Some((String::new(), Some(lua)));
+    }
     None
 }
 
@@ -1094,6 +1751,13 @@ fn resolve_design_bool_arg(
         let b = pv.is_truthy();
         let lua = ui_env.lower_design_expr_to_lua(class_name, expr);
         return Some((b, Some(lua)));
+    }
+    if matches!(
+        ui_env.infer_expr_type(class_name, expr),
+        Some(crate::types::Type::Bool)
+    ) {
+        let lua = ui_env.lower_design_expr_to_lua(class_name, expr);
+        return Some((false, Some(lua)));
     }
     None
 }
@@ -1843,11 +2507,28 @@ fn try_parse_control(
     Some(def)
 }
 
+fn lower_prop_expr_to_lua(
+    class_name: &str,
+    expr: &ast::Expr,
+    prop_env: &UiResolveEnv<'_>,
+) -> String {
+    if let ast::ExprKind::Ident(name) = &expr.kind {
+        return name.clone();
+    }
+    let mut env_no_empty_list = prop_env.clone();
+    env_no_empty_list
+        .constants
+        .retain(|_, v| !matches!(v, ConstValue::List(items) if items.is_empty()));
+    env_no_empty_list.lower_design_expr_to_lua(class_name, expr)
+}
+
 fn try_parse_property(
+    class_name: &str,
     var_name: &str,
     expr: &ast::Expr,
     span: Span,
     constants: &FxHashMap<String, ConstValue>,
+    scope_types: &FxHashMap<String, crate::types::Type>,
     diagnostics: &mut Diagnostics,
 ) -> Option<PropertyDef> {
     let (kind_str, args, kwargs) = match &expr.kind {
@@ -1864,6 +2545,10 @@ fn try_parse_property(
         },
         _ => return None,
     };
+
+    let mut prop_env = UiResolveEnv::empty();
+    prop_env.constants = constants.clone();
+    prop_env.scope_types = scope_types.clone();
 
     let prop_name = kwargs
         .iter()
@@ -1885,12 +2570,23 @@ fn try_parse_property(
 
     let prop = match kind_str {
         "Integer" => {
-            let default = kwargs
-                .iter()
-                .find(|(k, _)| k == "default")
-                .and_then(|(_, v)| eval_constant_with_env(v, constants))
-                .and_then(|c| c.as_i64())
-                .unwrap_or(0);
+            let mut default_lua_expr = None;
+            let default = match kwargs.iter().find(|(k, _)| k == "default") {
+                Some((_, v)) => {
+                    if let Some(i) = eval_constant_with_env(v, constants).and_then(|c| c.as_i64()) {
+                        i
+                    } else if matches!(
+                        prop_env.infer_expr_type(class_name, v),
+                        Some(crate::types::Type::Int)
+                    ) {
+                        default_lua_expr = Some(lower_prop_expr_to_lua(class_name, v, &prop_env));
+                        0
+                    } else {
+                        0
+                    }
+                }
+                None => 0,
+            };
             let min = kwargs
                 .iter()
                 .find(|(k, _)| k == "min")
@@ -1902,15 +2598,27 @@ fn try_parse_property(
                 .and_then(|(_, v)| eval_constant_with_env(v, constants))
                 .and_then(|c| c.as_i64());
             PropertyDef::integer(prop_name, default, min, max)
+                .with_default_lua_expr(default_lua_expr)
         }
 
         "Double" | "Float" => {
-            let default = kwargs
-                .iter()
-                .find(|(k, _)| k == "default")
-                .and_then(|(_, v)| eval_constant_with_env(v, constants))
-                .and_then(|c| c.as_f64())
-                .unwrap_or(0.0);
+            let mut default_lua_expr = None;
+            let default = match kwargs.iter().find(|(k, _)| k == "default") {
+                Some((_, v)) => {
+                    if let Some(f) = eval_constant_with_env(v, constants).and_then(|c| c.as_f64()) {
+                        f
+                    } else if matches!(
+                        prop_env.infer_expr_type(class_name, v),
+                        Some(crate::types::Type::Int | crate::types::Type::Float)
+                    ) {
+                        default_lua_expr = Some(lower_prop_expr_to_lua(class_name, v, &prop_env));
+                        0.0
+                    } else {
+                        0.0
+                    }
+                }
+                None => 0.0,
+            };
             let min = kwargs
                 .iter()
                 .find(|(k, _)| k == "min")
@@ -1922,71 +2630,120 @@ fn try_parse_property(
                 .and_then(|(_, v)| eval_constant_with_env(v, constants))
                 .and_then(|c| c.as_f64());
             PropertyDef::double(prop_name, default, min, max)
+                .with_default_lua_expr(default_lua_expr)
         }
 
         "String" => {
-            let default = kwargs
-                .iter()
-                .find(|(k, _)| k == "default")
-                .and_then(|(_, v)| eval_constant_with_env(v, constants))
-                .and_then(|c| c.as_str().map(String::from))
-                .unwrap_or_default();
-            PropertyDef::string(prop_name, default)
+            let mut default_lua_expr = None;
+            let default = match kwargs.iter().find(|(k, _)| k == "default") {
+                Some((_, v)) => {
+                    if let Some(s) = eval_constant_with_env(v, constants)
+                        .and_then(|c| c.as_str().map(String::from))
+                    {
+                        s
+                    } else if matches!(
+                        prop_env.infer_expr_type(class_name, v),
+                        Some(crate::types::Type::String)
+                    ) {
+                        default_lua_expr = Some(lower_prop_expr_to_lua(class_name, v, &prop_env));
+                        String::new()
+                    } else {
+                        String::new()
+                    }
+                }
+                None => String::new(),
+            };
+            PropertyDef::string(prop_name, default).with_default_lua_expr(default_lua_expr)
         }
 
         "Boolean" => {
-            let default = kwargs
-                .iter()
-                .find(|(k, _)| k == "default")
-                .and_then(|(_, v)| eval_constant_with_env(v, constants))
-                .and_then(|c| c.as_bool())
-                .unwrap_or(false);
-            PropertyDef::boolean(prop_name, default)
+            let mut default_lua_expr = None;
+            let default = match kwargs.iter().find(|(k, _)| k == "default") {
+                Some((_, v)) => {
+                    if let Some(b) = eval_constant_with_env(v, constants).and_then(|c| c.as_bool())
+                    {
+                        b
+                    } else if matches!(
+                        prop_env.infer_expr_type(class_name, v),
+                        Some(crate::types::Type::Bool)
+                    ) {
+                        default_lua_expr = Some(lower_prop_expr_to_lua(class_name, v, &prop_env));
+                        false
+                    } else {
+                        false
+                    }
+                }
+                None => false,
+            };
+            PropertyDef::boolean(prop_name, default).with_default_lua_expr(default_lua_expr)
         }
 
         "Enum" => {
+            let mut choices_lua_expr: Option<String> = None;
             let choices = match kwargs.iter().find(|(k, _)| k == "choices") {
-                Some((_, val)) => match eval_constant_with_env(val, constants) {
-                    Some(ConstValue::List(items)) => {
-                        let mut strings = Vec::new();
-                        for item in items {
-                            if let Some(s) = item.as_str() {
-                                strings.push(s.to_string());
+                Some((_, val)) => {
+                    let is_annotated_str_list = matches!(
+                        prop_env.infer_expr_type(class_name, val),
+                        Some(crate::types::Type::List(ref inner))
+                            if matches!(**inner, crate::types::Type::String | crate::types::Type::Any)
+                    );
+                    match eval_constant_with_env(val, constants) {
+                        Some(ConstValue::List(items)) => {
+                            let mut strings = Vec::new();
+                            for item in items {
+                                if let Some(s) = item.as_str() {
+                                    strings.push(s.to_string());
+                                } else {
+                                    diagnostics.report(
+                                        DiagnosticKind::InvalidDeclarationArgument {
+                                            name: prop_name.clone(),
+                                            message:
+                                                "All choices in 'choices' must be string literals"
+                                                    .to_string(),
+                                        },
+                                        val.span,
+                                    );
+                                    return None;
+                                }
+                            }
+                            if strings.is_empty() {
+                                if is_annotated_str_list
+                                    && !matches!(val.kind, ast::ExprKind::List(_))
+                                {
+                                    choices_lua_expr =
+                                        Some(lower_prop_expr_to_lua(class_name, val, &prop_env));
+                                    vec![String::new()]
+                                } else {
+                                    diagnostics.report(
+                                        DiagnosticKind::InvalidDeclarationArgument {
+                                            name: prop_name.clone(),
+                                            message: "'choices' list cannot be empty".to_string(),
+                                        },
+                                        val.span,
+                                    );
+                                    return None;
+                                }
                             } else {
-                                diagnostics.report(
-                                    DiagnosticKind::InvalidDeclarationArgument {
-                                        name: prop_name.clone(),
-                                        message: "All choices in 'choices' must be string literals"
-                                            .to_string(),
-                                    },
-                                    val.span,
-                                );
-                                return None;
+                                strings
                             }
                         }
-                        if strings.is_empty() {
+                        _ if is_annotated_str_list => {
+                            choices_lua_expr =
+                                Some(lower_prop_expr_to_lua(class_name, val, &prop_env));
+                            vec![String::new()]
+                        }
+                        _ => {
                             diagnostics.report(
                                 DiagnosticKind::InvalidDeclarationArgument {
                                     name: prop_name.clone(),
-                                    message: "'choices' list cannot be empty".to_string(),
+                                    message: "'choices' must be a list of strings".to_string(),
                                 },
                                 val.span,
                             );
                             return None;
                         }
-                        strings
                     }
-                    _ => {
-                        diagnostics.report(
-                            DiagnosticKind::InvalidDeclarationArgument {
-                                name: prop_name.clone(),
-                                message: "'choices' must be a list of strings".to_string(),
-                            },
-                            val.span,
-                        );
-                        return None;
-                    }
-                },
+                }
                 None => {
                     diagnostics.report(
                         DiagnosticKind::InvalidDeclarationArgument {
@@ -1999,13 +2756,18 @@ fn try_parse_property(
                 }
             };
 
+            let mut default_lua_expr: Option<String> = None;
             let default = match kwargs.iter().find(|(k, _)| k == "default") {
                 Some((_, val)) => {
                     match eval_constant_with_env(val, constants)
                         .and_then(|c| c.as_str().map(String::from))
                     {
                         Some(d) => {
-                            if !choices.contains(&d) {
+                            if choices_lua_expr.is_some() {
+                                d
+                            } else if d.is_empty() && !choices.contains(&d) {
+                                choices.first().cloned().unwrap_or_default()
+                            } else if !choices.contains(&d) {
                                 diagnostics.report(
                                     DiagnosticKind::InvalidDeclarationArgument {
                                         name: prop_name.clone(),
@@ -2016,8 +2778,18 @@ fn try_parse_property(
                                     val.span,
                                 );
                                 return None;
+                            } else {
+                                d
                             }
-                            d
+                        }
+                        None if matches!(
+                            prop_env.infer_expr_type(class_name, val),
+                            Some(crate::types::Type::String)
+                        ) =>
+                        {
+                            default_lua_expr =
+                                Some(lower_prop_expr_to_lua(class_name, val, &prop_env));
+                            choices.first().cloned().unwrap_or_default()
                         }
                         None => {
                             diagnostics.report(
@@ -2031,10 +2803,12 @@ fn try_parse_property(
                         }
                     }
                 }
-                None => choices.first().cloned().unwrap(),
+                None => choices.first().cloned().unwrap_or_default(),
             };
 
             PropertyDef::enumeration(prop_name, choices, default)
+                .with_choices_lua_expr(choices_lua_expr)
+                .with_default_lua_expr(default_lua_expr)
         }
 
         _ => {

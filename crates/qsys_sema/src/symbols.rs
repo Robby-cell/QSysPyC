@@ -298,6 +298,37 @@ impl ScopeStack {
         names
     }
 
+    pub fn collect_variable_types(&self) -> FxHashMap<String, Type> {
+        let mut out = FxHashMap::default();
+        for scope in &self.scopes {
+            for (name, sym) in &scope.symbols {
+                match &sym.kind {
+                    SymbolKind::Variable { ty, .. } | SymbolKind::Parameter { ty, .. } => {
+                        out.insert(name.clone(), ty.clone());
+                    }
+                    SymbolKind::UserClass { name: cls_name } => {
+                        out.insert(
+                            name.clone(),
+                            Type::UserClass {
+                                name: cls_name.clone(),
+                            },
+                        );
+                    }
+                    SymbolKind::Class { name: cls_name, .. } => {
+                        out.insert(
+                            name.clone(),
+                            Type::ClassInstance {
+                                name: cls_name.clone(),
+                            },
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+        out
+    }
+
     /// Collects all control and property names declared in the current class scope.
     pub fn class_member_names(&self) -> Vec<String> {
         let mut names = Vec::new();

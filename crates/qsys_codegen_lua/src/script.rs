@@ -2,6 +2,7 @@ use qsys_ir::*;
 
 use crate::context::CodegenContext;
 use crate::emitter::{LuaEmitter, escape_lua_string};
+use crate::plugin::format_truthy_helper;
 
 pub fn emit_script(script: &IRScript, ctx: &mut CodegenContext) -> String {
     for ctl in &script.controls {
@@ -20,12 +21,18 @@ pub fn emit_script(script: &IRScript, ctx: &mut CodegenContext) -> String {
     } else {
         emitter.write_line("-- Target: Q-SYS Procedural Script\n");
     }
+    let top_level_helper_offset = emitter.buffer.len();
 
     if !script.is_controller {
         let mut combined = Vec::with_capacity(script.body.len() + script.methods.len());
         combined.extend(script.body.iter().cloned());
         combined.extend(script.methods.iter().cloned().map(IRStmt::FunctionDef));
         emitter.emit_hoisted_statements(&combined);
+        if emitter.ctx.needs_truthy_helper || emitter.buffer.contains("__py_truthy(") {
+            emitter
+                .buffer
+                .insert_str(top_level_helper_offset, &format_truthy_helper());
+        }
         return emitter.buffer;
     }
 
@@ -112,6 +119,12 @@ pub fn emit_script(script: &IRScript, ctx: &mut CodegenContext) -> String {
 
     // Emit top-level body statements with declaration hoisting (classes before functions before executable statements)
     emitter.emit_hoisted_statements(&script.body);
+
+    if emitter.ctx.needs_truthy_helper || emitter.buffer.contains("__py_truthy(") {
+        emitter
+            .buffer
+            .insert_str(top_level_helper_offset, &format_truthy_helper());
+    }
 
     emitter.buffer
 }

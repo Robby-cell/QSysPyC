@@ -95,31 +95,34 @@ pub struct ResolvedMethod {
     pub span: Span,
 }
 
-pub(crate) fn type_from_annotation(ann: Option<&str>, env: &RuntimeEnv) -> Type {
-    match ann {
-        Some("str") | Some("String") => Type::String,
-        Some("int") | Some("Integer") => Type::Int,
-        Some("float") | Some("Double") => Type::Float,
-        Some("bool") | Some("Boolean") => Type::Bool,
-        Some("list") | Some("List") => Type::List(Box::new(Type::Any)),
-        Some("dict") | Some("Dict") => Type::Dict(Box::new(Type::Any), Box::new(Type::Any)),
-        Some("tuple") | Some("Tuple") => Type::Tuple(Vec::new()),
-        Some("None") => Type::None,
-        Some("ControlHandle") => Type::ControlHandle,
-        Some("PropertyHandle") => Type::PropertyHandle,
-        Some(s) if s.starts_with('(') && s.ends_with(')') => {
-            let inner = &s[1..s.len() - 1];
-            let elems = inner
-                .split(',')
-                .map(|part| type_from_annotation(Some(part.trim()), env))
-                .collect();
-            Type::Tuple(elems)
+fn split_top_level_commas(s: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    for (idx, ch) in s.char_indices() {
+        match ch {
+            '[' | '(' => depth += 1,
+            ']' | ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                parts.push(s[start..idx].trim());
+                start = idx + 1;
+            }
+            _ => {}
         }
-        Some(name) if env.object_type(name).is_some() => Type::Native {
-            name: name.to_string(),
-        },
-        _ => Type::Any,
     }
+    let tail = s[start..].trim();
+    if !tail.is_empty() {
+        parts.push(tail);
+    }
+    parts
+}
+
+pub fn parse_simple_type_annotation(ann: &str) -> Type {
+    type_from_annotation(Some(ann), &RuntimeEnv::qsys())
+}
+
+pub fn type_from_annotation(ann: Option<&str>, env: &RuntimeEnv) -> Type {
+    type_from_annotation_with_scope(ann, env, &ScopeStack::new())
 }
 
 pub(crate) fn type_from_annotation_with_scope(
@@ -127,33 +130,120 @@ pub(crate) fn type_from_annotation_with_scope(
     env: &RuntimeEnv,
     scope_stack: &ScopeStack,
 ) -> Type {
-    let base = type_from_annotation(ann, env);
-    if base != Type::Any {
-        return base;
+    let Some(raw) = ann.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Type::Any;
+    };
+
+    if let Some(inner) = raw
+        .strip_prefix("Optional[")
+        .and_then(|s| s.strip_suffix(']'))
+    {
+        return type_from_annotation_with_scope(Some(inner), env, scope_stack);
     }
-    if let Some(name) = ann {
-        if let Some(s) = name.strip_prefix('(').and_then(|s| s.strip_suffix(')')) {
-            let elems = s
-                .split(',')
-                .map(|part| type_from_annotation_with_scope(Some(part.trim()), env, scope_stack))
-                .collect();
-            return Type::Tuple(elems);
+
+    if let Some(inner) = raw
+        .strip_prefix("list[")
+        .or_else(|| raw.strip_prefix("List["))
+        .and_then(|s| s.strip_suffix(']'))
+    {
+        let elem_ty = type_from_annotation_with_scope(Some(inner), env, scope_stack);
+        return Type::List(Box::new(elem_ty));
+    }
+
+    if let Some(inner) = raw
+        .strip_prefix("dict[")
+        .or_else(|| raw.strip_prefix("Dict["))
+        .and_then(|s| s.strip_suffix(']'))
+    {
+        let parts = split_top_level_commas(inner);
+        if parts.len() == 2 {
+            let k_ty = type_from_annotation_with_scope(Some(parts[0]), env, scope_stack);
+            let v_ty = type_from_annotation_with_scope(Some(parts[1]), env, scope_stack);
+            return Type::Dict(Box::new(k_ty), Box::new(v_ty));
         }
-        if let Some(sym) = scope_stack.lookup(name) {
-            if let SymbolKind::Class { name: cls_name, .. }
+        return Type::Dict(Box::new(Type::Any), Box::new(Type::Any));
+    }
+
+    if let Some(inner) = raw
+        .strip_prefix("tuple[")
+        .or_else(|| raw.strip_prefix("Tuple["))
+        .and_then(|s| s.strip_suffix(']'))
+    {
+        let elems = split_top_level_commas(inner)
+            .into_iter()
+            .map(|part| type_from_annotation_with_scope(Some(part), env, scope_stack))
+            .collect();
+        return Type::Tuple(elems);
+    }
+
+    if let Some(inner) = raw
+        .strip_prefix("type[")
+        .or_else(|| raw.strip_prefix("Type["))
+        .and_then(|s| s.strip_suffix(']'))
+    {
+        let inner_trimmed = inner.trim();
+        if let Some(sym) = scope_stack.lookup(inner_trimmed)
+            && let SymbolKind::Class { name: cls_name, .. }
             | SymbolKind::UserClass { name: cls_name } = &sym.kind
-            {
-                return Type::UserInstance {
-                    name: cls_name.clone(),
-                };
-            }
-        } else if let Some((_, attr)) = name.split_once('.')
-            && let Some(sym) = scope_stack.lookup(attr)
+        {
+            return Type::UserClass {
+                name: cls_name.clone(),
+            };
+        }
+        return Type::UserClass {
+            name: inner_trimmed.to_string(),
+        };
+    }
+
+    if let Some(inner) = raw.strip_prefix('(').and_then(|s| s.strip_suffix(')')) {
+        let elems = split_top_level_commas(inner)
+            .into_iter()
+            .map(|part| type_from_annotation_with_scope(Some(part), env, scope_stack))
+            .collect();
+        return Type::Tuple(elems);
+    }
+
+    match raw {
+        "str" | "String" => return Type::String,
+        "int" | "Integer" => return Type::Int,
+        "float" | "Double" => return Type::Float,
+        "bool" | "Boolean" => return Type::Bool,
+        "list" | "List" => return Type::List(Box::new(Type::Any)),
+        "dict" | "Dict" => return Type::Dict(Box::new(Type::Any), Box::new(Type::Any)),
+        "tuple" | "Tuple" => return Type::Tuple(Vec::new()),
+        "None" => return Type::None,
+        "ControlHandle" => return Type::ControlHandle,
+        "PropertyHandle" => return Type::PropertyHandle,
+        name if env.object_type(name).is_some() => {
+            return Type::Native {
+                name: name.to_string(),
+            };
+        }
+        _ => {}
+    }
+
+    if let Some(sym) = scope_stack.lookup(raw) {
+        if let SymbolKind::Class { name: cls_name, .. } | SymbolKind::UserClass { name: cls_name } =
+            &sym.kind
+        {
+            return Type::UserInstance {
+                name: cls_name.clone(),
+            };
+        }
+    } else if let Some((mod_name, attr)) = raw.split_once('.') {
+        if let Some(sym) = scope_stack.lookup(attr)
             && let SymbolKind::Class { name: cls_name, .. }
             | SymbolKind::UserClass { name: cls_name } = &sym.kind
         {
             return Type::UserInstance {
                 name: cls_name.clone(),
+            };
+        }
+        if scope_stack.lookup(mod_name).is_some()
+            && attr.chars().next().is_some_and(char::is_uppercase)
+        {
+            return Type::UserInstance {
+                name: attr.to_string(),
             };
         }
     }
@@ -333,6 +423,18 @@ pub fn analyze_lossy_with_env(
                         f.name.clone(),
                         sig_params,
                     );
+                    let ret_ty = type_from_annotation_with_scope(
+                        f.return_type.as_deref(),
+                        &env,
+                        &scope_stack,
+                    );
+                    if ret_ty != Type::Any {
+                        type_map.insert_class_member_type(
+                            class.name.clone(),
+                            f.name.clone(),
+                            ret_ty,
+                        );
+                    }
                     method_ids.insert(f.name.clone(), method_id);
                 }
             }
@@ -573,6 +675,18 @@ pub fn analyze_lossy_with_env(
                         f.name.clone(),
                         sig_params,
                     );
+                    let ret_ty = type_from_annotation_with_scope(
+                        f.return_type.as_deref(),
+                        &env,
+                        &scope_stack,
+                    );
+                    if ret_ty != Type::Any {
+                        type_map.insert_class_member_type(
+                            class.name.clone(),
+                            f.name.clone(),
+                            ret_ty,
+                        );
+                    }
                     method_ids.insert(f.name.clone(), method_id);
                 }
             }

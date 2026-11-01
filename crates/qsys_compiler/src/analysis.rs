@@ -1086,14 +1086,16 @@ fn find_assigned_type_in_module(
                 if let ast::ExprKind::Ident(name) = &target.kind
                     && name == var_name
                 {
-                    if let Some(ann) = type_annotation
-                        && ann.chars().next().is_some_and(char::is_uppercase)
-                        && !matches!(
-                            ann.as_str(),
-                            "Any" | "None" | "ControlHandle" | "PropertyHandle"
-                        )
-                    {
-                        return Some(Type::UserInstance { name: ann.clone() });
+                    if let Some(ann) = type_annotation {
+                        let parsed_ty = qsys_sema::type_from_annotation(Some(ann), env);
+                        if !matches!(parsed_ty, Type::Any | Type::None) {
+                            return Some(parsed_ty);
+                        }
+                        if ann.chars().next().is_some_and(char::is_uppercase)
+                            && !matches!(ann.as_str(), "Any" | "None")
+                        {
+                            return Some(Type::UserInstance { name: ann.clone() });
+                        }
                     }
                     if let ast::ExprKind::Call { callee, .. } = &value.kind {
                         if let ast::ExprKind::Attribute { value: recv, attr } = &callee.kind

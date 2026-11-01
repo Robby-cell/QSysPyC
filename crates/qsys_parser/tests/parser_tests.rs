@@ -80,9 +80,15 @@ fn test_rejects_complex_number_without_panic() {
 }
 
 #[test]
-fn test_rejects_tuple_target_in_for_loop() {
-    let src = "for (a, b) in items: pass";
-    let errs = parse_str(src).unwrap_err();
+fn test_parses_tuple_target_and_rejects_invalid_target_in_for_loop() {
+    let module =
+        parse_str("for (a, b) in items: pass").expect("Tuple target in for loop should parse");
+    match &module.statements[0].kind {
+        StmtKind::For { target, .. } => assert_eq!(target, "a, b"),
+        _ => panic!("Expected StmtKind::For"),
+    }
+
+    let errs = parse_str("for a.b in items: pass").unwrap_err();
     assert_eq!(errs[0].code(), "E0110");
 }
 

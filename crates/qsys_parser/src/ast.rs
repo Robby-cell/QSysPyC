@@ -102,6 +102,14 @@ pub struct Param {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct Comprehension {
+    pub targets: Vec<(String, Span)>,
+    pub iter: Expr,
+    pub ifs: Vec<Expr>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct Expr {
     pub kind: ExprKind,
     pub span: Span,
@@ -124,6 +132,10 @@ pub enum ExprKind {
 
     Tuple(Vec<Expr>),
     List(Vec<Expr>),
+    ListComp {
+        elt: Box<Expr>,
+        generators: Vec<Comprehension>,
+    },
     Dict(Vec<(Expr, Expr)>),
 
     Binary {

@@ -1813,3 +1813,250 @@ class DynamicConfigPlugin(QSysPlugin):
         panic!("Expected IRProgram::Plugin");
     }
 }
+
+#[test]
+fn test_truthy_helper_omitted_when_unused_and_emitted_when_needed() {
+    let unused_src = r#"
+from qsys import Control, QSysPlugin
+
+class SimplePlugin(QSysPlugin):
+    Btn = Control.Button(name="Btn")
+
+    @Btn.EventHandler
+    def on_btn(self, ctl) -> None:
+        if ctl.Boolean:
+            print("pressed")
+"#;
+    let lua1 = compile_to_lua(unused_src);
+
+    assert!(
+        !lua1.contains("local function __py_truthy(v)"),
+        "`__py_truthy` must NOT be emitted when not used in generated code:\n{lua1}"
+    );
+
+    let used_src = r#"
+from qsys import Control, QSysPlugin
+
+class DynamicTruthyPlugin(QSysPlugin):
+    Btn = Control.Button(name="Btn")
+
+    @Btn.EventHandler
+    def on_btn(self, ctl) -> None:
+        val = ctl.Data
+        if val:
+            print("truthy")
+"#;
+    let lua2 = compile_to_lua(used_src);
+
+    assert!(
+        lua2.contains("local function __py_truthy(v)") && lua2.contains("if __py_truthy(val) then"),
+        "`__py_truthy` MUST be emitted when dynamic truthiness is used:\n{lua2}"
+    );
+}
+
+#[test]
+fn test_mutable_lists_and_comprehensions_in_properties_ui_and_runtime() {
+    let src = r#"
+from qsys import Control, Property, QSysPlugin, UI
+
+TRACK_COUNT = 3
+BASE_PREFIXES = ["Alpha", "Beta"]
+
+options = []
+options.append("None")
+for p in BASE_PREFIXES:
+    options.append(p)
+
+class CompPlugin(QSysPlugin):
+    class_opts = ["foo"]
+    class_opts.append("bar")
+    class_opts.extend([f"item_{i}" for i in range(1, TRACK_COUNT + 1) if i != 2])
+
+    comp_choices = [f"{p}-{i}" for p in BASE_PREFIXES for i in range(1, TRACK_COUNT)]
+
+    Mode = Property.Enum("Mode", choices=options, default="Alpha")
+    Preset = Property.Enum("Preset", choices=class_opts, default="foo")
+    Route = Property.Enum("Route", choices=comp_choices, default="Alpha-1")
+
+    Gains = Control.Knob(name="Gains", count=TRACK_COUNT, min=-100.0, max=12.0, default=0.0)
+
+    layout = UI.Page(
+        "Main",
+        UI.GroupBox(
+            "Channels",
+            [UI.Field(f"Ch {i + 1}", Gains[i]) for i in range(TRACK_COUNT)],
+        ),
+    )
+
+    def runtime(self) -> None:
+        dyn_list = [i * 10 for i in range(TRACK_COUNT) if i > 0]
+        print(len(dyn_list))
+"#;
+
+    let lua = compile_to_lua(src);
+
+    // 1. `options = []` + `options.append(...)` in loop must populate `Mode` enum choices
+    assert!(
+        lua.contains("Name = \"Mode\",\n        Type = \"enum\",\n        Choices = { \"None\", \"Alpha\", \"Beta\" },\n        Value = \"Alpha\","),
+        "`options = []` populated via `.append()` and `for` loop must populate Property.Enum choices:\n{lua}"
+    );
+
+    // 2. `class_opts = ["foo"]` + `.append("bar")` + `.extend([comprehension with if filter])` must populate `Preset` enum choices
+    assert!(
+        lua.contains("Name = \"Preset\",\n        Type = \"enum\",\n        Choices = { \"foo\", \"bar\", \"item_1\", \"item_3\" },\n        Value = \"foo\","),
+        "`class_opts = [\"foo\"]` mutated via `.append()` and `.extend([...])` must include all options:\n{lua}"
+    );
+
+    // 3. Multi-generator comprehension `[f"{p}-{i}" for p in BASE_PREFIXES for i in range(1, TRACK_COUNT)]` must populate `Route` enum choices
+    assert!(
+        lua.contains("Name = \"Route\",\n        Type = \"enum\",\n        Choices = { \"Alpha-1\", \"Alpha-2\", \"Beta-1\", \"Beta-2\" },\n        Value = \"Alpha-1\","),
+        "Comprehension over list variable and `range(1, TRACK_COUNT)` must populate Property.Enum choices:\n{lua}"
+    );
+
+    // 4. UI layout comprehension `[UI.Field(f"Ch {i + 1}", Gains[i]) for i in range(TRACK_COUNT)]` must unroll all 3 fields
+    assert!(
+        lua.contains("layout[\"Gains 1\"]")
+            && lua.contains("layout[\"Gains 2\"]")
+            && lua.contains("layout[\"Gains 3\"]")
+            && lua.contains("PrettyName = \"Ch 1\"")
+            && lua.contains("PrettyName = \"Ch 2\"")
+            && lua.contains("PrettyName = \"Ch 3\""),
+        "UI comprehension over `range(TRACK_COUNT)` must unroll all 3 controls:\n{lua}"
+    );
+
+    // 5. Runtime list comprehension `[i * 10 for i in range(TRACK_COUNT) if i > 0]` must lower to Lua IIFE
+    assert!(
+        lua.contains("local dyn_list = (function() local _comp = {} for i = 0, (TRACK_COUNT) - 1 do if (i > 0) then table.insert(_comp, (i * 10)) end end return _comp end)()"),
+        "Runtime list comprehension must lower to Lua IIFE:\n{lua}"
+    );
+}
+
+#[test]
+fn test_dict_comprehensions_and_generic_type_annotations_across_declarations_and_runtime() {
+    let src = r#"# --- Bundled module: helpers.py ---
+def format_status(state: str) -> str:
+    return "STATUS: " + state
+# --- End bundled modules ---
+from qsys import Control, ControlHandle, Property, QSysPlugin, UI
+from helpers import format_status
+
+class Foo:
+    def ping(self) -> str:
+        return "foo_ping"
+
+class Bar:
+    def ping(self) -> str:
+        return "bar_ping"
+
+types = {
+    "foo": Foo,
+    "bar": Bar,
+}
+
+options: list[str] = [k for k, v in types]
+
+def build_dynamic_choices() -> list[str]:
+    res: list[str] = []
+    for k, v in types:
+        res.append(k)
+    return res
+
+dyn_options: list[str] = build_dynamic_choices()
+
+def pick_first(xs: list[Foo]) -> Foo:
+    return xs[0]
+
+class MyPlugin(QSysPlugin):
+    version = "1.0.0"
+    author = "Q-SYS Developer"
+    description = "MyPlugin Plugin"
+
+    Type = Property.Enum("Type", choices=options, default="")
+    DynType = Property.Enum("DynType", choices=dyn_options, default="foo")
+    Enable = Control.Button(name="Enable", type="Toggle")
+    Status = Control.Text(name="Status", default="Standby", type="ReadOnly", pins="Output")
+
+    layout = UI.Page(
+        "Main",
+        UI.Header("MyPlugin"),
+        UI.GroupBox(
+            "Controls",
+            UI.Row(
+                UI.Field("Enable System", Enable),
+                UI.Field("System Status", Status, width=160),
+            ),
+        ),
+    )
+
+    @Enable.EventHandler
+    def on_enable(self, ctl: ControlHandle):
+        items: list[Foo] = []
+        mapping: dict[str, Foo] = {}
+        current: Foo | None = None
+        pair: tuple[str, Foo] = ("item", Foo())
+
+        first = items[0]
+        s1 = first.ping()
+        s2 = pick_first(items).ping()
+        s3 = mapping["foo"].ping()
+        s4 = current.ping()
+        tag, inst = pair
+        s5 = tag + ":" + inst.ping()
+
+        for item in items:
+            item.ping()
+
+        for k, v in mapping:
+            v.ping()
+
+        inst_from_dict = types[self.Type.Value]()
+        s6 = inst_from_dict.ping()
+
+        if ctl.Boolean:
+            self.Status.String = format_status("Online") + s1 + s2 + s3 + s4 + s5 + s6
+        else:
+            self.Status.String = format_status("Standby")
+"#;
+
+    let lua = compile_to_lua(src);
+
+    // 1. `types = {"foo": Foo, "bar": Bar}` + `options: list[str] = [k for k, v in types]`
+    //    must fold at compile-time to `Choices = { "foo", "bar" }`, and `default=""` falls back to `"foo"`.
+    assert!(
+        lua.contains("Name = \"Type\",\n        Type = \"enum\",\n        Choices = { \"foo\", \"bar\" },\n        Value = \"foo\","),
+        "`options: list[str] = [k for k, v in types]` with `default=\"\"` must fold to Choices = {{ \"foo\", \"bar\" }}, Value = \"foo\":\n{lua}"
+    );
+
+    // 2. Annotated `dyn_options: list[str] = build_dynamic_choices()` must be accepted by `Property.Enum` via its `list[str]` annotation
+    //    and emitted as `Choices = dyn_options` in `GetProperties()`.
+    assert!(
+        lua.contains("Name = \"DynType\",\n        Type = \"enum\",\n        Choices = dyn_options,\n        Value = \"foo\","),
+        "Annotated `dyn_options: list[str]` must be accepted in `Property.Enum` and emitted as `Choices = dyn_options`:\n{lua}"
+    );
+
+    // 3. Comprehension and `for k, v in types` over a dict must emit `pairs(...)` in Lua
+    assert!(
+        lua.contains("for k, v in pairs(types) do"),
+        "Iterating `for k, v in types` in comprehension and loop must emit `for k, v in pairs(types) do`:\n{lua}"
+    );
+
+    // 4. Generic and union type annotations (`list[Foo]`, `dict[str, Foo]`, `Foo | None`, `tuple[str, Foo]`)
+    //    must preserve class instance types so `.ping()` lowers to `:ping()` and string `+` lowers to `..`.
+    assert!(
+        lua.contains("local s1 = first:ping()")
+            && lua.contains("local s2 = pick_first(items):ping()")
+            && lua.contains("local s3 = mapping[\"foo\"]:ping()")
+            && lua.contains("local s4 = current:ping()")
+            && lua.contains("local s5 = ((tag .. \":\") .. inst:ping())")
+            && lua.contains("local inst_from_dict = types[Properties[\"Type\"].Value].new()")
+            && lua.contains("local s6 = inst_from_dict:ping()"),
+        "Type annotations `list[Foo]`, `dict[str, Foo]`, `Foo | None`, `tuple[str, Foo]`, and class dict values must preserve `.new()` and method dispatch (`:`):\n{lua}"
+    );
+
+    // 5. Loops over annotated `items: list[Foo]` and `mapping: dict[str, Foo]` must dispatch `:ping()` and use `ipairs`/`pairs`
+    assert!(
+        lua.contains("for _, item in ipairs(items) do\n            item:ping()\n        end")
+            && lua.contains("for k, v in pairs(mapping) do\n            v:ping()\n        end"),
+        "For loops over `list[Foo]` and `dict[str, Foo]` must preserve element/value types and emit `ipairs`/`pairs`:\n{lua}"
+    );
+}

@@ -63,6 +63,32 @@ pub(crate) fn find_first_return_expr(stmts: &[ast::Stmt]) -> Option<&ast::Expr> 
     None
 }
 
+pub(crate) fn merge_annotated_type(preferred: Type, fallback: Type) -> Type {
+    match (preferred, fallback) {
+        (Type::Any | Type::None, other) => other,
+        (other, Type::Any | Type::None) => other,
+        (Type::List(a), Type::List(b)) => Type::List(Box::new(merge_annotated_type(*a, *b))),
+        (Type::Dict(ak, av), Type::Dict(bk, bv)) => Type::Dict(
+            Box::new(merge_annotated_type(*ak, *bk)),
+            Box::new(merge_annotated_type(*av, *bv)),
+        ),
+        (Type::Tuple(as_), Type::Tuple(bs)) if as_.len() == bs.len() => Type::Tuple(
+            as_.into_iter()
+                .zip(bs)
+                .map(|(a, b)| merge_annotated_type(a, b))
+                .collect(),
+        ),
+        (Type::UserInstance { ref name }, Type::UserClass { name: ref cls_name })
+            if name == cls_name =>
+        {
+            Type::UserClass {
+                name: cls_name.clone(),
+            }
+        }
+        (pref, _) => pref,
+    }
+}
+
 pub struct ExprAnalyzer<'a> {
     pub scope_stack: &'a mut ScopeStack,
     pub type_map: &'a mut TypeMap,
@@ -126,6 +152,11 @@ impl<'a> ExprAnalyzer<'a> {
         // Pass 2: Hoist ClassDef, FunctionDef, and module-level Assign declarations
         for stmt in stmts {
             if let ast::StmtKind::ClassDef(c) = &stmt.kind {
+                self.pre_register_class_symbol(c);
+            }
+        }
+        for stmt in stmts {
+            if let ast::StmtKind::ClassDef(c) = &stmt.kind {
                 self.pre_register_class(c);
             }
         }
@@ -151,11 +182,8 @@ impl<'a> ExprAnalyzer<'a> {
                         self.env,
                         self.scope_stack,
                     );
-                    let quick_ty = if !matches!(ann_ty, Type::Any | Type::None) {
-                        ann_ty
-                    } else {
-                        self.peek_expr_type(value)
-                    };
+                    let peek_ty = self.peek_expr_type(value);
+                    let quick_ty = merge_annotated_type(ann_ty, peek_ty);
                     self.pre_register_assign_target(target, quick_ty);
                 }
             }
@@ -256,12 +284,12 @@ impl<'a> ExprAnalyzer<'a> {
             ast::ExprKind::Ident(name) => {
                 if let Some(sym) = self.scope_stack.lookup(name)
                     && let SymbolKind::Variable { id, ty } = &sym.kind
-                    && matches!(ty, Type::None | Type::Any)
-                    && !matches!(val_ty, Type::Any | Type::None)
                 {
-                    let sym_id = *id;
-                    self.scope_stack
-                        .update_variable_type(sym_id, val_ty.clone());
+                    let merged = merge_annotated_type(ty.clone(), val_ty.clone());
+                    if merged != *ty {
+                        let sym_id = *id;
+                        self.scope_stack.update_variable_type(sym_id, merged);
+                    }
                 }
             }
             ast::ExprKind::Tuple(items) | ast::ExprKind::List(items) => {
@@ -292,11 +320,8 @@ impl<'a> ExprAnalyzer<'a> {
                         self.env,
                         self.scope_stack,
                     );
-                    let new_ty = if !matches!(ann_ty, Type::Any | Type::None) {
-                        ann_ty
-                    } else {
-                        self.peek_expr_type(value)
-                    };
+                    let peek_ty = self.peek_expr_type(value);
+                    let new_ty = merge_annotated_type(ann_ty, peek_ty);
                     self.upgrade_target_var_types(target, &new_ty);
                 }
                 ast::StmtKind::FunctionDef(f) => {
@@ -342,6 +367,59 @@ impl<'a> ExprAnalyzer<'a> {
                     .unwrap_or(Type::Any);
                 Type::List(Box::new(elem))
             }
+            ast::ExprKind::Dict(pairs) => {
+                let (k_ty, v_ty) = pairs
+                    .first()
+                    .map(|(k, v)| (self.peek_expr_type(k), self.peek_expr_type(v)))
+                    .unwrap_or((Type::Any, Type::Any));
+                Type::Dict(Box::new(k_ty), Box::new(v_ty))
+            }
+            ast::ExprKind::ListComp { elt, generators } => {
+                let mut elem_ty = self.peek_expr_type(elt);
+                if elem_ty == Type::Any
+                    && let ast::ExprKind::Ident(elt_name) = &elt.kind
+                {
+                    for g in generators {
+                        if let Some(idx) = g.targets.iter().position(|(t, _)| t == elt_name) {
+                            let iter_ty = self.peek_expr_type(&g.iter);
+                            elem_ty = match iter_ty {
+                                Type::List(inner) => *inner,
+                                Type::Dict(k, v) => {
+                                    if g.targets.len() == 1 || idx == 0 {
+                                        *k
+                                    } else if idx == 1 {
+                                        *v
+                                    } else {
+                                        Type::Any
+                                    }
+                                }
+                                Type::Tuple(tys) => tys.get(idx).cloned().unwrap_or(Type::Any),
+                                Type::String => Type::String,
+                                Type::ControlHandle => Type::ControlHandle,
+                                _ => Type::Any,
+                            };
+                            break;
+                        }
+                    }
+                }
+                Type::List(Box::new(elem_ty))
+            }
+            ast::ExprKind::Subscript { value, index } => match self.peek_expr_type(value) {
+                Type::List(elem) => *elem,
+                Type::Dict(_, val) => *val,
+                Type::Tuple(elems) => {
+                    if let ast::ExprKind::Int(i) = index.kind
+                        && i >= 0
+                    {
+                        elems.get(i as usize).cloned().unwrap_or(Type::Any)
+                    } else {
+                        elems.first().cloned().unwrap_or(Type::Any)
+                    }
+                }
+                Type::ControlHandle => Type::ControlHandle,
+                Type::String => Type::String,
+                _ => Type::Any,
+            },
             ast::ExprKind::Ident(name) => {
                 if let Some(sym) = self.scope_stack.lookup(name) {
                     match &sym.kind {
@@ -393,7 +471,15 @@ impl<'a> ExprAnalyzer<'a> {
         }
     }
 
-    fn pre_register_class(&mut self, c: &ast::ClassDef) {
+    fn pre_register_class_symbol(&mut self, c: &ast::ClassDef) {
+        if self
+            .scope_stack
+            .current_scope()
+            .symbols
+            .contains_key(&c.name)
+        {
+            return;
+        }
         let sym_id = self.scope_stack.alloc_symbol_id();
 
         if let Some(base_name) = c.bases.first()
@@ -419,6 +505,10 @@ impl<'a> ExprAnalyzer<'a> {
             },
             c.span,
         ));
+    }
+
+    fn pre_register_class(&mut self, c: &ast::ClassDef) {
+        self.pre_register_class_symbol(c);
 
         for body_stmt in &c.body {
             match &body_stmt.kind {
@@ -436,19 +526,15 @@ impl<'a> ExprAnalyzer<'a> {
                         sig_params,
                     );
 
-                    let mut ret_ty = crate::type_from_annotation_with_scope(
+                    let ann_ret_ty = crate::type_from_annotation_with_scope(
                         f.return_type.as_deref(),
                         self.env,
                         self.scope_stack,
                     );
-                    if ret_ty == Type::Any
-                        && let Some(ret_expr) = find_first_return_expr(&f.body)
-                    {
-                        let peeked = self.peek_expr_type(ret_expr);
-                        if peeked != Type::Any {
-                            ret_ty = peeked;
-                        }
-                    }
+                    let peek_ret_ty = find_first_return_expr(&f.body)
+                        .map(|e| self.peek_expr_type(e))
+                        .unwrap_or(Type::Any);
+                    let ret_ty = merge_annotated_type(ann_ret_ty, peek_ret_ty);
                     self.type_map
                         .insert_class_member_type(c.name.clone(), f.name.clone(), ret_ty);
 
@@ -469,9 +555,7 @@ impl<'a> ExprAnalyzer<'a> {
                                 self.env,
                                 self.scope_stack,
                             );
-                            let attr_ty = if !matches!(ann_ty, Type::Any | Type::None) {
-                                ann_ty
-                            } else if let ast::ExprKind::Ident(rhs_id) = &value.kind
+                            let rhs_ty = if let ast::ExprKind::Ident(rhs_id) = &value.kind
                                 && let Some(param) = f.params.iter().find(|p| p.name == *rhs_id)
                             {
                                 let p_ty = crate::type_from_annotation_with_scope(
@@ -479,21 +563,28 @@ impl<'a> ExprAnalyzer<'a> {
                                     self.env,
                                     self.scope_stack,
                                 );
-                                if !matches!(p_ty, Type::Any | Type::None) {
-                                    p_ty
-                                } else if let Some(ref def_expr) = param.default {
-                                    self.peek_expr_type(def_expr)
-                                } else {
-                                    self.peek_expr_type(value)
-                                }
+                                let def_ty = param
+                                    .default
+                                    .as_ref()
+                                    .map(|d| self.peek_expr_type(d))
+                                    .unwrap_or(Type::Any);
+                                merge_annotated_type(p_ty, def_ty)
                             } else {
                                 self.peek_expr_type(value)
                             };
+                            let attr_ty = merge_annotated_type(ann_ty, rhs_ty);
                             if !matches!(attr_ty, Type::Any | Type::None) {
+                                let merged = if let Some(prev) =
+                                    self.type_map.get_class_member_type(&c.name, attr).cloned()
+                                {
+                                    merge_annotated_type(attr_ty, prev)
+                                } else {
+                                    attr_ty
+                                };
                                 self.type_map.insert_class_member_type(
                                     c.name.clone(),
                                     attr.clone(),
-                                    attr_ty,
+                                    merged,
                                 );
                             }
                         }
@@ -510,11 +601,7 @@ impl<'a> ExprAnalyzer<'a> {
                             self.env,
                             self.scope_stack,
                         );
-                        let attr_ty = if !matches!(ann_ty, Type::Any | Type::None) {
-                            ann_ty
-                        } else {
-                            self.peek_expr_type(value)
-                        };
+                        let attr_ty = merge_annotated_type(ann_ty, self.peek_expr_type(value));
                         self.type_map.insert_class_member_type(
                             c.name.clone(),
                             attr_name.clone(),
@@ -557,19 +644,15 @@ impl<'a> ExprAnalyzer<'a> {
         self.type_map
             .insert_function_params(f.name.clone(), sig_params);
 
-        let mut ret_ty = crate::type_from_annotation_with_scope(
+        let ann_ret_ty = crate::type_from_annotation_with_scope(
             f.return_type.as_deref(),
             self.env,
             self.scope_stack,
         );
-        if ret_ty == Type::Any
-            && let Some(ret_expr) = find_first_return_expr(&f.body)
-        {
-            let peeked = self.peek_expr_type(ret_expr);
-            if peeked != Type::Any {
-                ret_ty = peeked;
-            }
-        }
+        let peek_ret_ty = find_first_return_expr(&f.body)
+            .map(|e| self.peek_expr_type(e))
+            .unwrap_or(Type::Any);
+        let ret_ty = merge_annotated_type(ann_ret_ty, peek_ret_ty);
         if ret_ty != Type::Any {
             self.type_map
                 .insert_function_return_type(f.name.clone(), ret_ty);
@@ -617,11 +700,8 @@ impl<'a> ExprAnalyzer<'a> {
                 } else {
                     (self.scope_stack.alloc_symbol_id(), None, false)
                 };
-                let effective_ty = if matches!(val_ty, Type::None | Type::Any)
-                    && let Some(ref prev) = prev_ty
-                    && !matches!(prev, Type::None | Type::Any)
-                {
-                    prev.clone()
+                let effective_ty = if let Some(ref prev) = prev_ty {
+                    merge_annotated_type(val_ty, prev.clone())
                 } else {
                     val_ty
                 };
@@ -673,8 +753,18 @@ impl<'a> ExprAnalyzer<'a> {
                         ..
                     } = sym.kind
                 {
+                    let cls_name = name.clone();
+                    let merged = if let Some(prev) = self
+                        .type_map
+                        .get_class_member_type(&cls_name, attr)
+                        .cloned()
+                    {
+                        merge_annotated_type(val_ty, prev)
+                    } else {
+                        val_ty
+                    };
                     self.type_map
-                        .insert_class_member_type(name.clone(), attr.clone(), val_ty);
+                        .insert_class_member_type(cls_name, attr.clone(), merged);
                 }
                 let _ = self.infer_expr(target);
             }
@@ -708,11 +798,7 @@ impl<'a> ExprAnalyzer<'a> {
                     self.env,
                     self.scope_stack,
                 );
-                let effective_ty = if !matches!(ann_ty, Type::Any | Type::None) {
-                    ann_ty
-                } else {
-                    val_ty
-                };
+                let effective_ty = merge_annotated_type(ann_ty, val_ty);
                 self.analyze_assign_target(target, effective_ty);
             }
 
@@ -755,10 +841,43 @@ impl<'a> ExprAnalyzer<'a> {
                 body,
             } => {
                 let iter_ty = self.infer_expr(iterable);
-                let elem_ty = match iter_ty {
-                    Type::List(elem) => *elem,
-                    Type::ControlHandle => Type::ControlHandle,
-                    _ => Type::Any,
+                let is_range_call = matches!(
+                    &iterable.kind,
+                    ast::ExprKind::Call { callee, .. }
+                        if matches!(&callee.kind, ast::ExprKind::Ident(n) if n == "range")
+                );
+                let elem_ty = if is_range_call {
+                    Type::Int
+                } else if let ast::ExprKind::Call { callee, args, .. } = &iterable.kind
+                    && matches!(&callee.kind, ast::ExprKind::Ident(n) if n == "enumerate")
+                {
+                    let inner_iter_ty = args
+                        .first()
+                        .and_then(|a| self.type_map.get_type(a.span).cloned())
+                        .unwrap_or(Type::Any);
+                    let inner_elem = match inner_iter_ty {
+                        Type::List(e) => *e,
+                        Type::Dict(k, _) => *k,
+                        Type::String => Type::String,
+                        Type::ControlHandle => Type::ControlHandle,
+                        _ => Type::Any,
+                    };
+                    Type::Tuple(vec![Type::Int, inner_elem])
+                } else {
+                    match iter_ty {
+                        Type::List(elem) => *elem,
+                        Type::Dict(k, v) => {
+                            if target.contains(',') {
+                                Type::Tuple(vec![*k, *v])
+                            } else {
+                                *k
+                            }
+                        }
+                        Type::Tuple(elems) => elems.first().cloned().unwrap_or(Type::Any),
+                        Type::String => Type::String,
+                        Type::ControlHandle => Type::ControlHandle,
+                        _ => Type::Any,
+                    }
                 };
 
                 let sym_id = self.scope_stack.alloc_symbol_id();
@@ -769,10 +888,33 @@ impl<'a> ExprAnalyzer<'a> {
                     target.clone(),
                     SymbolKind::Variable {
                         id: sym_id,
-                        ty: elem_ty,
+                        ty: elem_ty.clone(),
                     },
                     stmt.span,
                 ));
+                if target.contains(',') {
+                    for (idx, part) in target.split(',').enumerate() {
+                        let part_name = part.trim();
+                        if !part_name.is_empty() {
+                            let part_ty = match &elem_ty {
+                                Type::Tuple(elems) => elems.get(idx).cloned().unwrap_or(Type::Any),
+                                _ => Type::Any,
+                            };
+                            let part_id = self.scope_stack.alloc_symbol_id();
+                            self.type_map
+                                .insert_symbol_name(part_id, part_name.to_string());
+                            self.scope_stack.define(Symbol::new(
+                                part_id,
+                                part_name.to_string(),
+                                SymbolKind::Variable {
+                                    id: part_id,
+                                    ty: part_ty,
+                                },
+                                stmt.span,
+                            ));
+                        }
+                    }
+                }
                 self.type_map
                     .insert_resolution(stmt.span, ResolvedTarget::Local(sym_id));
 
@@ -842,7 +984,7 @@ impl<'a> ExprAnalyzer<'a> {
                 for (idx, param) in f.params.iter().enumerate() {
                     let default_ty = param.default.as_ref().map(|d| self.infer_expr(d));
                     let param_sym_id = self.scope_stack.alloc_symbol_id();
-                    let mut param_ty = if idx == 0 && param.name == "self" {
+                    let ann_param_ty = if idx == 0 && param.name == "self" {
                         if let Some(ref cls_name) = enclosing_class {
                             Type::UserInstance {
                                 name: cls_name.clone(),
@@ -857,12 +999,11 @@ impl<'a> ExprAnalyzer<'a> {
                             self.scope_stack,
                         )
                     };
-                    if param_ty == Type::Any
-                        && let Some(ref dt) = default_ty
-                        && !matches!(dt, Type::Any | Type::None)
-                    {
-                        param_ty = dt.clone();
-                    }
+                    let param_ty = if let Some(ref dt) = default_ty {
+                        merge_annotated_type(ann_param_ty, dt.clone())
+                    } else {
+                        ann_param_ty
+                    };
                     self.type_map
                         .insert_symbol_name(param_sym_id, param.name.clone());
                     self.type_map
@@ -892,18 +1033,15 @@ impl<'a> ExprAnalyzer<'a> {
                 self.context = outer_context;
                 self.scope_stack.pop_scope();
 
-                let mut ret_ty = crate::type_from_annotation_with_scope(
+                let ann_ret_ty = crate::type_from_annotation_with_scope(
                     f.return_type.as_deref(),
                     self.env,
                     self.scope_stack,
                 );
-                if ret_ty == Type::Any
-                    && let Some(ret_expr) = find_first_return_expr(&f.body)
-                    && let Some(inferred) = self.type_map.get_type(ret_expr.span)
-                    && *inferred != Type::Any
-                {
-                    ret_ty = inferred.clone();
-                }
+                let inferred_ret_ty = find_first_return_expr(&f.body)
+                    .and_then(|ret_expr| self.type_map.get_type(ret_expr.span).cloned())
+                    .unwrap_or(Type::Any);
+                let ret_ty = merge_annotated_type(ann_ret_ty, inferred_ret_ty);
 
                 if let Some(cls_name) = enclosing_class {
                     self.type_map
@@ -1332,7 +1470,10 @@ impl<'a> ExprAnalyzer<'a> {
                                         expr.span,
                                         ResolvedTarget::Function(*id),
                                     );
-                                    Type::Any
+                                    self.type_map
+                                        .get_class_member_type(name, attr)
+                                        .cloned()
+                                        .unwrap_or(Type::Any)
                                 }
                                 SymbolKind::Variable { id, ty } => {
                                     self.type_map
@@ -1468,7 +1609,13 @@ impl<'a> ExprAnalyzer<'a> {
                     | ast::BinaryOp::GtEq => Type::Bool,
 
                     ast::BinaryOp::Add => {
-                        if left_ty == Type::String || right_ty == Type::String {
+                        if let (Type::List(l_elem), Type::List(_r_elem)) = (&left_ty, &right_ty) {
+                            if **l_elem != Type::Any {
+                                left_ty
+                            } else {
+                                right_ty
+                            }
+                        } else if left_ty == Type::String || right_ty == Type::String {
                             Type::String
                         } else if left_ty == Type::Float || right_ty == Type::Float {
                             Type::Float
@@ -1484,6 +1631,10 @@ impl<'a> ExprAnalyzer<'a> {
                             || (left_ty == Type::Int && right_ty == Type::String)
                         {
                             Type::String
+                        } else if matches!((&left_ty, &right_ty), (Type::List(_), Type::Int)) {
+                            left_ty
+                        } else if matches!((&left_ty, &right_ty), (Type::Int, Type::List(_))) {
+                            right_ty
                         } else if left_ty == Type::Float || right_ty == Type::Float {
                             Type::Float
                         } else if left_ty == Type::Int && right_ty == Type::Int {
@@ -1584,6 +1735,28 @@ impl<'a> ExprAnalyzer<'a> {
                     Type::UserInstance { name }
                 } else if let ast::ExprKind::Attribute { value, attr } = &callee.kind {
                     let receiver_ty = self.type_map.get_type(value.span).cloned();
+                    if let Some(Type::List(ref inner_ty)) = receiver_ty
+                        && **inner_ty == Type::Any
+                        && let ast::ExprKind::Ident(ref var_name) = value.kind
+                    {
+                        let new_elem_ty = if attr == "append" {
+                            arg_types.first().cloned().unwrap_or(Type::Any)
+                        } else if attr == "extend" {
+                            match arg_types.first() {
+                                Some(Type::List(e)) => (**e).clone(),
+                                _ => Type::Any,
+                            }
+                        } else {
+                            Type::Any
+                        };
+                        if !matches!(new_elem_ty, Type::Any | Type::None)
+                            && let Some(sym) = self.scope_stack.lookup(var_name)
+                        {
+                            let sym_id = sym.id;
+                            let upgraded = Type::List(Box::new(new_elem_ty));
+                            self.scope_stack.update_variable_type(sym_id, upgraded);
+                        }
+                    }
                     if let Some(Type::Native { ref name }) = receiver_ty {
                         match self.env.member(name, attr) {
                             Some(Member::Method(method)) => {
@@ -1603,6 +1776,28 @@ impl<'a> ExprAnalyzer<'a> {
                             self.type_map.get_module_member_type(name, attr).cloned()
                     {
                         ret_ty
+                    } else if let Some(Type::Dict(ref k_ty, ref v_ty)) = receiver_ty {
+                        match attr.as_str() {
+                            "keys" => Type::List(k_ty.clone()),
+                            "values" => Type::List(v_ty.clone()),
+                            "items" => Type::List(Box::new(Type::Tuple(vec![
+                                (**k_ty).clone(),
+                                (**v_ty).clone(),
+                            ]))),
+                            "get" => arg_types
+                                .get(1)
+                                .cloned()
+                                .filter(|t| !matches!(t, Type::Any | Type::None))
+                                .unwrap_or_else(|| (**v_ty).clone()),
+                            "pop" => (**v_ty).clone(),
+                            _ => Type::Any,
+                        }
+                    } else if let Some(Type::List(ref elem_ty)) = receiver_ty {
+                        match attr.as_str() {
+                            "pop" => (**elem_ty).clone(),
+                            "copy" => Type::List(elem_ty.clone()),
+                            _ => Type::Any,
+                        }
                     } else if receiver_ty == Some(Type::String) {
                         match attr.as_str() {
                             "upper" | "lower" | "strip" | "lstrip" | "rstrip" | "replace"
@@ -1636,6 +1831,16 @@ impl<'a> ExprAnalyzer<'a> {
                             }
                         } else {
                             Type::Any
+                        }
+                    } else if is_runtime_global && fn_name == "list" {
+                        match arg_types.first() {
+                            Some(Type::List(e)) => Type::List(e.clone()),
+                            Some(Type::Dict(k, _)) => Type::List(k.clone()),
+                            Some(Type::Tuple(elems)) => {
+                                Type::List(Box::new(elems.first().cloned().unwrap_or(Type::Any)))
+                            }
+                            Some(Type::String) => Type::List(Box::new(Type::String)),
+                            _ => Type::List(Box::new(Type::Any)),
                         }
                     } else if is_runtime_global
                         && let Some(function) =
@@ -1695,6 +1900,81 @@ impl<'a> ExprAnalyzer<'a> {
                 } else {
                     Type::Any
                 }
+            }
+
+            ast::ExprKind::ListComp { elt, generators } => {
+                self.scope_stack.push_scope(ScopeKind::Block);
+                for g in generators {
+                    let iter_ty = self.infer_expr(&g.iter);
+                    let is_range_call = matches!(
+                        &g.iter.kind,
+                        ast::ExprKind::Call { callee, .. }
+                            if matches!(&callee.kind, ast::ExprKind::Ident(n) if n == "range")
+                    );
+                    let elem_ty = if is_range_call {
+                        Type::Int
+                    } else if let ast::ExprKind::Call { callee, args, .. } = &g.iter.kind
+                        && matches!(&callee.kind, ast::ExprKind::Ident(n) if n == "enumerate")
+                    {
+                        let inner_iter_ty = args
+                            .first()
+                            .and_then(|a| self.type_map.get_type(a.span).cloned())
+                            .unwrap_or(Type::Any);
+                        let inner_elem = match inner_iter_ty {
+                            Type::List(e) => *e,
+                            Type::Dict(k, _) => *k,
+                            Type::String => Type::String,
+                            Type::ControlHandle => Type::ControlHandle,
+                            _ => Type::Any,
+                        };
+                        Type::Tuple(vec![Type::Int, inner_elem])
+                    } else {
+                        match iter_ty {
+                            Type::List(elem) => *elem,
+                            Type::Dict(k, v) => {
+                                if g.targets.len() == 1 {
+                                    *k
+                                } else {
+                                    Type::Tuple(vec![*k, *v])
+                                }
+                            }
+                            Type::Tuple(elems) => elems.first().cloned().unwrap_or(Type::Any),
+                            Type::String => Type::String,
+                            Type::ControlHandle => Type::ControlHandle,
+                            _ => Type::Any,
+                        }
+                    };
+                    for (idx, (t_name, t_span)) in g.targets.iter().enumerate() {
+                        let t_ty = if g.targets.len() == 1 {
+                            elem_ty.clone()
+                        } else if let Type::Tuple(ref elems) = elem_ty {
+                            elems.get(idx).cloned().unwrap_or(Type::Any)
+                        } else {
+                            Type::Any
+                        };
+                        let sym_id = self.scope_stack.alloc_symbol_id();
+                        self.type_map.insert_symbol_name(sym_id, t_name.clone());
+                        self.scope_stack.define(Symbol::new(
+                            sym_id,
+                            t_name.clone(),
+                            SymbolKind::Variable {
+                                id: sym_id,
+                                ty: t_ty.clone(),
+                            },
+                            *t_span,
+                        ));
+                        self.type_map
+                            .insert_resolution(*t_span, ResolvedTarget::Local(sym_id));
+                        self.type_map.insert_type(*t_span, t_ty);
+                    }
+                    for cond in &g.ifs {
+                        let c_ty = self.infer_expr(cond);
+                        self.type_map.insert_type(cond.span, c_ty);
+                    }
+                }
+                let elt_ty = self.infer_expr(elt);
+                self.scope_stack.pop_scope();
+                Type::List(Box::new(elt_ty))
             }
 
             ast::ExprKind::Error => Type::Any,

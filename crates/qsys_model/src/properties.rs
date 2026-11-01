@@ -43,6 +43,10 @@ pub struct PropertyDef {
     pub name: String,
     pub kind: PropertyKind,
     pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub choices_lua_expr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_lua_expr: Option<String>,
 }
 
 impl PropertyDef {
@@ -56,6 +60,8 @@ impl PropertyDef {
             name: name.into(),
             kind: PropertyKind::Integer { default, min, max },
             description: None,
+            choices_lua_expr: None,
+            default_lua_expr: None,
         }
     }
 
@@ -69,6 +75,8 @@ impl PropertyDef {
             name: name.into(),
             kind: PropertyKind::Double { default, min, max },
             description: None,
+            choices_lua_expr: None,
+            default_lua_expr: None,
         }
     }
 
@@ -79,6 +87,8 @@ impl PropertyDef {
                 default: default.into(),
             },
             description: None,
+            choices_lua_expr: None,
+            default_lua_expr: None,
         }
     }
 
@@ -94,6 +104,8 @@ impl PropertyDef {
                 default: default.into(),
             },
             description: None,
+            choices_lua_expr: None,
+            default_lua_expr: None,
         }
     }
 
@@ -102,11 +114,23 @@ impl PropertyDef {
             name: name.into(),
             kind: PropertyKind::Boolean { default },
             description: None,
+            choices_lua_expr: None,
+            default_lua_expr: None,
         }
     }
 
     pub fn with_description(mut self, desc: impl Into<String>) -> Self {
         self.description = Some(desc.into());
+        self
+    }
+
+    pub fn with_choices_lua_expr(mut self, expr: Option<String>) -> Self {
+        self.choices_lua_expr = expr;
+        self
+    }
+
+    pub fn with_default_lua_expr(mut self, expr: Option<String>) -> Self {
+        self.default_lua_expr = expr;
         self
     }
 }

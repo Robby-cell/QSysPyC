@@ -259,16 +259,18 @@ impl<'a> Lowerer<'a> {
                     return;
                 }
 
-                let target = match f.target.as_ref() {
-                    ruff::Expr::Name(n) => n.id.to_string(),
-                    _ => {
-                        self.diagnostics.report(
-                            DiagnosticKind::UnsupportedForTarget,
-                            text_range_to_span(f.target.range()),
-                        );
-                        return;
-                    }
+                let Some(targets) = extract_comp_targets(&f.target) else {
+                    self.diagnostics.report(
+                        DiagnosticKind::UnsupportedForTarget,
+                        text_range_to_span(f.target.range()),
+                    );
+                    return;
                 };
+                let target = targets
+                    .into_iter()
+                    .map(|(n, _)| n)
+                    .collect::<Vec<_>>()
+                    .join(", ");
 
                 let iterable = self.lower_expr(&f.iter);
                 let body = self.lower_suite(&f.body);
@@ -492,33 +494,11 @@ impl<'a> Lowerer<'a> {
             }
 
             ruff::Expr::ListComp(comp) => {
-                if let Some(items) = self.try_unroll_comprehension(&comp.elt, &comp.generators) {
-                    ExprKind::List(items)
-                } else {
-                    self.diagnostics.report(
-                        DiagnosticKind::unsupported_expression(
-                            "List comprehensions must iterate over a constant range(...) or list/tuple literal",
-                        ),
-                        span,
-                    );
-                    ExprKind::Error
-                }
+                self.lower_comprehension(&comp.elt, &comp.generators, span)
             }
 
             ruff::Expr::Generator(gen_expr) => {
-                if let Some(items) =
-                    self.try_unroll_comprehension(&gen_expr.elt, &gen_expr.generators)
-                {
-                    ExprKind::List(items)
-                } else {
-                    self.diagnostics.report(
-                        DiagnosticKind::unsupported_expression(
-                            "Generator expressions must iterate over a constant range(...) or list/tuple literal",
-                        ),
-                        span,
-                    );
-                    ExprKind::Error
-                }
+                self.lower_comprehension(&gen_expr.elt, &gen_expr.generators, span)
             }
 
             ruff::Expr::Attribute(a) => {
@@ -677,197 +657,141 @@ impl<'a> Lowerer<'a> {
         Expr::new(kind, span)
     }
 
-    fn try_unroll_comprehension(
+    fn lower_comprehension(
         &mut self,
         elt: &ruff::Expr,
         generators: &[ruff::Comprehension],
-    ) -> Option<Vec<Expr>> {
-        if generators.len() != 1 {
-            return None;
+        span: Span,
+    ) -> ExprKind {
+        let mut lowered_gens = Vec::with_capacity(generators.len());
+        for gen_clause in generators {
+            let clause_span = text_range_to_span(gen_clause.range());
+            if gen_clause.is_async {
+                self.diagnostics
+                    .report(DiagnosticKind::unsupported_async("async for"), clause_span);
+                return ExprKind::Error;
+            }
+            let Some(targets) = extract_comp_targets(&gen_clause.target) else {
+                self.diagnostics.report(
+                    DiagnosticKind::UnsupportedForTarget,
+                    text_range_to_span(gen_clause.target.range()),
+                );
+                return ExprKind::Error;
+            };
+            let iter = self.lower_expr(&gen_clause.iter);
+            let ifs = gen_clause
+                .ifs
+                .iter()
+                .map(|cond| self.lower_expr(cond))
+                .collect();
+            lowered_gens.push(Comprehension {
+                targets,
+                iter,
+                ifs,
+                span: clause_span,
+            });
         }
-        let gen_clause = &generators[0];
-        if gen_clause.is_async || !gen_clause.ifs.is_empty() {
-            return None;
+        let lowered_elt = Box::new(self.lower_expr(elt));
+        let _ = span;
+        ExprKind::ListComp {
+            elt: lowered_elt,
+            generators: lowered_gens,
         }
-        let var_name = match &gen_clause.target {
-            ruff::Expr::Name(n) => n.id.to_string(),
-            _ => return None,
-        };
-        let iter_expr = self.lower_expr(&gen_clause.iter);
-        let values = extract_const_iter_values(&iter_expr)?;
-        let template_expr = self.lower_expr(elt);
-        let mut out = Vec::with_capacity(values.len());
-        for val in values {
-            out.push(substitute_expr_ident(&template_expr, &var_name, &val));
-        }
-        Some(out)
     }
 }
 
-fn extract_const_iter_values(iter_expr: &Expr) -> Option<Vec<Expr>> {
-    match &iter_expr.kind {
-        ExprKind::List(items) | ExprKind::Tuple(items) => Some(items.clone()),
-        ExprKind::Call { callee, args, .. } => {
-            if let ExprKind::Ident(fn_name) = &callee.kind
-                && fn_name == "range"
-            {
-                let (start, stop, step) = match args.as_slice() {
-                    [stop_e] => (0, eval_int_literal(stop_e)?, 1),
-                    [start_e, stop_e] => (eval_int_literal(start_e)?, eval_int_literal(stop_e)?, 1),
-                    [start_e, stop_e, step_e] => (
-                        eval_int_literal(start_e)?,
-                        eval_int_literal(stop_e)?,
-                        eval_int_literal(step_e)?,
-                    ),
-                    _ => return None,
-                };
-                if step == 0 {
+fn extract_comp_targets(target: &ruff::Expr) -> Option<Vec<(String, Span)>> {
+    match target {
+        ruff::Expr::Name(n) => Some(vec![(n.id.to_string(), text_range_to_span(n.range()))]),
+        ruff::Expr::Tuple(t) => {
+            let mut out = Vec::with_capacity(t.elts.len());
+            for elt in &t.elts {
+                if let ruff::Expr::Name(n) = elt {
+                    out.push((n.id.to_string(), text_range_to_span(n.range())));
+                } else {
                     return None;
                 }
-                let mut values = Vec::new();
-                let mut cur = start;
-                let max_iters = 256;
-                while (step > 0 && cur < stop) || (step < 0 && cur > stop) {
-                    if values.len() >= max_iters {
-                        return None;
-                    }
-                    values.push(Expr::new(ExprKind::Int(cur), iter_expr.span));
-                    cur += step;
-                }
-                return Some(values);
             }
-            None
+            if out.is_empty() { None } else { Some(out) }
+        }
+        ruff::Expr::List(l) => {
+            let mut out = Vec::with_capacity(l.elts.len());
+            for elt in &l.elts {
+                if let ruff::Expr::Name(n) = elt {
+                    out.push((n.id.to_string(), text_range_to_span(n.range())));
+                } else {
+                    return None;
+                }
+            }
+            if out.is_empty() { None } else { Some(out) }
         }
         _ => None,
     }
-}
-
-fn eval_int_literal(expr: &Expr) -> Option<i64> {
-    match &expr.kind {
-        ExprKind::Int(i) => Some(*i),
-        ExprKind::Unary {
-            op: UnaryOp::Neg,
-            operand,
-        } => eval_int_literal(operand).map(|v| -v),
-        ExprKind::Unary {
-            op: UnaryOp::Pos,
-            operand,
-        } => eval_int_literal(operand),
-        _ => None,
-    }
-}
-
-fn substitute_expr_ident(expr: &Expr, target: &str, replacement: &Expr) -> Expr {
-    let kind = match &expr.kind {
-        ExprKind::Ident(name) if name == target => {
-            return Expr::new(replacement.kind.clone(), expr.span);
-        }
-        ExprKind::Ident(_)
-        | ExprKind::Int(_)
-        | ExprKind::Float(_)
-        | ExprKind::String(_)
-        | ExprKind::Bool(_)
-        | ExprKind::None
-        | ExprKind::Error => expr.kind.clone(),
-        ExprKind::Tuple(items) => ExprKind::Tuple(
-            items
-                .iter()
-                .map(|i| substitute_expr_ident(i, target, replacement))
-                .collect(),
-        ),
-        ExprKind::List(items) => ExprKind::List(
-            items
-                .iter()
-                .map(|i| substitute_expr_ident(i, target, replacement))
-                .collect(),
-        ),
-        ExprKind::Dict(pairs) => ExprKind::Dict(
-            pairs
-                .iter()
-                .map(|(k, v)| {
-                    (
-                        substitute_expr_ident(k, target, replacement),
-                        substitute_expr_ident(v, target, replacement),
-                    )
-                })
-                .collect(),
-        ),
-        ExprKind::Binary { left, op, right } => ExprKind::Binary {
-            left: Box::new(substitute_expr_ident(left, target, replacement)),
-            op: *op,
-            right: Box::new(substitute_expr_ident(right, target, replacement)),
-        },
-        ExprKind::BoolOp { op, left, right } => ExprKind::BoolOp {
-            op: *op,
-            left: Box::new(substitute_expr_ident(left, target, replacement)),
-            right: Box::new(substitute_expr_ident(right, target, replacement)),
-        },
-        ExprKind::Unary { op, operand } => ExprKind::Unary {
-            op: *op,
-            operand: Box::new(substitute_expr_ident(operand, target, replacement)),
-        },
-        ExprKind::Call {
-            callee,
-            args,
-            kwargs,
-        } => ExprKind::Call {
-            callee: Box::new(substitute_expr_ident(callee, target, replacement)),
-            args: args
-                .iter()
-                .map(|a| substitute_expr_ident(a, target, replacement))
-                .collect(),
-            kwargs: kwargs
-                .iter()
-                .map(|(k, v)| (k.clone(), substitute_expr_ident(v, target, replacement)))
-                .collect(),
-        },
-        ExprKind::Attribute { value, attr } => ExprKind::Attribute {
-            value: Box::new(substitute_expr_ident(value, target, replacement)),
-            attr: attr.clone(),
-        },
-        ExprKind::Subscript { value, index } => ExprKind::Subscript {
-            value: Box::new(substitute_expr_ident(value, target, replacement)),
-            index: Box::new(substitute_expr_ident(index, target, replacement)),
-        },
-        ExprKind::Lambda { params, body } => {
-            if params.iter().any(|p| p.name == target) {
-                ExprKind::Lambda {
-                    params: params.clone(),
-                    body: body.clone(),
-                }
-            } else {
-                ExprKind::Lambda {
-                    params: params.clone(),
-                    body: Box::new(substitute_expr_ident(body, target, replacement)),
-                }
-            }
-        }
-        ExprKind::IfExp { test, body, orelse } => ExprKind::IfExp {
-            test: Box::new(substitute_expr_ident(test, target, replacement)),
-            body: Box::new(substitute_expr_ident(body, target, replacement)),
-            orelse: Box::new(substitute_expr_ident(orelse, target, replacement)),
-        },
-    };
-    Expr::new(kind, expr.span)
 }
 
 fn lower_type_annotation(expr: &ruff::Expr) -> String {
     match expr {
         ruff::Expr::Name(n) => n.id.to_string(),
+        ruff::Expr::StringLiteral(s) => s.value.to_str().to_string(),
         ruff::Expr::Attribute(a) => {
             if let ruff::Expr::Name(base) = a.value.as_ref() {
-                format!("{}.{}", base.id, a.attr)
+                if base.id.as_str() == "typing" {
+                    a.attr.to_string()
+                } else {
+                    format!("{}.{}", base.id, a.attr)
+                }
             } else {
                 a.attr.to_string()
             }
         }
         ruff::Expr::Subscript(s) => {
-            if let ruff::Expr::Name(base) = s.value.as_ref() {
-                if base.id.as_str() == "Optional" {
-                    return lower_type_annotation(&s.slice);
-                }
-                if base.id.as_str() == "list" || base.id.as_str() == "List" {
-                    return "list".to_string();
+            let base_name = match s.value.as_ref() {
+                ruff::Expr::Name(base) => Some(base.id.as_str()),
+                ruff::Expr::Attribute(a) => Some(a.attr.as_str()),
+                _ => None,
+            };
+            if let Some(base) = base_name {
+                match base {
+                    "Optional" => return lower_type_annotation(&s.slice),
+                    "Union" => {
+                        if let ruff::Expr::Tuple(t) = s.slice.as_ref() {
+                            for elt in &t.elts {
+                                let lowered = lower_type_annotation(elt);
+                                if lowered != "None" {
+                                    return lowered;
+                                }
+                            }
+                            return "None".to_string();
+                        }
+                        return lower_type_annotation(&s.slice);
+                    }
+                    "list" | "List" | "Sequence" | "Iterable" | "set" | "Set" => {
+                        return format!("list[{}]", lower_type_annotation(&s.slice));
+                    }
+                    "dict" | "Dict" | "Mapping" => {
+                        if let ruff::Expr::Tuple(t) = s.slice.as_ref()
+                            && t.elts.len() == 2
+                        {
+                            return format!(
+                                "dict[{}, {}]",
+                                lower_type_annotation(&t.elts[0]),
+                                lower_type_annotation(&t.elts[1])
+                            );
+                        }
+                        return "dict".to_string();
+                    }
+                    "tuple" | "Tuple" => {
+                        if let ruff::Expr::Tuple(t) = s.slice.as_ref() {
+                            let elems: Vec<String> =
+                                t.elts.iter().map(lower_type_annotation).collect();
+                            return format!("({})", elems.join(", "));
+                        }
+                        return format!("({})", lower_type_annotation(&s.slice));
+                    }
+                    "type" | "Type" => {
+                        return format!("type[{}]", lower_type_annotation(&s.slice));
+                    }
+                    _ => {}
                 }
             }
             "Any".to_string()

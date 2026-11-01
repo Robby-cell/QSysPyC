@@ -10,7 +10,8 @@ use qsys_model::{
 use qsys_parser::ast;
 
 use crate::declarations::{
-    ConstValue, DeclaredControl, DeclaredProperty, eval_constant, eval_constant_with_env,
+    ConstValue, DeclaredControl, DeclaredProperty, eval_const_stmt, eval_constant,
+    eval_constant_with_env,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -20,6 +21,7 @@ pub struct UiResolveEnv<'a> {
     pub module_functions: FxHashMap<String, ast::FunctionDef>,
     pub local_functions: FxHashMap<String, ast::FunctionDef>,
     pub constants: FxHashMap<String, ConstValue>,
+    pub scope_types: FxHashMap<String, crate::types::Type>,
 }
 
 impl<'a> UiResolveEnv<'a> {
@@ -30,6 +32,7 @@ impl<'a> UiResolveEnv<'a> {
             module_functions: FxHashMap::default(),
             local_functions: FxHashMap::default(),
             constants: FxHashMap::default(),
+            scope_types: FxHashMap::default(),
         }
     }
 
@@ -44,43 +47,266 @@ impl<'a> UiResolveEnv<'a> {
             module_functions: FxHashMap::default(),
             local_functions: FxHashMap::default(),
             constants: FxHashMap::default(),
+            scope_types: FxHashMap::default(),
         };
 
         for stmt in module_stmts {
             match &stmt.kind {
                 ast::StmtKind::FunctionDef(f) => {
+                    if let Some(ret_ann) = &f.return_type {
+                        env.scope_types
+                            .insert(f.name.clone(), crate::parse_simple_type_annotation(ret_ann));
+                    }
                     env.module_functions.insert(f.name.clone(), f.clone());
                 }
-                ast::StmtKind::Assign { target, value, .. } => {
-                    if let ast::ExprKind::Ident(name) = &target.kind
-                        && let Some(val) = eval_constant_with_env(value, &env.constants)
-                            .or_else(|| eval_constant(value))
+                ast::StmtKind::Assign {
+                    target,
+                    type_annotation,
+                    ..
+                } => {
+                    if let Some(ann) = type_annotation
+                        && let ast::ExprKind::Ident(name) = &target.kind
                     {
-                        env.constants.insert(name.clone(), val);
+                        env.scope_types
+                            .insert(name.clone(), crate::parse_simple_type_annotation(ann));
                     }
+                    eval_const_stmt(stmt, &mut env.constants);
                 }
-                _ => {}
+                ast::StmtKind::ClassDef(cls) => {
+                    env.scope_types.insert(
+                        cls.name.clone(),
+                        crate::types::Type::UserClass {
+                            name: cls.name.clone(),
+                        },
+                    );
+                    eval_const_stmt(stmt, &mut env.constants);
+                }
+                _ => {
+                    eval_const_stmt(stmt, &mut env.constants);
+                }
             }
         }
 
         for stmt in class_body {
             match &stmt.kind {
                 ast::StmtKind::FunctionDef(f) => {
+                    if let Some(ret_ann) = &f.return_type {
+                        env.scope_types
+                            .insert(f.name.clone(), crate::parse_simple_type_annotation(ret_ann));
+                    }
                     env.class_methods.insert(f.name.clone(), f.clone());
                 }
-                ast::StmtKind::Assign { target, value, .. } => {
-                    if let ast::ExprKind::Ident(name) = &target.kind
-                        && let Some(val) = eval_constant_with_env(value, &env.constants)
-                            .or_else(|| eval_constant(value))
+                ast::StmtKind::Assign {
+                    target,
+                    type_annotation,
+                    ..
+                } => {
+                    if let Some(ann) = type_annotation
+                        && let ast::ExprKind::Ident(name) = &target.kind
                     {
-                        env.constants.insert(name.clone(), val);
+                        env.scope_types
+                            .insert(name.clone(), crate::parse_simple_type_annotation(ann));
                     }
+                    eval_const_stmt(stmt, &mut env.constants);
                 }
-                _ => {}
+                _ => {
+                    eval_const_stmt(stmt, &mut env.constants);
+                }
             }
         }
 
         env
+    }
+
+    pub(crate) fn infer_expr_type(
+        &self,
+        class_name: &str,
+        expr: &ast::Expr,
+    ) -> Option<crate::types::Type> {
+        use crate::types::Type;
+        match &expr.kind {
+            ast::ExprKind::Int(_) => Some(Type::Int),
+            ast::ExprKind::Float(_) => Some(Type::Float),
+            ast::ExprKind::String(_) => Some(Type::String),
+            ast::ExprKind::Bool(_) => Some(Type::Bool),
+            ast::ExprKind::None => Some(Type::None),
+            ast::ExprKind::Ident(name) => {
+                if let Some(ty) = self.scope_types.get(name) {
+                    return Some(ty.clone());
+                }
+                if let Some(prop) = self
+                    .properties
+                    .iter()
+                    .find(|p| p.ident == *name || p.def.name == *name)
+                {
+                    return Some(match prop.def.kind {
+                        PropertyKind::Integer { .. } => Type::Int,
+                        PropertyKind::Double { .. } => Type::Float,
+                        PropertyKind::String { .. } | PropertyKind::Enum { .. } => Type::String,
+                        PropertyKind::Boolean { .. } => Type::Bool,
+                    });
+                }
+                None
+            }
+            ast::ExprKind::Attribute { value, attr } => {
+                if attr == "Value"
+                    && let Some(prop) = match &value.kind {
+                        ast::ExprKind::Ident(name) => self
+                            .properties
+                            .iter()
+                            .find(|p| p.ident == *name || p.def.name == *name),
+                        ast::ExprKind::Attribute {
+                            value: inner_obj,
+                            attr: prop_ident,
+                        } if matches!(
+                            &inner_obj.kind,
+                            ast::ExprKind::Ident(s) if s == "self" || s == class_name
+                        ) =>
+                        {
+                            self.properties
+                                .iter()
+                                .find(|p| p.ident == *prop_ident || p.def.name == *prop_ident)
+                        }
+                        _ => None,
+                    }
+                {
+                    return Some(match prop.def.kind {
+                        PropertyKind::Integer { .. } => Type::Int,
+                        PropertyKind::Double { .. } => Type::Float,
+                        PropertyKind::String { .. } | PropertyKind::Enum { .. } => Type::String,
+                        PropertyKind::Boolean { .. } => Type::Bool,
+                    });
+                }
+                if let ast::ExprKind::Ident(obj_name) = &value.kind
+                    && (obj_name == "self" || obj_name == class_name)
+                {
+                    if let Some(ty) = self.scope_types.get(attr) {
+                        return Some(ty.clone());
+                    }
+                    if let Some(prop) = self
+                        .properties
+                        .iter()
+                        .find(|p| p.ident == *attr || p.def.name == *attr)
+                    {
+                        return Some(match prop.def.kind {
+                            PropertyKind::Integer { .. } => Type::Int,
+                            PropertyKind::Double { .. } => Type::Float,
+                            PropertyKind::String { .. } | PropertyKind::Enum { .. } => Type::String,
+                            PropertyKind::Boolean { .. } => Type::Bool,
+                        });
+                    }
+                }
+                None
+            }
+            ast::ExprKind::Subscript { value, index } => {
+                match self.infer_expr_type(class_name, value)? {
+                    Type::List(inner) => Some(*inner),
+                    Type::Dict(_, val_ty) => Some(*val_ty),
+                    Type::Tuple(elems) => {
+                        if let ast::ExprKind::Int(i) = &index.kind
+                            && *i >= 0
+                        {
+                            elems.get(*i as usize).cloned()
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                }
+            }
+            ast::ExprKind::Call { callee, args, .. } => {
+                if let ast::ExprKind::Ident(fn_name) = &callee.kind {
+                    match fn_name.as_str() {
+                        "str" => return Some(Type::String),
+                        "int" | "len" | "round" => return Some(Type::Int),
+                        "float" => return Some(Type::Float),
+                        "bool" => return Some(Type::Bool),
+                        "list" => {
+                            if let Some(first) = args.first()
+                                && let Some(Type::Dict(k, _) | Type::List(k)) =
+                                    self.infer_expr_type(class_name, first)
+                            {
+                                return Some(Type::List(k));
+                            }
+                            return Some(Type::List(Box::new(Type::Any)));
+                        }
+                        _ => {}
+                    }
+                    if let Some(func) = self
+                        .local_functions
+                        .get(fn_name)
+                        .or_else(|| self.class_methods.get(fn_name))
+                        .or_else(|| self.module_functions.get(fn_name))
+                        && let Some(ret_ann) = &func.return_type
+                    {
+                        return Some(crate::parse_simple_type_annotation(ret_ann));
+                    }
+                    if let Some(ty) = self.scope_types.get(fn_name) {
+                        return Some(ty.clone());
+                    }
+                }
+                if let ast::ExprKind::Attribute { value, attr } = &callee.kind {
+                    if let ast::ExprKind::Ident(obj_name) = &value.kind
+                        && (obj_name == "self" || obj_name == class_name)
+                    {
+                        if let Some(method) = self.class_methods.get(attr)
+                            && let Some(ret_ann) = &method.return_type
+                        {
+                            return Some(crate::parse_simple_type_annotation(ret_ann));
+                        }
+                        if let Some(ty) = self.scope_types.get(attr) {
+                            return Some(ty.clone());
+                        }
+                    }
+                    if let Some(Type::Dict(k, v)) = self.infer_expr_type(class_name, value) {
+                        match attr.as_str() {
+                            "keys" => return Some(Type::List(k)),
+                            "values" => return Some(Type::List(v)),
+                            "items" => {
+                                return Some(Type::List(Box::new(Type::Tuple(vec![*k, *v]))));
+                            }
+                            "get" => return Some(*v),
+                            _ => {}
+                        }
+                    }
+                }
+                None
+            }
+            ast::ExprKind::Unary { op, operand } => match op {
+                ast::UnaryOp::Not => Some(Type::Bool),
+                ast::UnaryOp::Neg | ast::UnaryOp::Pos | ast::UnaryOp::BitNot => {
+                    self.infer_expr_type(class_name, operand)
+                }
+            },
+            ast::ExprKind::Binary { left, op, right } => match op {
+                ast::BinaryOp::Eq
+                | ast::BinaryOp::NotEq
+                | ast::BinaryOp::Lt
+                | ast::BinaryOp::LtEq
+                | ast::BinaryOp::Gt
+                | ast::BinaryOp::GtEq => Some(Type::Bool),
+                ast::BinaryOp::Div => Some(Type::Float),
+                _ => {
+                    let lt = self.infer_expr_type(class_name, left);
+                    let rt = self.infer_expr_type(class_name, right);
+                    match (lt, rt) {
+                        (Some(Type::String), _) | (_, Some(Type::String))
+                            if *op == ast::BinaryOp::Add =>
+                        {
+                            Some(Type::String)
+                        }
+                        (Some(Type::Float), _) | (_, Some(Type::Float)) => Some(Type::Float),
+                        (Some(Type::Int), Some(Type::Int)) => Some(Type::Int),
+                        (Some(t), None) | (None, Some(t)) => Some(t),
+                        _ => None,
+                    }
+                }
+            },
+            ast::ExprKind::IfExp { body, orelse, .. } => self
+                .infer_expr_type(class_name, body)
+                .or_else(|| self.infer_expr_type(class_name, orelse)),
+            _ => None,
+        }
     }
 
     pub(crate) fn collect_property_resolutions(
@@ -203,6 +429,15 @@ impl<'a> UiResolveEnv<'a> {
                     self.collect_property_resolutions(class_name, item, out);
                 }
             }
+            ast::ExprKind::ListComp { elt, generators } => {
+                for g in generators {
+                    self.collect_property_resolutions(class_name, &g.iter, out);
+                    for cond in &g.ifs {
+                        self.collect_property_resolutions(class_name, cond, out);
+                    }
+                }
+                self.collect_property_resolutions(class_name, elt, out);
+            }
             ast::ExprKind::Lambda { body, .. } => {
                 self.collect_property_resolutions(class_name, body, out);
             }
@@ -267,11 +502,31 @@ impl<'a> UiResolveEnv<'a> {
             ast::ExprKind::List(items) | ast::ExprKind::Tuple(items) => items
                 .iter()
                 .any(|i| self.is_dynamic_design_expr(class_name, i)),
+            ast::ExprKind::ListComp { elt, generators } => {
+                self.is_dynamic_design_expr(class_name, elt)
+                    || generators.iter().any(|g| {
+                        self.is_dynamic_design_expr(class_name, &g.iter)
+                            || g.ifs
+                                .iter()
+                                .any(|c| self.is_dynamic_design_expr(class_name, c))
+                    })
+            }
             ast::ExprKind::Call { callee, args, .. } => {
                 if let ast::ExprKind::Ident(fn_name) = &callee.kind
                     && matches!(
                         fn_name.as_str(),
-                        "str" | "int" | "float" | "bool" | "abs" | "min" | "max" | "round"
+                        "str"
+                            | "int"
+                            | "float"
+                            | "bool"
+                            | "abs"
+                            | "min"
+                            | "max"
+                            | "round"
+                            | "range"
+                            | "len"
+                            | "enumerate"
+                            | "list"
                     )
                     && !self.local_functions.contains_key(fn_name)
                     && !self.class_methods.contains_key(fn_name)
@@ -342,6 +597,20 @@ impl<'a> UiResolveEnv<'a> {
                 let parts: Vec<String> = items.iter().map(Self::const_val_to_lua).collect();
                 format!("{{ {} }}", parts.join(", "))
             }
+            ConstValue::Dict(entries) => {
+                let parts: Vec<String> = entries
+                    .iter()
+                    .map(|(k, v)| {
+                        format!(
+                            "[{}] = {}",
+                            Self::const_val_to_lua(k),
+                            Self::const_val_to_lua(v)
+                        )
+                    })
+                    .collect();
+                format!("{{ {} }}", parts.join(", "))
+            }
+            ConstValue::Symbol(name) => name.clone(),
         }
     }
 
@@ -694,6 +963,133 @@ impl<'a> UiResolveEnv<'a> {
                 );
                 format!("{callee_lua}({})", rendered_args.join(", "))
             }
+            ast::ExprKind::List(items) | ast::ExprKind::Tuple(items) => {
+                let parts: Vec<String> = items
+                    .iter()
+                    .map(|i| {
+                        self.lower_ui_expr_to_lua_inner(
+                            class_name,
+                            i,
+                            local_map,
+                            prop_template_mode,
+                        )
+                    })
+                    .collect();
+                format!("{{ {} }}", parts.join(", "))
+            }
+            ast::ExprKind::ListComp { elt, generators } => {
+                if let Some(PreviewVal::Tuple(items)) =
+                    self.eval_design_expr_preview(class_name, expr)
+                {
+                    let parts: Vec<String> = items
+                        .iter()
+                        .map(|v| match v {
+                            PreviewVal::Str(s) => format!("\"{}\"", escape_lua_str_content(s)),
+                            PreviewVal::Int(i) => i.to_string(),
+                            PreviewVal::Float(f) => f.to_string(),
+                            PreviewVal::Bool(b) => b.to_string(),
+                            _ => format!("\"{}\"", escape_lua_str_content(&v.to_display_string())),
+                        })
+                        .collect();
+                    return format!("{{ {} }}", parts.join(", "));
+                }
+                let mut inner_map = local_map.clone();
+                let mut header = String::from("(function() local _comp = {}");
+                let mut closers = String::new();
+                for g in generators {
+                    let t_name = g.targets.first().map(|(n, _)| n.as_str()).unwrap_or("_x");
+                    if let ast::ExprKind::Call { callee, args, .. } = &g.iter.kind
+                        && matches!(&callee.kind, ast::ExprKind::Ident(n) if n == "range")
+                    {
+                        let (start_lua, end_lua, step_lua) = match args.as_slice() {
+                            [end] => (
+                                "0".to_string(),
+                                self.lower_ui_expr_to_lua_inner(
+                                    class_name,
+                                    end,
+                                    &inner_map,
+                                    prop_template_mode,
+                                ),
+                                None,
+                            ),
+                            [start, end] => (
+                                self.lower_ui_expr_to_lua_inner(
+                                    class_name,
+                                    start,
+                                    &inner_map,
+                                    prop_template_mode,
+                                ),
+                                self.lower_ui_expr_to_lua_inner(
+                                    class_name,
+                                    end,
+                                    &inner_map,
+                                    prop_template_mode,
+                                ),
+                                None,
+                            ),
+                            [start, end, step] => (
+                                self.lower_ui_expr_to_lua_inner(
+                                    class_name,
+                                    start,
+                                    &inner_map,
+                                    prop_template_mode,
+                                ),
+                                self.lower_ui_expr_to_lua_inner(
+                                    class_name,
+                                    end,
+                                    &inner_map,
+                                    prop_template_mode,
+                                ),
+                                Some(self.lower_ui_expr_to_lua_inner(
+                                    class_name,
+                                    step,
+                                    &inner_map,
+                                    prop_template_mode,
+                                )),
+                            ),
+                            _ => ("0".to_string(), "0".to_string(), None),
+                        };
+                        inner_map.insert(t_name.to_string(), t_name.to_string());
+                        if let Some(st) = step_lua {
+                            header.push_str(&format!(
+                                " for {t_name} = {start_lua}, ({end_lua}) - 1, {st} do"
+                            ));
+                        } else {
+                            header.push_str(&format!(
+                                " for {t_name} = {start_lua}, ({end_lua}) - 1 do"
+                            ));
+                        }
+                        closers.push_str(" end");
+                    } else {
+                        let iter_lua = self.lower_ui_expr_to_lua_inner(
+                            class_name,
+                            &g.iter,
+                            &inner_map,
+                            prop_template_mode,
+                        );
+                        inner_map.insert(t_name.to_string(), t_name.to_string());
+                        header.push_str(&format!(" for _, {t_name} in ipairs({iter_lua}) do"));
+                        closers.push_str(" end");
+                    }
+                    for cond in &g.ifs {
+                        let c_lua = self.lower_ui_expr_to_lua_inner(
+                            class_name,
+                            cond,
+                            &inner_map,
+                            prop_template_mode,
+                        );
+                        header.push_str(&format!(" if {c_lua} then"));
+                        closers.push_str(" end");
+                    }
+                }
+                let elt_lua = self.lower_ui_expr_to_lua_inner(
+                    class_name,
+                    elt,
+                    &inner_map,
+                    prop_template_mode,
+                );
+                format!("{header} table.insert(_comp, {elt_lua}){closers} return _comp end)()")
+            }
             _ => "\"\"".to_string(),
         }
     }
@@ -738,6 +1134,33 @@ impl<'a> UiResolveEnv<'a> {
             match &stmt.kind {
                 ast::StmtKind::Pass | ast::StmtKind::Global(_) | ast::StmtKind::Nonlocal(_) => {}
                 ast::StmtKind::Expr(e) if matches!(e.kind, ast::ExprKind::String(_)) => {}
+                ast::StmtKind::Expr(e) => {
+                    if let ast::ExprKind::Call {
+                        callee,
+                        args,
+                        kwargs,
+                    } = &e.kind
+                        && kwargs.is_empty()
+                        && let ast::ExprKind::Attribute { value: recv, attr } = &callee.kind
+                        && let ast::ExprKind::Ident(var_name) = &recv.kind
+                    {
+                        if attr == "append"
+                            && args.len() == 1
+                            && let Some(arg_val) =
+                                self.eval_preview_expr_in_env(class_name, &args[0], vars, depth)
+                            && let Some(PreviewVal::Tuple(items)) = vars.get_mut(var_name)
+                        {
+                            items.push(arg_val);
+                        } else if attr == "extend"
+                            && args.len() == 1
+                            && let Some(PreviewVal::Tuple(more)) =
+                                self.eval_preview_expr_in_env(class_name, &args[0], vars, depth)
+                            && let Some(PreviewVal::Tuple(items)) = vars.get_mut(var_name)
+                        {
+                            items.extend(more);
+                        }
+                    }
+                }
                 ast::StmtKind::Assign { target, value, .. } => {
                     let val = self.eval_preview_expr_in_env(class_name, value, vars, depth)?;
                     match &target.kind {
@@ -754,6 +1177,57 @@ impl<'a> UiResolveEnv<'a> {
                             }
                         }
                         _ => {}
+                    }
+                }
+                ast::StmtKind::AugAssign { target, op, value } => {
+                    if let ast::ExprKind::Ident(name) = &target.kind {
+                        let bin_expr = ast::Expr {
+                            kind: ast::ExprKind::Binary {
+                                left: Box::new(target.clone()),
+                                op: *op,
+                                right: Box::new(value.clone()),
+                            },
+                            span: stmt.span,
+                        };
+                        if let Some(res) =
+                            self.eval_preview_expr_in_env(class_name, &bin_expr, vars, depth)
+                        {
+                            vars.insert(name.clone(), res);
+                        }
+                    }
+                }
+                ast::StmtKind::For {
+                    target,
+                    iterable,
+                    body,
+                } => {
+                    let target_parts: Vec<&str> = target
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                    let arity = target_parts.len().max(1);
+                    if let Some(items) = self.eval_preview_iterable_with_arity_in_env(
+                        class_name, iterable, arity, vars, depth,
+                    ) {
+                        for item in items {
+                            if target_parts.len() <= 1 {
+                                vars.insert(target.clone(), item);
+                            } else if let PreviewVal::Tuple(sub_items) = item
+                                && sub_items.len() == target_parts.len()
+                            {
+                                for (t_name, sub_val) in target_parts.iter().zip(sub_items) {
+                                    vars.insert((*t_name).to_string(), sub_val);
+                                }
+                            } else {
+                                continue;
+                            }
+                            if let Some(ret) =
+                                self.eval_preview_stmts_in_env(class_name, body, vars, depth)
+                            {
+                                return Some(ret);
+                            }
+                        }
                     }
                 }
                 ast::StmtKind::If {
@@ -798,6 +1272,172 @@ impl<'a> UiResolveEnv<'a> {
         }
     }
 
+    pub(crate) fn eval_preview_iterable_with_arity_in_env(
+        &self,
+        class_name: &str,
+        iter_expr: &ast::Expr,
+        target_arity: usize,
+        vars: &FxHashMap<String, PreviewVal>,
+        depth: usize,
+    ) -> Option<Vec<PreviewVal>> {
+        if let ast::ExprKind::Call {
+            callee,
+            args,
+            kwargs,
+        } = &iter_expr.kind
+            && kwargs.is_empty()
+            && let ast::ExprKind::Ident(fn_name) = &callee.kind
+        {
+            match fn_name.as_str() {
+                "range" => {
+                    let (start, end, step) = match args.as_slice() {
+                        [end] => (
+                            0,
+                            self.eval_preview_expr_in_env(class_name, end, vars, depth)?
+                                .as_i64()?,
+                            1,
+                        ),
+                        [start, end] => (
+                            self.eval_preview_expr_in_env(class_name, start, vars, depth)?
+                                .as_i64()?,
+                            self.eval_preview_expr_in_env(class_name, end, vars, depth)?
+                                .as_i64()?,
+                            1,
+                        ),
+                        [start, end, step] => (
+                            self.eval_preview_expr_in_env(class_name, start, vars, depth)?
+                                .as_i64()?,
+                            self.eval_preview_expr_in_env(class_name, end, vars, depth)?
+                                .as_i64()?,
+                            self.eval_preview_expr_in_env(class_name, step, vars, depth)?
+                                .as_i64()?,
+                        ),
+                        _ => return None,
+                    };
+                    if step == 0 {
+                        return None;
+                    }
+                    let mut out = Vec::new();
+                    let mut cur = start;
+                    while (step > 0 && cur < end) || (step < 0 && cur > end) {
+                        if out.len() >= 10_000 {
+                            return None;
+                        }
+                        out.push(PreviewVal::Int(cur));
+                        cur = cur.saturating_add(step);
+                    }
+                    return Some(out);
+                }
+                "enumerate" if (1..=2).contains(&args.len()) => {
+                    let inner = self.eval_preview_iterable_with_arity_in_env(
+                        class_name, &args[0], 1, vars, depth,
+                    )?;
+                    let start = if args.len() == 2 {
+                        self.eval_preview_expr_in_env(class_name, &args[1], vars, depth)?
+                            .as_i64()?
+                    } else {
+                        0
+                    };
+                    let mut out = Vec::with_capacity(inner.len());
+                    for (idx, item) in inner.into_iter().enumerate() {
+                        out.push(PreviewVal::Tuple(vec![
+                            PreviewVal::Int(start.saturating_add(idx as i64)),
+                            item,
+                        ]));
+                    }
+                    return Some(out);
+                }
+                _ => {}
+            }
+        }
+        match self.eval_preview_expr_in_env(class_name, iter_expr, vars, depth)? {
+            PreviewVal::Tuple(items) => Some(items),
+            PreviewVal::Dict(entries) => {
+                if target_arity >= 2 {
+                    Some(
+                        entries
+                            .into_iter()
+                            .map(|(k, v)| PreviewVal::Tuple(vec![k, v]))
+                            .collect(),
+                    )
+                } else {
+                    Some(entries.into_iter().map(|(k, _)| k).collect())
+                }
+            }
+            PreviewVal::Str(s) => Some(s.chars().map(|c| PreviewVal::Str(c.to_string())).collect()),
+            _ => None,
+        }
+    }
+
+    fn bind_preview_targets(
+        targets: &[(String, Span)],
+        val: PreviewVal,
+        vars: &mut FxHashMap<String, PreviewVal>,
+    ) -> bool {
+        if targets.len() == 1 {
+            vars.insert(targets[0].0.clone(), val);
+            return true;
+        }
+        if let PreviewVal::Tuple(items) = val
+            && items.len() == targets.len()
+        {
+            for ((name, _), item) in targets.iter().zip(items) {
+                vars.insert(name.clone(), item);
+            }
+            return true;
+        }
+        false
+    }
+
+    fn eval_preview_comprehension_in_env(
+        &self,
+        class_name: &str,
+        elt: &ast::Expr,
+        generators: &[ast::Comprehension],
+        vars: &FxHashMap<String, PreviewVal>,
+        depth: usize,
+        out: &mut Vec<PreviewVal>,
+    ) -> Option<()> {
+        let Some((first, rest)) = generators.split_first() else {
+            out.push(self.eval_preview_expr_in_env(class_name, elt, vars, depth)?);
+            return Some(());
+        };
+        let items = self.eval_preview_iterable_with_arity_in_env(
+            class_name,
+            &first.iter,
+            first.targets.len(),
+            vars,
+            depth,
+        )?;
+        let mut local_vars = vars.clone();
+        for item in items {
+            if !Self::bind_preview_targets(&first.targets, item, &mut local_vars) {
+                return None;
+            }
+            let mut cond_ok = true;
+            for cond in &first.ifs {
+                if !self
+                    .eval_preview_expr_in_env(class_name, cond, &local_vars, depth)?
+                    .is_truthy()
+                {
+                    cond_ok = false;
+                    break;
+                }
+            }
+            if cond_ok {
+                self.eval_preview_comprehension_in_env(
+                    class_name,
+                    elt,
+                    rest,
+                    &local_vars,
+                    depth,
+                    out,
+                )?;
+            }
+        }
+        Some(())
+    }
+
     pub(crate) fn eval_preview_expr_in_env(
         &self,
         class_name: &str,
@@ -815,6 +1455,22 @@ impl<'a> UiResolveEnv<'a> {
                 for item in items {
                     out.push(self.eval_preview_expr_in_env(class_name, item, vars, depth)?);
                 }
+                Some(PreviewVal::Tuple(out))
+            }
+            ast::ExprKind::Dict(pairs) => {
+                let mut out = Vec::with_capacity(pairs.len());
+                for (k, v) in pairs {
+                    let kv = self.eval_preview_expr_in_env(class_name, k, vars, depth)?;
+                    let vv = self.eval_preview_expr_in_env(class_name, v, vars, depth)?;
+                    out.push((kv, vv));
+                }
+                Some(PreviewVal::Dict(out))
+            }
+            ast::ExprKind::ListComp { elt, generators } => {
+                let mut out = Vec::new();
+                self.eval_preview_comprehension_in_env(
+                    class_name, elt, generators, vars, depth, &mut out,
+                )?;
                 Some(PreviewVal::Tuple(out))
             }
             ast::ExprKind::Ident(name) => {
@@ -874,15 +1530,25 @@ impl<'a> UiResolveEnv<'a> {
                         .or(Some(PreviewVal::Prop(prop_name)));
                 }
                 let container = self.eval_preview_expr_in_env(class_name, value, vars, depth)?;
-                let idx = self
-                    .eval_preview_expr_in_env(class_name, index, vars, depth)?
-                    .as_i64()?;
-                if let PreviewVal::Tuple(items) = container
-                    && idx >= 0
-                {
-                    return items.get(idx as usize).cloned();
+                let idx_val = self.eval_preview_expr_in_env(class_name, index, vars, depth)?;
+                match container {
+                    PreviewVal::Tuple(items) => {
+                        let idx = idx_val.as_i64()?;
+                        if idx >= 0 {
+                            items.get(idx as usize).cloned()
+                        } else {
+                            let actual = items.len() as i64 + idx;
+                            (actual >= 0)
+                                .then(|| items.get(actual as usize).cloned())
+                                .flatten()
+                        }
+                    }
+                    PreviewVal::Dict(entries) => entries
+                        .into_iter()
+                        .find(|(k, _)| k.to_display_string() == idx_val.to_display_string())
+                        .map(|(_, v)| v),
+                    _ => None,
                 }
-                None
             }
             ast::ExprKind::Unary { op, operand } => {
                 let val = self.eval_preview_expr_in_env(class_name, operand, vars, depth)?;
@@ -1114,6 +1780,34 @@ impl<'a> UiResolveEnv<'a> {
                                 }
                                 return best.map(PreviewVal::Float);
                             }
+                            "len" if eval_args.len() == 1 => {
+                                return match &eval_args[0] {
+                                    PreviewVal::Tuple(items) => {
+                                        Some(PreviewVal::Int(items.len() as i64))
+                                    }
+                                    PreviewVal::Dict(entries) => {
+                                        Some(PreviewVal::Int(entries.len() as i64))
+                                    }
+                                    PreviewVal::Str(s) => {
+                                        Some(PreviewVal::Int(s.chars().count() as i64))
+                                    }
+                                    _ => None,
+                                };
+                            }
+                            "list" if eval_args.len() == 1 => {
+                                return match &eval_args[0] {
+                                    PreviewVal::Tuple(items) => {
+                                        Some(PreviewVal::Tuple(items.clone()))
+                                    }
+                                    PreviewVal::Dict(entries) => Some(PreviewVal::Tuple(
+                                        entries.iter().map(|(k, _)| k.clone()).collect(),
+                                    )),
+                                    PreviewVal::Str(s) => Some(PreviewVal::Tuple(
+                                        s.chars().map(|c| PreviewVal::Str(c.to_string())).collect(),
+                                    )),
+                                    _ => None,
+                                };
+                            }
                             _ => {}
                         }
                     }
@@ -1129,17 +1823,56 @@ impl<'a> UiResolveEnv<'a> {
                         depth + 1,
                     );
                 }
-                if let ast::ExprKind::Attribute { value, attr } = &callee.kind
-                    && let ast::ExprKind::Ident(obj) = &value.kind
-                    && (obj == "self" || obj == class_name)
-                {
-                    let method = self.class_methods.get(attr)?;
-                    return self.eval_preview_function_in_env(
-                        class_name,
-                        method,
-                        &eval_args,
-                        depth + 1,
-                    );
+                if let ast::ExprKind::Attribute { value, attr } = &callee.kind {
+                    if let ast::ExprKind::Ident(obj) = &value.kind
+                        && (obj == "self" || obj == class_name)
+                        && let Some(method) = self.class_methods.get(attr)
+                    {
+                        return self.eval_preview_function_in_env(
+                            class_name,
+                            method,
+                            &eval_args,
+                            depth + 1,
+                        );
+                    }
+                    if let Some(PreviewVal::Dict(entries)) =
+                        self.eval_preview_expr_in_env(class_name, value, vars, depth)
+                    {
+                        match attr.as_str() {
+                            "keys" if eval_args.is_empty() => {
+                                return Some(PreviewVal::Tuple(
+                                    entries.into_iter().map(|(k, _)| k).collect(),
+                                ));
+                            }
+                            "values" if eval_args.is_empty() => {
+                                return Some(PreviewVal::Tuple(
+                                    entries.into_iter().map(|(_, v)| v).collect(),
+                                ));
+                            }
+                            "items" if eval_args.is_empty() => {
+                                return Some(PreviewVal::Tuple(
+                                    entries
+                                        .into_iter()
+                                        .map(|(k, v)| PreviewVal::Tuple(vec![k, v]))
+                                        .collect(),
+                                ));
+                            }
+                            "get" if (1..=2).contains(&eval_args.len()) => {
+                                let target_k = eval_args[0].to_display_string();
+                                if let Some((_, v)) = entries
+                                    .into_iter()
+                                    .find(|(k, _)| k.to_display_string() == target_k)
+                                {
+                                    return Some(v);
+                                }
+                                if eval_args.len() == 2 {
+                                    return Some(eval_args[1].clone());
+                                }
+                                return None;
+                            }
+                            _ => {}
+                        }
+                    }
                 }
                 None
             }
@@ -1168,6 +1901,7 @@ pub(crate) enum PreviewVal {
     Str(String),
     Bool(bool),
     Tuple(Vec<PreviewVal>),
+    Dict(Vec<(PreviewVal, PreviewVal)>),
     Prop(String),
 }
 
@@ -1181,6 +1915,13 @@ impl PreviewVal {
             Self::Tuple(items) => {
                 let parts: Vec<String> = items.iter().map(Self::to_display_string).collect();
                 format!("({})", parts.join(", "))
+            }
+            Self::Dict(entries) => {
+                let parts: Vec<String> = entries
+                    .iter()
+                    .map(|(k, v)| format!("{}: {}", k.to_display_string(), v.to_display_string()))
+                    .collect();
+                format!("{{{}}}", parts.join(", "))
             }
             Self::Prop(name) => name.clone(),
         }
@@ -1223,6 +1964,7 @@ impl PreviewVal {
             Self::Float(f) => *f != 0.0,
             Self::Str(s) => !s.is_empty(),
             Self::Tuple(items) => !items.is_empty(),
+            Self::Dict(entries) => !entries.is_empty(),
             Self::Prop(_) => true,
         }
     }
@@ -1234,7 +1976,34 @@ impl PreviewVal {
             ConstValue::String(s) => Self::Str(s.clone()),
             ConstValue::Bool(b) => Self::Bool(*b),
             ConstValue::List(items) => Self::Tuple(items.iter().map(Self::from_const).collect()),
+            ConstValue::Dict(entries) => Self::Dict(
+                entries
+                    .iter()
+                    .map(|(k, v)| (Self::from_const(k), Self::from_const(v)))
+                    .collect(),
+            ),
+            ConstValue::Symbol(name) => Self::Prop(name.clone()),
         }
+    }
+
+    pub(crate) fn to_ast_expr(&self, span: Span) -> ast::Expr {
+        let kind = match self {
+            Self::Int(i) => ast::ExprKind::Int(*i),
+            Self::Float(f) => ast::ExprKind::Float(*f),
+            Self::Str(s) => ast::ExprKind::String(s.clone()),
+            Self::Bool(b) => ast::ExprKind::Bool(*b),
+            Self::Tuple(items) => {
+                ast::ExprKind::List(items.iter().map(|i| i.to_ast_expr(span)).collect())
+            }
+            Self::Dict(entries) => ast::ExprKind::Dict(
+                entries
+                    .iter()
+                    .map(|(k, v)| (k.to_ast_expr(span), v.to_ast_expr(span)))
+                    .collect(),
+            ),
+            Self::Prop(name) => ast::ExprKind::Ident(name.clone()),
+        };
+        ast::Expr { kind, span }
     }
 }
 
@@ -1299,6 +2068,7 @@ pub fn is_ui_layout_expr(expr: &ast::Expr) -> bool {
         ast::ExprKind::List(items) | ast::ExprKind::Tuple(items) => {
             !items.is_empty() && items.iter().all(is_ui_layout_expr)
         }
+        ast::ExprKind::ListComp { elt, .. } => is_ui_layout_expr(elt),
         _ => false,
     }
 }
@@ -1316,6 +2086,35 @@ pub fn substitute_ui_vars(expr: &ast::Expr, vars: &FxHashMap<String, ast::Expr>)
                 expr.clone()
             }
         }
+        ast::ExprKind::Attribute { value, attr } => ast::Expr {
+            kind: ast::ExprKind::Attribute {
+                value: Box::new(substitute_ui_vars(value, vars)),
+                attr: attr.clone(),
+            },
+            span: expr.span,
+        },
+        ast::ExprKind::Subscript { value, index } => ast::Expr {
+            kind: ast::ExprKind::Subscript {
+                value: Box::new(substitute_ui_vars(value, vars)),
+                index: Box::new(substitute_ui_vars(index, vars)),
+            },
+            span: expr.span,
+        },
+        ast::ExprKind::Unary { op, operand } => ast::Expr {
+            kind: ast::ExprKind::Unary {
+                op: *op,
+                operand: Box::new(substitute_ui_vars(operand, vars)),
+            },
+            span: expr.span,
+        },
+        ast::ExprKind::Binary { left, op, right } => ast::Expr {
+            kind: ast::ExprKind::Binary {
+                left: Box::new(substitute_ui_vars(left, vars)),
+                op: *op,
+                right: Box::new(substitute_ui_vars(right, vars)),
+            },
+            span: expr.span,
+        },
         ast::ExprKind::Call {
             callee,
             args,
@@ -1339,6 +2138,34 @@ pub fn substitute_ui_vars(expr: &ast::Expr, vars: &FxHashMap<String, ast::Expr>)
             kind: ast::ExprKind::Tuple(items.iter().map(|i| substitute_ui_vars(i, vars)).collect()),
             span: expr.span,
         },
+        ast::ExprKind::ListComp { elt, generators } => {
+            let mut inner_vars = vars.clone();
+            let mut new_gens = Vec::with_capacity(generators.len());
+            for g in generators {
+                let iter_sub = substitute_ui_vars(&g.iter, &inner_vars);
+                for (t_name, _) in &g.targets {
+                    inner_vars.remove(t_name);
+                }
+                let ifs_sub = g
+                    .ifs
+                    .iter()
+                    .map(|c| substitute_ui_vars(c, &inner_vars))
+                    .collect();
+                new_gens.push(ast::Comprehension {
+                    targets: g.targets.clone(),
+                    iter: iter_sub,
+                    ifs: ifs_sub,
+                    span: g.span,
+                });
+            }
+            ast::Expr {
+                kind: ast::ExprKind::ListComp {
+                    elt: Box::new(substitute_ui_vars(elt, &inner_vars)),
+                    generators: new_gens,
+                },
+                span: expr.span,
+            }
+        }
         ast::ExprKind::BoolOp { op, left, right } => ast::Expr {
             kind: ast::ExprKind::BoolOp {
                 op: *op,
@@ -1461,11 +2288,8 @@ pub fn collect_inline_ui_pages_from_stmts(
                         diagnostics,
                         control_resolutions,
                     ));
-                } else if let ast::ExprKind::Ident(var_name) = &target.kind
-                    && let Some(cval) = eval_constant_with_env(value, &env.constants)
-                        .or_else(|| eval_constant(value))
-                {
-                    env.constants.insert(var_name.clone(), cval);
+                } else {
+                    eval_const_stmt(stmt, &mut env.constants);
                 }
             }
             ast::StmtKind::Expr(e) => {
@@ -1488,6 +2312,8 @@ pub fn collect_inline_ui_pages_from_stmts(
                         diagnostics,
                         control_resolutions,
                     ));
+                } else {
+                    eval_const_stmt(stmt, &mut env.constants);
                 }
             }
             ast::StmtKind::Return(Some(ret_expr)) => {
@@ -1508,6 +2334,7 @@ pub fn collect_inline_ui_pages_from_stmts(
                 else_branch,
                 ..
             } => {
+                eval_const_stmt(stmt, &mut env.constants);
                 pages.extend(collect_inline_ui_pages_from_stmts(
                     class_name,
                     then_branch,
@@ -1527,7 +2354,9 @@ pub fn collect_inline_ui_pages_from_stmts(
                     local_ui_vars,
                 ));
             }
-            _ => {}
+            _ => {
+                eval_const_stmt(stmt, &mut env.constants);
+            }
         }
     }
     pages
@@ -1604,8 +2433,98 @@ struct UiParserCtx<'a> {
 }
 
 impl<'a> UiParserCtx<'a> {
+    fn unroll_comprehension_step(
+        &self,
+        elt: &ast::Expr,
+        generators: &[ast::Comprehension],
+        vars: &FxHashMap<String, PreviewVal>,
+        expr_vars: &FxHashMap<String, ast::Expr>,
+        out: &mut Vec<ast::Expr>,
+    ) -> Option<()> {
+        let Some((first, rest)) = generators.split_first() else {
+            out.push(substitute_ui_vars(elt, expr_vars));
+            return Some(());
+        };
+        let items = self.env.eval_preview_iterable_with_arity_in_env(
+            self.class_name,
+            &first.iter,
+            first.targets.len(),
+            vars,
+            0,
+        )?;
+        let mut local_vars = vars.clone();
+        let mut local_expr_vars = expr_vars.clone();
+        for item in items {
+            if !UiResolveEnv::bind_preview_targets(&first.targets, item.clone(), &mut local_vars) {
+                return None;
+            }
+            if first.targets.len() == 1 {
+                local_expr_vars.insert(
+                    first.targets[0].0.clone(),
+                    item.to_ast_expr(first.targets[0].1),
+                );
+            } else if let PreviewVal::Tuple(sub_items) = item {
+                for ((t_name, t_span), sub_item) in first.targets.iter().zip(sub_items) {
+                    local_expr_vars.insert(t_name.clone(), sub_item.to_ast_expr(*t_span));
+                }
+            }
+            let mut cond_ok = true;
+            for cond in &first.ifs {
+                if !self
+                    .env
+                    .eval_preview_expr_in_env(self.class_name, cond, &local_vars, 0)?
+                    .is_truthy()
+                {
+                    cond_ok = false;
+                    break;
+                }
+            }
+            if cond_ok {
+                self.unroll_comprehension_step(elt, rest, &local_vars, &local_expr_vars, out)?;
+            }
+        }
+        Some(())
+    }
+
+    fn unroll_comprehension_exprs(
+        &mut self,
+        elt: &ast::Expr,
+        generators: &[ast::Comprehension],
+        span: Span,
+    ) -> Vec<ast::Expr> {
+        let mut vars = FxHashMap::default();
+        for (name, val) in &self.env.constants {
+            vars.insert(name.clone(), PreviewVal::from_const(val));
+        }
+        let expr_vars = FxHashMap::default();
+        let mut out = Vec::new();
+        if self
+            .unroll_comprehension_step(elt, generators, &vars, &expr_vars, &mut out)
+            .is_none()
+        {
+            self.diagnostics.report(
+                DiagnosticKind::InvalidDeclarationArgument {
+                    name: "UI".to_string(),
+                    message:
+                        "List comprehension in UI layout could not be evaluated at compile time"
+                            .to_string(),
+                },
+                span,
+            );
+        }
+        out
+    }
+
     fn parse_top_level_pages(&mut self, expr: &ast::Expr) -> Vec<UiPageSpec> {
         match &expr.kind {
+            ast::ExprKind::ListComp { elt, generators } => {
+                let items = self.unroll_comprehension_exprs(elt, generators, expr.span);
+                let list_expr = ast::Expr {
+                    kind: ast::ExprKind::List(items),
+                    span: expr.span,
+                };
+                self.parse_top_level_pages(&list_expr)
+            }
             ast::ExprKind::List(items) | ast::ExprKind::Tuple(items) => {
                 let mut pages = Vec::new();
                 let mut loose_children = Vec::new();
@@ -1745,6 +2664,15 @@ impl<'a> UiParserCtx<'a> {
 
     fn parse_node_expr(&mut self, expr: &ast::Expr) -> Vec<UiNode> {
         match &expr.kind {
+            ast::ExprKind::ListComp { elt, generators } => {
+                let items = self.unroll_comprehension_exprs(elt, generators, expr.span);
+                let mut out = Vec::new();
+                for item in &items {
+                    out.extend(self.parse_node_expr(item));
+                }
+                out
+            }
+
             ast::ExprKind::List(items) | ast::ExprKind::Tuple(items) => {
                 let mut out = Vec::new();
                 for item in items {
@@ -3703,7 +4631,7 @@ fn is_ui_node_or_control_expr(
     class_name: &str,
 ) -> bool {
     match &expr.kind {
-        ast::ExprKind::List(_) | ast::ExprKind::Tuple(_) => true,
+        ast::ExprKind::List(_) | ast::ExprKind::Tuple(_) | ast::ExprKind::ListComp { .. } => true,
         ast::ExprKind::Call { callee, .. } => is_ui_callee(callee).is_some(),
         ast::ExprKind::Ident(ident) => controls.iter().any(|c| c.ident == *ident),
         ast::ExprKind::Attribute { value, attr } => {

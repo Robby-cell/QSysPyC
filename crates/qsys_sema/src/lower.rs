@@ -413,6 +413,26 @@ impl<'a> StmtLowerer<'a> {
                 if *op == ast::BinaryOp::Add {
                     let target_ty = self.type_map.get_type(target.span);
                     let val_ty = self.type_map.get_type(value.span);
+                    if matches!(target_ty, Some(Type::List(_))) {
+                        return Some(IRStmt::For {
+                            target_id: SymbolId(u32::MAX - 1),
+                            target_name: "_v".to_string(),
+                            iterable: value_ir,
+                            is_dict: false,
+                            body: vec![IRStmt::Expr {
+                                expr: IRExpr::Call {
+                                    callee: Box::new(IRExpr::Attribute {
+                                        object: Box::new(IRExpr::Global("table".to_string())),
+                                        attr: "insert".to_string(),
+                                    }),
+                                    args: vec![target_ir, IRExpr::Global("_v".to_string())],
+                                    kwargs: Vec::new(),
+                                },
+                                span,
+                            }],
+                            span,
+                        });
+                    }
                     if matches!(target_ty, Some(Type::String))
                         || matches!(val_ty, Some(Type::String))
                     {
@@ -470,7 +490,7 @@ impl<'a> StmtLowerer<'a> {
                 iterable,
                 body,
             } => {
-                let iter_ir = self.lower_expr(iterable);
+                let (iter_ir, is_dict) = self.lower_iterable(iterable);
                 let target_id = self
                     .type_map
                     .get_resolution(stmt.span)
@@ -486,6 +506,7 @@ impl<'a> StmtLowerer<'a> {
                     target_id,
                     target_name: target.clone(),
                     iterable: iter_ir,
+                    is_dict,
                     body: body_ir,
                     span,
                 })
@@ -514,6 +535,39 @@ impl<'a> StmtLowerer<'a> {
                 }
                 if let Some(appended) = extract_graphics_append(&sub_expr) {
                     return self.lower_ui_expr_to_stmt(&appended, span);
+                }
+                if let ast::ExprKind::Call {
+                    callee,
+                    args,
+                    kwargs,
+                } = &expr.kind
+                    && kwargs.is_empty()
+                    && args.len() == 1
+                    && let ast::ExprKind::Attribute { value, attr } = &callee.kind
+                    && attr == "extend"
+                {
+                    let (iter_ir, is_dict) = self.lower_iterable(&args[0]);
+                    return Some(IRStmt::For {
+                        target_id: SymbolId(u32::MAX - 1),
+                        target_name: "_v".to_string(),
+                        iterable: iter_ir,
+                        is_dict,
+                        body: vec![IRStmt::Expr {
+                            expr: IRExpr::Call {
+                                callee: Box::new(IRExpr::Attribute {
+                                    object: Box::new(IRExpr::Global("table".to_string())),
+                                    attr: "insert".to_string(),
+                                }),
+                                args: vec![
+                                    self.lower_expr(value),
+                                    IRExpr::Global("_v".to_string()),
+                                ],
+                                kwargs: Vec::new(),
+                            },
+                            span,
+                        }],
+                        span,
+                    });
                 }
                 if let Some(raw_code) = extract_raw_lua(expr) {
                     Some(IRStmt::RawLua {
@@ -916,13 +970,73 @@ impl<'a> StmtLowerer<'a> {
                                 kwargs: vec![],
                             };
                         }
-                        // dict.get(key) -> dict[key]
-                        if attr == "get" && args.len() == 1 {
-                            return IRExpr::Index {
+                        // dict.get(key) -> dict[key]; dict.get(key, default) -> (dict[key] or default)
+                        if attr == "get" && (1..=2).contains(&args.len()) {
+                            let idx_ir = IRExpr::Index {
                                 base: Box::new(self.lower_expr(value)),
                                 index: Box::new(self.lower_expr(&args[0])),
                                 is_zero_based: false,
                             };
+                            if args.len() == 2 {
+                                return IRExpr::LogicalOr {
+                                    left: Box::new(idx_ir),
+                                    right: Box::new(self.lower_expr(&args[1])),
+                                    left_truthiness: IRTruthiness::Direct,
+                                };
+                            }
+                            return idx_ir;
+                        }
+                        if args.is_empty()
+                            && matches!(self.type_map.get_type(value.span), Some(Type::Dict(_, _)))
+                        {
+                            match attr.as_str() {
+                                "keys" => {
+                                    return IRExpr::ListComp {
+                                        elt: Box::new(IRExpr::Global("_k".to_string())),
+                                        generators: vec![IRComprehension {
+                                            targets: vec![(
+                                                SymbolId(u32::MAX - 2),
+                                                "_k".to_string(),
+                                            )],
+                                            iterable: self.lower_expr(value),
+                                            ifs: Vec::new(),
+                                            is_dict: true,
+                                        }],
+                                    };
+                                }
+                                "values" => {
+                                    return IRExpr::ListComp {
+                                        elt: Box::new(IRExpr::Global("_v".to_string())),
+                                        generators: vec![IRComprehension {
+                                            targets: vec![
+                                                (SymbolId(u32::MAX - 2), "_k".to_string()),
+                                                (SymbolId(u32::MAX - 3), "_v".to_string()),
+                                            ],
+                                            iterable: self.lower_expr(value),
+                                            ifs: Vec::new(),
+                                            is_dict: true,
+                                        }],
+                                    };
+                                }
+                                "items" => {
+                                    return IRExpr::ListComp {
+                                        elt: Box::new(IRExpr::List(vec![
+                                            IRExpr::Global("_k".to_string()),
+                                            IRExpr::Global("_v".to_string()),
+                                        ])),
+                                        generators: vec![IRComprehension {
+                                            targets: vec![
+                                                (SymbolId(u32::MAX - 2), "_k".to_string()),
+                                                (SymbolId(u32::MAX - 3), "_v".to_string()),
+                                            ],
+                                            iterable: self.lower_expr(value),
+                                            ifs: Vec::new(),
+                                            is_dict: true,
+                                        }],
+                                    };
+                                }
+                                _ => {}
+                            }
                         }
 
                         // `super().method(...)` -> `BaseName.method(self, ...)`
@@ -1030,8 +1144,70 @@ impl<'a> StmtLowerer<'a> {
                 }
             }
 
+            ast::ExprKind::ListComp { elt, generators } => {
+                let ir_gens = generators
+                    .iter()
+                    .map(|g| {
+                        let targets = g
+                            .targets
+                            .iter()
+                            .map(|(t_name, t_span)| {
+                                let sym_id = self
+                                    .type_map
+                                    .get_resolution(*t_span)
+                                    .and_then(|r| match r {
+                                        ResolvedTarget::Local(id) => Some(*id),
+                                        _ => None,
+                                    })
+                                    .unwrap_or(SymbolId(0));
+                                (sym_id, t_name.clone())
+                            })
+                            .collect();
+                        let ifs = g
+                            .ifs
+                            .iter()
+                            .map(|c| {
+                                let truth = lower_truthiness(self.type_map.get_truthiness(c.span));
+                                (self.lower_expr(c), truth)
+                            })
+                            .collect();
+                        let (iterable, is_dict) = self.lower_iterable(&g.iter);
+                        IRComprehension {
+                            targets,
+                            iterable,
+                            ifs,
+                            is_dict,
+                        }
+                    })
+                    .collect();
+                IRExpr::ListComp {
+                    elt: Box::new(self.lower_expr(elt)),
+                    generators: ir_gens,
+                }
+            }
+
             ast::ExprKind::Error => IRExpr::Nil,
         }
+    }
+
+    fn lower_iterable(&self, iter: &ast::Expr) -> (IRExpr, bool) {
+        if let ast::ExprKind::Call {
+            callee,
+            args,
+            kwargs,
+        } = &iter.kind
+            && args.is_empty()
+            && kwargs.is_empty()
+            && let ast::ExprKind::Attribute { value, attr } = &callee.kind
+            && matches!(attr.as_str(), "items" | "keys")
+            && (matches!(self.type_map.get_type(value.span), Some(Type::Dict(_, _)))
+                || matches!(value.kind, ast::ExprKind::Dict(_)))
+        {
+            return (self.lower_expr(value), true);
+        }
+        let is_dict = matches!(self.type_map.get_type(iter.span), Some(Type::Dict(_, _)))
+            || matches!(iter.kind, ast::ExprKind::Dict(_));
+        (self.lower_expr(iter), is_dict)
     }
 
     fn control_cols_ir(&self, ctl_id: ControlId) -> IRExpr {
